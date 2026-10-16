@@ -1537,7 +1537,9 @@ static bool nv_xnu_bootarg_flag(const char *name, int *cache)
 static int nv_xnu_gps_cache = -1, nv_xnu_nvpcf_cache = -1;
 static bool nv_xnu_gps_on(void)   { return nv_xnu_bootarg_flag("nvrmgps", &nv_xnu_gps_cache); }
 static bool nv_xnu_nvpcf_on(void) { return nv_xnu_bootarg_flag("nvrmnvpcf", &nv_xnu_nvpcf_cache); }
-static bool nv_xnu_platpower_on(void) { return nv_xnu_gps_on() || nv_xnu_nvpcf_on(); }
+static int nv_xnu_tgp_cache = -1;
+// nvrmtgp (nvrm_power.cpp) polls _PSR, so it opens the same ACPI power-source path.
+static bool nv_xnu_platpower_on(void) { return nv_xnu_gps_on() || nv_xnu_nvpcf_on() || nv_xnu_bootarg_flag("nvrmtgp", &nv_xnu_tgp_cache); }
 extern "C" bool nv_xnu_platpower_enabled(void) { return nv_xnu_platpower_on(); }
 
 static const NvU8 nv_xnu_gps_guid[16]   = { 0x01, 0x2D, 0x13, 0xA3, 0xDA, 0x8C, 0xBA, 0x49,      // GPS_DSM_GUID
