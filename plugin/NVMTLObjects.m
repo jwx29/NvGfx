@@ -1521,7 +1521,7 @@ NSData *nvmtl_translate_with_fc_cached(NSString *air, NSString *stage, NSString 
 #pragma mark - library / function
 id gNVMTLMainDevice = nil;
 
-extern NSData *nvmtl_translate_samplers(NVMTLFunction *, NSDictionary *, NSString **);
+extern NSData *nvmtl_translate_samplers(NVMTLFunction *, NSDictionary *, uint32_t, NSString **);
 extern NSData *nvmtl_translate_variant(NVMTLFunction *, NSDictionary *, NSDictionary *, NSString **);
 @interface NVMTLCIBinding : NSObject { @public NSString *_name; NVMTLType *_t; } @end
 @implementation NVMTLCIBinding
@@ -2627,7 +2627,7 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
                 NVMTLFunction *vf=_ps->_linkedVert?:(id)_ps->_descriptor.vertexFunction,*ff=_ps->_linkedFrag?:(id)_ps->_descriptor.fragmentFunction;
                 NSString *why=nil;
                 NSString *gk=nvmtl_sampvar_key(_ps->_descriptor,vf,ff,key); selected=nvmtl_sampvar_get(gk);
-                NSData *v=selected?nil:nvmtl_translate_samplers(vf,vS,&why),*f=(selected||!v)?nil:(ff?nvmtl_translate_samplers(ff,fS,&why):[NSData data]);
+                NSData *v=selected?nil:nvmtl_translate_samplers(vf,vS,0,&why),*f=(selected||!v)?nil:(ff?nvmtl_translate_samplers(ff,fS,_ps->_a8mask,&why):[NSData data]);
                 if(v && f) {
                     NVMTLFunction *vs=[NVMTLFunction new],*fs=ff?[NVMTLFunction new]:nil;
                     vs->_spirv=v;vs->_fname=vf->_fname;vs->_stage=vf->_stage;
