@@ -1,6 +1,6 @@
 #!/bin/bash
 # NvGfx: make an installable package from the shipped NullMoth pkgroot with our builds swapped in.
-#   REF  = shipped pkgroot (default: the audited 2.3.5 package)
+#   REF  = shipped pkgroot (default: the audited 2.3.7 package)
 #   OUT  = output pkgroot (default ~/src/NvGfx-build/pkg/<label>)
 #   Components to swap are given as env vars pointing at built files (unset = keep shipped):
 #     NVGFX_PLUGIN (NVMTLDriver), NVGFX_XLATE (libnvmtl_translate.dylib), NVGFX_NVK (libvulkan_nouveau.dylib),
@@ -8,7 +8,7 @@
 # The result keeps install.sh/uninstall.sh unchanged; SHA256SUMS, BASELINE-IDENTITY.json and NVGFX-VERSION are rewritten.
 set -euo pipefail
 LABEL=${1:?usage: package.sh <label, e.g. 2.1.0-nvgfx.1>}
-REF=${REF:-$HOME/Hackintosh/tooling/quarantine/nullmoth-release-2.3.5/x/pkgroot}
+REF=${REF:-$HOME/Hackintosh/tooling/quarantine/nullmoth-release-2.3.7/x/pkgroot}
 OUT=${OUT:-$HOME/src/NvGfx-build/pkg/$LABEL}
 R=$(cd "$(dirname "$0")/../.." && pwd)
 rm -rf "$OUT"; mkdir -p "$(dirname "$OUT")"; cp -Rp "$REF" "$OUT"
@@ -39,4 +39,11 @@ json.dump(d, open(p, "w"), indent=2)
 PY
 # the manifest lists "<hash>  <path>" (two spaces, no binary marker); keep the path whole even with spaces
 (cd "$OUT" && sed -E 's/^[0-9a-f]{64} [ *]//' SHA256SUMS | while IFS= read -r f; do shasum -a 256 "$f"; done > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS)
+# 2.3.7's installer refuses absolute links, and from 2.3.7 the kexts read firmware from /Library/NullMoth/nvfw: an NVRM
+# built for an older base finds none there (no display). Refuse both here instead of at install time.
+abs=$(cd "$OUT" && find . -type l -exec sh -c 'case $(readlink "$1") in /*) echo "$1";; esac' _ {} \;)
+[ -z "$abs" ] || { echo "FAIL absolute links in the package: $abs"; exit 3; }
+fw_new=0; grep -q 'nvfw' "$OUT/install.sh" && grep -q '/Library/NullMoth/nvfw' "$OUT/install.sh" && fw_new=1
+nvrm_new=0; [ "$(strings "$OUT/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM" | grep -c '/Library/NullMoth/nvfw' || true)" -gt 0 ] && nvrm_new=1
+[ "$fw_new" = "$nvrm_new" ] || { echo "FAIL NVRM firmware path does not match the installer (NVRM new path $nvrm_new, installer $fw_new)"; exit 3; }
 (cd "$OUT" && shasum -a 256 --strict -c SHA256SUMS --quiet) && echo "package ok: $OUT"
