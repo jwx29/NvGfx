@@ -89,7 +89,7 @@ stage_completion() {
   grep -q " t _GetFlipPendingStatus$" <<< "$syms" || { echo "STOP: completion archive lacks GetFlipPendingStatus"; exit 4; }
 }
 
-GLUE_CXX=( NVRM os-xnu os-xnu2 nv_xnu_stubs os-nvkms-xnu nvkms_shaders nvrm_fbinfo nvrm_gpuva nvrm_surfshare )
+GLUE_CXX=( NVRM os-xnu os-xnu2 nv_xnu_stubs nv_xnu_power os-nvkms-xnu nvkms_shaders nvrm_fbinfo nvrm_gpuva nvrm_surfshare )   # nv_xnu_power: upstream 2.4.1
 # Our glue (power, phys control) is linked only where the sources exist, so the same harness reproduces an upstream
 # tree (parity check against the shipped NVRM) and builds the fork.
 OURS_CXX=(); OURS_C=(); [ -f "$K/nvrm_power.cpp" ] && OURS_CXX+=(nvrm_power); [ -f "$K/nvrm_physctl.c" ] && OURS_C+=(nvrm_physctl)
@@ -133,7 +133,7 @@ stage_link() {
   # archive members in load order (RM first: access_cntr_buffer.o follows pageoff in the shipped text).
   "$CXX" -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib -Xlinker -kext \
     "$G/nv_xnu_stubs.o" "$G/nvkms_shaders.o" "$G/nvrm_fbinfo.o" "$G/nvrm_gpuva.o" "$G/nvrm_surfshare.o" "$G/NVRM.o" \
-    "$G/os-nvkms-xnu.o" "$G/os-xnu.o" "$G/os-xnu2.o" "$G/nvrm_kapi_fields.o" "$G/nvrm_pageoff.o" ${ours[@]+"${ours[@]}"} \
+    "$G/os-nvkms-xnu.o" "$G/os-xnu.o" "$G/os-xnu2.o" "$G/nv_xnu_power.o" "$G/nvrm_kapi_fields.o" "$G/nvrm_pageoff.o" ${ours[@]+"${ours[@]}"} \
     "$OGKM/src/nvidia/_out/Darwin_x86_64/libnvkernel.a" "$O/completion/libnvkms.a" \
     -lkmodc++ -lkmod -lcc_kext -o "$X/Contents/MacOS/NVRM" > "$O/logs/link.log" 2>&1 \
     || { grep -v "built for newer macOS" "$O/logs/link.log" | head -30; echo "STOP: link failed"; exit 6; }
