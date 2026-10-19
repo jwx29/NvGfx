@@ -1693,23 +1693,9 @@ extern "C" NvBool nv_xnu_power_battery_present(void)
     return found ? NV_TRUE : NV_FALSE;
 }
 
-// nv-acpi.c nv_acpi_get_powersource: _PSR on the power source device, *ac_plugged = (_PSR == 1). Off: the old stub.
-// No notify handler yet (Linux calls rm_power_source_change_event on 0x80); RM reads it once at init (osinit.c).
-NV_STATUS NV_API_CALL nv_acpi_get_powersource(NvU32 *ac_plugged)
-{
-    if (!nv_xnu_platpower_on()) { NV_XNU_STUB_HIT("nv_acpi_get_powersource"); return NV_ERR_NOT_SUPPORTED; }
-    if (!ac_plugged) return NV_ERR_INVALID_ARGUMENT;
-    IOACPIPlatformDevice *adp = nv_xnu_adapter();
-    if (!adp) return NV_ERR_INVALID_ARGUMENT;
-    if (!nv_xnu_acpi_may_sleep()) return NV_ERR_NOT_SUPPORTED;
-    UInt32 v = 0;
-    IOReturn r = adp->evaluateInteger("_PSR", &v);
-    static volatile UInt32 n;
-    if (nv_xnu_log_tick(&n)) kprintf("NVRM-xnu: _PSR on %s -> ioret 0x%x value %u\n", adp->getName(), r, (unsigned)v);
-    if (r != kIOReturnSuccess) return NV_ERR_GENERIC;
-    *ac_plugged = (v == 0x1);
-    return NV_OK;
-}
+// nv_acpi_get_powersource: upstream 2.4.1 answers it in nv_xnu_stubs.cpp from what nv_xnu_power.cpp read off the
+// battery service at its own safe points. The firmware asks with its locks held, so the fork's _PSR evaluation here
+// is gone; nvrmtgp (nvrm_power.cpp) still polls _PSR, from its own thread.
 void  NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *pa, NvU32 *w, NvU32 *h, NvU32 *depth, NvU32 *pitch, NvU64 *size)
 {
     TRC;

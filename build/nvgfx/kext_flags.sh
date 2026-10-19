@@ -12,7 +12,7 @@
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 OGKM=${OGKM:-$HOME/src/deps/open-gpu-610.57.04}
 OUTROOT=${OUTROOT:-$HOME/src/NvGfx-build/kexts}
-SDK=$(xcrun --sdk macosx --show-sdk-path)
+SDK=${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}   # SDKROOT pins the SDK (the docs say 15.5); CLT 26 made 26.5 the default
 KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 NV="$OGKM/src/nvidia"; KMS="$OGKM/src/nvidia-modeset"
 [ -d "$NV/generated" ] || { echo "OGKM=$OGKM is not an open-gpu-kernel-modules 610.57.04 tree"; exit 1; }
