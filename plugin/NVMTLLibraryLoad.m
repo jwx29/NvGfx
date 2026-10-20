@@ -419,7 +419,6 @@ static NVMTLAirDigest *nvmtl_air_state(NSString *ll) {
     if (!ll) return nil;
     // Only long strings we marked: every CF-backed string is a kind of NSMutableString, so a class test keeps nothing.
     const BOOL cacheable = ll.length >= 4096 && objc_getAssociatedObject(ll, NVMTL_AIRTEXT_KEY) != nil;
-    // </wtl>
     NVMTLAirDigest *d = cacheable ? objc_getAssociatedObject(ll, NVMTL_AIRDIGEST_KEY) : nil;
     if (d) return d;
     NSData *air = [ll dataUsingEncoding:NSUTF8StringEncoding];
