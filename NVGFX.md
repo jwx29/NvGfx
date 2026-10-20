@@ -61,6 +61,7 @@ Read from `/Library/GPUBundles/nvmtl/nvrm610.conf` in release builds, since the 
 | `NVMTL_NVGFX_FCOPY_FORCE_FAIL=1` | make the fetch-copy pipeline fail, to test the rebuild-without-it path |
 | `NVMTL_NVGFX_SURFOUT_TRACE=1` | syslog trace of surface copy-outs |
 | `NVMTL_NVGFX_WSTRACE=1` | WindowServer trace: samplers, pipelines, small render targets, the backdrop composite draw, draws that sample small square textures |
+| `NVMTL_NO_POOL_REUSE=1` | upstream switch: command pools and address pages are created and destroyed per commit instead of being kept behind the completion witness; set on the test machine since 2026-10-20 as the workaround for the per-process backend shutdown below (I-085) |
 
 ## Where things are
 
@@ -90,6 +91,11 @@ RTX 5070 Laptop (`10DE:2D18`), 2560x1600 at 165 Hz, macOS 26.7.1 (25G241), OpenC
 - Geekbench 6.7.1 Metal: 103094 on 2.4.3-nvgfx.1 (2026-10-20, https://browser.geekbench.com/v6/compute/6944564);
   Background Blur completes here (upstream #292 reports a hang at that subtest on other machines).
 - WindowServer CPU after boot: normal since nvgfx.20 (before: about 150 % while it re-translated every shader).
+- Still wrong (I-085, 2026-10-20): Terminal.app and iTerm2 froze for good three times in two hours under heavy text output.
+  The plugin logged "vk: completion witness missing; disabling backend and retaining all in-flight resources" in the
+  process (upstream `nvmtl_vk_submit_finish`, unchanged here), every later command buffer was nil and CoreAnimation's
+  CG glyph queue waited forever. Workaround: `NVMTL_NO_POOL_REUSE=1` in nvrm610.conf (not yet proven). Upstream issue
+  to be written by hand; record in project-legion `evidence/native/I-085-completion-witness-hang/`.
 - Still wrong: the Dock's blur draws as blocks (a WindowServer framebuffer-fetch problem, under investigation with the trace switches).
 
 ## Credit
