@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.4.3-nvgfx.1 (fork, not yet booted)
+
+- NVRM: the boot hold no longer lets WindowServer in while the card is still coming up. The cap used to fire at
+  settle + 40 s whatever the bring-up was doing; on a Legion 5 15IAX10 the GSP bring-up takes 2 to 48 s from one boot
+  to the next, and every boot over 40 s ended on software rendering (WindowServer asserted in CGXMappedDisplayStart,
+  the driver then refused to arm). The cap now waits in 10 s steps while go(2) runs, up to `nvrmholdcap=<s>` (40 to
+  600, default 120), and the log says how long go(2) took.
+- NVRM: the 115 W TGP mode follows the charger again (the 2.4.1 base caches the power source; the TGP tick refreshes
+  it before reading).
+
 ## 2.4.3
 
 - Fix a desktop freeze followed by a kernel panic ("thread_call group 'high' reached max thread cap") a few seconds to a few minutes after logging in (#295). The display driver started a new kernel thread for every vblank and every cursor move while an earlier one was still waiting; each of its callbacks now runs one at a time.
