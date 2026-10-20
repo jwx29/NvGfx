@@ -121,11 +121,8 @@ public:
     bool         fBar1Placed = false;
     volatile UInt32 fBootHold = 0;
     // <wtl>
-    // The hold cap used to be a fixed settle + 40 s. On this laptop the GSP bring-up takes 2 to 48 s from one boot to
-    // the next (the time goes after the NBCI _DSM call, before RM's first allocations), and every boot that crossed
-    // 40 s lost the desktop: the cap let WindowServer in, it asserted on the unarmed framebuffer, and the driver then
-    // refused to arm. So while the auto-go thread is still bringing the card up the cap waits on, 10 s at a time, up
-    // to nvrmholdcap seconds (default 120) counted from the first deadline. A hung bring-up still gets released.
+    // A fixed settle + 40 s cap lost the desktop whenever the GSP bring-up ran long (up to 48 s here); while go(2)
+    // runs the cap now waits in 10 s steps, up to nvrmholdcap seconds (default 120). A hung bring-up is still released.
     volatile UInt32 fBringUp = 0;          // 1 from go(2) until the display is armed or the bring-up gave up
     uint64_t        fBringUpStartNs = 0;
     uint32_t        fHoldCapMs = 120000;   // boot-arg nvrmholdcap (seconds)
@@ -720,8 +717,7 @@ void NVRM::bootHoldCap(thread_call_param_t p0, thread_call_param_t)
 {
     NVRM *s = (NVRM *)p0;
     // <wtl>
-    // Still inside the bring-up (go(2) running, or the heads not yet armed) and under the ceiling: wait another 10 s.
-    // The retain taken when the call was first armed stays with the call until the last firing.
+    // bring-up still running and under the ceiling: look again in 10 s (the arm-time retain stays with the call)
     if (s->fBootHold == 1 && s->fBringUp == 1 && s->fHoldWaitedMs + 40000 < s->fHoldCapMs && s->fHoldCapCall) {
         const uint32_t step = 10000;
         s->fHoldWaitedMs += step;
@@ -776,7 +772,7 @@ void NVRM::autoGo(void *p0, wait_result_t)
     s->fBringUp = 1;
     // </wtl>
     IOReturn r = s->go(2);
-    // <wtl> how long the card took: the number that decides whether the boot hold cap was wide enough
+    // <wtl> how long go(2) took, which says whether the cap was wide enough
     { uint64_t t, ns = 0; clock_get_uptime(&t); absolutetime_to_nanoseconds(t, &ns);
       LOG("auto-go: go(2) took %llu ms (hold cap settle + %u s)", (unsigned long long)((ns - s->fBringUpStartNs) / 1000000ULL), s->fHoldCapMs / 1000); }
     // </wtl>
