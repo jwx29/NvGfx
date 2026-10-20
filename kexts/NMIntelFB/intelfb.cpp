@@ -23,6 +23,38 @@
 
 #define IFBLOG(fmt, ...) IOLog("NMIntelFB: " fmt "\n", ##__VA_ARGS__)
 
+// Boot guard, as NVRM's nvrm_off.h: each start counts in NVRAM, WindowServer going active clears it, two counted
+// starts in a row turn the driver off so the firmware framebuffer gives the next boot a desktop.
+#include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOPlatformExpert.h>
+#include <libkern/c++/OSData.h>
+#define NMIFB_GUARD_VAR "nmintelfb-starts"
+static unsigned nmifbGuardStarts(IORegistryEntry *o)
+{
+    OSObject *v = o->copyProperty(NMIFB_GUARD_VAR); OSData *d = OSDynamicCast(OSData, v);
+    unsigned n = (d && d->getLength() >= 1) ? *(const unsigned char *)d->getBytesNoCopy() : 0;
+    if (v) v->release();
+    return n;
+}
+static bool nmifbGuardTripped()
+{
+    IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane); if (!o) return false;
+    bool t = nmifbGuardStarts(o) >= 2; o->release(); return t;
+}
+static void nmifbGuardCount()
+{
+    IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane); if (!o) return;
+    unsigned char n = (unsigned char)(nmifbGuardStarts(o) + 1);
+    if (OSData *d = OSData::withBytes(&n, 1)) { if (o->setProperty(NMIFB_GUARD_VAR, d)) IFBLOG("boot guard: start %u without WindowServer so far (off after 2)", n); d->release(); }
+    o->release();
+}
+static void nmifbGuardClear()
+{
+    static bool done; if (done) return; done = true;
+    IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane); if (!o) return;
+    o->removeProperty(NMIFB_GUARD_VAR); o->release(); IFBLOG("boot guard cleared: WindowServer is active on the panel");
+}
+
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
@@ -191,7 +223,7 @@ public:
         return kIOPMAckImplied;
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
-        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
+        if (attribute == kIOWindowServerActiveAttribute) { if (value) nmifbGuardClear(); return kIOReturnSuccess; }
         if (attribute == kIOPowerAttribute) {
             if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
                          return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
@@ -249,6 +281,7 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
     uint16_t dev = pci->configRead16(kIOPCIConfigDeviceID);
     fVer = displayVersion(dev);
     if (!fVer) return nullptr;   // an Intel GPU this driver does not know (older ones have Apple's own driver)
+    if (nmifbGuardTripped()) { IFBLOG("off: two starts in a row never reached WindowServer (clear with: sudo nvram -d " NMIFB_GUARD_VAR ")"); return nullptr; }
     IFBLOG("8086:%04x display version %u", dev, fVer);
     return IOFramebuffer::probe(provider, score);
 }
@@ -268,9 +301,8 @@ bool NMIntelFB::adoptFirmwareMode()
         if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) {
             IFBLOG("pipe %c: plane %ux%u stride %u is not a usable surface", 'A' + p, fWidth, fHeight, fRowBytes); return false;
         }
-        if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen) {
-            IFBLOG("pipe %c: surface at 0x%x is past the %llu MiB aperture", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20)); return false;
-        }
+        if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen)   // only informative: BAR2 is not used for scanout
+            IFBLOG("pipe %c: surface at GGTT 0x%x lies past the %llu MiB BAR2 window", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20));
         // the transcoder that feeds pipe p is p on these display versions (eDP on transcoder A in every recording)
         fHT = (rd(HTOTAL(p)) >> 16) + 1; fVT = (rd(VTOTAL(p)) >> 16) + 1;
         fHSS = (rd(HSYNC(p)) & 0xFFFF) + 1; fHSE = (rd(HSYNC(p)) >> 16) + 1;
@@ -331,6 +363,22 @@ bool NMIntelFB::start(IOService *provider)
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
     if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    // Scan out at the boot console's address (what IONDRV uses), never BAR2 + PLANE_SURF: on display 14 CPU access to
+    // stolen memory through the BAR can hang the machine (Linux i915 Wa_22018444074).
+    {
+        PE_Video v; bzero(&v, sizeof v);
+        bool cons = getPlatform() && getPlatform()->getConsoleInfo(&v) == kIOReturnSuccess && v.v_baseAddr && v.v_depth == 32;
+        uint64_t cbase = cons ? ((uint64_t)v.v_baseAddr & ~3ull) : 0;
+        IFBLOG("scanout: console 0x%llx %lux%lu rowBytes %lu, BAR2 0x%llx + PLANE_SURF 0x%x = 0x%llx (not used)",
+               (unsigned long long)cbase, cons ? v.v_width : 0, cons ? v.v_height : 0, cons ? v.v_rowBytes : 0,
+               (unsigned long long)fApertureBase, fSurf, (unsigned long long)(fApertureBase + fSurf));
+        if (!cons || v.v_width != fWidth || v.v_height != fHeight || v.v_rowBytes != fRowBytes) {
+            IFBLOG("the boot console does not match the lit plane - leaving the firmware screen");
+            OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false;
+        }
+        fApertureBase = cbase; fSurf = 0; fApertureLen = (IOPhysicalLength)fRowBytes * fHeight;
+    }
+    nmifbGuardCount();   // only a start that is about to publish can fail WindowServer; a clean decline is not a strike
     if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
     // display pipe copies each frame into fSurfMap. Without NVAccel the panel stays a plain framebuffer.
