@@ -87,6 +87,8 @@ RTX 5070 Laptop (`10DE:2D18`), 2560x1600 at 165 Hz, macOS 26.7.1 (25G241), OpenC
 - Present path: flips latched at the panel rate (165/s), window drags about 148 fps; shipped 2.1.0 on the same machine did about 54.
 - Power: 115 W enforced with `nvrmtgp=1` (VBIOS default 50 W; Windows runs the same GPU at 115 W with Dynamic Boost).
 - Terminal overdraw from 2.1.0: gone since nvgfx.1.
+- Geekbench 6.7.1 Metal: 103094 on 2.4.3-nvgfx.1 (2026-10-20, https://browser.geekbench.com/v6/compute/6944564);
+  Background Blur completes here (upstream #292 reports a hang at that subtest on other machines).
 - WindowServer CPU after boot: normal since nvgfx.20 (before: about 150 % while it re-translated every shader).
 - Still wrong: the Dock's blur draws as blocks (a WindowServer framebuffer-fetch problem, under investigation with the trace switches).
 
