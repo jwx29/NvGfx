@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Compile every drm-kmod source (drm, dmabuf, ttm, i915) for the XNU kernel target with -fsyntax-only and rank what
 # breaks: missing headers first, then the most common first errors. The scoreboard is the X1 progress measure.
-import argparse, collections, concurrent.futures as cf, json, os, re, subprocess, sys
+import argparse, collections, concurrent.futures as cf, glob, json, os, re, subprocess, sys
 
 SRC = os.path.expanduser("~/src/xe-src")
 KMOD = os.path.join(SRC, "drm-kmod")
@@ -88,12 +88,37 @@ def kconfig_defines():
     return d
 
 
+# XEGFX_OVERLAY: a directory with exclude.txt (source basenames to drop), include/ (searched before drm-kmod) and
+# src/<module>/*.c (added to that module). The NvGfx fork keeps its non-GPL replacements for drm-kmod's GPL-2.0 files
+# there (gpu/xkpi). Without an overlay the build still uses drm-kmod's GPL-only gplv2 headers and refuses --obj.
+OVERLAY = os.environ.get("XEGFX_OVERLAY")
+
+
+def overlay_exclude():
+    f = os.path.join(OVERLAY, "exclude.txt") if OVERLAY else None
+    if not f or not os.path.exists(f):
+        return set()
+    return {l.split("#")[0].strip() for l in open(f) if l.split("#")[0].strip()}
+
+
+def overlay_sources(mod):
+    d = os.path.join(OVERLAY, "src", mod) if OVERLAY else None
+    if not d or not os.path.isdir(d):
+        return []
+    return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".c"))
+
+
 KERN_SRCS = ["kern/subr_eventhandler.c"]
 # LinuxKPI's own implementation, minus subsystems the GPU stack does not use
 LKPI_SKIP = ("80211", "usb", "netdev", "skbuff", "mhi", "page_pool", "i2cbb", "hdmikmod", "videokmod", "cmdline", "linux_i2c", "linux_acpi")
 
 
 def sources(mod):
+    drop = overlay_exclude()
+    return [p for p in _sources(mod) if os.path.basename(p) not in drop] + overlay_sources(mod)
+
+
+def _sources(mod):
     if mod == "kern":  # FreeBSD kernel sources reused unchanged
         return [os.path.join(SRC, "freebsd/sys", f) for f in KERN_SRCS]
     if mod == "shim":
@@ -140,7 +165,9 @@ def make_cflags(mod):
 
 
 def flags(mod):
-    inc = [os.path.join(ROOT, "shim/include"), os.path.join(KMOD, "linuxkpi/gplv2/include"),
+    gpl = [] if OVERLAY else [os.path.join(KMOD, "linuxkpi/gplv2/include")]
+    ovl = [os.path.join(OVERLAY, "include")] if OVERLAY and os.path.isdir(os.path.join(OVERLAY, "include")) else []
+    inc = [os.path.join(ROOT, "shim/include")] + ovl + gpl + [
            os.path.join(KMOD, "linuxkpi/bsd/include"), os.path.join(LKPI, "common/include"),
            os.path.join(LKPI, "dummy/include"), os.path.join(KMOD, "include"),
            os.path.join(KMOD, "include/uapi"), os.path.join(KMOD, "drivers/gpu/drm"), os.path.join(KMOD, "drivers/gpu"),
@@ -164,13 +191,41 @@ def flags(mod):
 OBJ = None
 
 
+PERMISSIVE = ("MIT", "BSD", "X11", "ISC", "Apache", "Zlib", "curl", "Linux-OpenIB")
+
+
+def gpl_only(path):
+    """True when the file's licence is GPL with no permissive alternative (SPDX line, else the GPL boilerplate)."""
+    try:
+        head = open(path, errors="ignore").read(4096)
+    except OSError:
+        return False
+    m = re.search(r"SPDX-License-Identifier:\s*(.+)", head)
+    if m:
+        expr = m.group(1).strip().rstrip("*/ ").strip()
+        return "GPL" in expr and "Linux-syscall-note" not in expr and not any(k in expr for k in PERMISSIVE)
+    return "GNU General Public License" in head and not re.search(r"\b(MIT|BSD|dual)\b", head, re.I)
+
+
+def licence_gate(jobs):
+    files = {p for _, p in jobs}
+    for d in glob.glob(os.path.join(OBJ, "*", "*.o.d")):
+        for tok in open(d).read().replace("\\\n", " ").split()[1:]:
+            if tok.endswith((".h", ".c")):
+                files.add(os.path.normpath(tok))
+    bad = sorted(f for f in files if gpl_only(f))
+    with open(os.path.join(ROOT, "out", "licence.txt"), "w") as f:
+        f.write("\n".join(bad) + ("\n" if bad else ""))
+    return bad
+
+
 def compile_one(args):
     mod, path = args
     out = ["-fsyntax-only"]
     if OBJ:
         o = os.path.join(OBJ, mod, os.path.basename(path) + ".o")
         os.makedirs(os.path.dirname(o), exist_ok=True)
-        out = ["-c", "-o", o]
+        out = ["-c", "-o", o, "-MD", "-MF", o + ".d"]
     fl = flags(mod)
     if mod == "shim":  # our own code: real warnings
         fl = [x for x in fl if x not in ("-Wno-everything", "-ferror-limit=1")] + ["-ferror-limit=40", "-Wall", "-Wno-sign-conversion", "-Wno-shorten-64-to-32", "-Wno-macro-redefined", "-Wno-unused-variable", "-Wno-unused-function", "-Werror=implicit-function-declaration"]
@@ -220,6 +275,12 @@ def main():
     jobs = [(m, p) for m in a.mods.split(",") for p in sources(m)]
     with cf.ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
         res = list(ex.map(compile_one, jobs))
+    if OBJ:
+        bad = licence_gate(jobs)
+        print(f"licence gate: {len(bad)} GPL-only files compiled or included (out/licence.txt)")
+        if bad and OVERLAY:
+            print("\n".join("  " + b for b in bad[:40]))
+            return 2
     ok = collections.Counter(m for m, _, good, _ in res if good)
     tot = collections.Counter(m for m, _, _, _ in res)
     missing, kinds = collections.Counter(), collections.Counter()
