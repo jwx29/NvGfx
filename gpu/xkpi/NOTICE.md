@@ -9,3 +9,12 @@ that are GPL-only, so the kext contains no GPL-only code (Legion I-097).
 | `include/uapi/linux/sync_file.h` | Linux v6.14 | GPL-1.0+ WITH Linux-syscall-note (interface header) |
 | `include/drm/drm_format_helper.h` | written for this fork | MIT |
 | `exclude.txt` | written for this fork | MIT |
+
+# gpu/userland
+
+| Path | Origin | Licence |
+|---|---|---|
+| `patches/mesa-macos.patch`, `patches/libdrm-macos.patch`, `tools/vkprobe.c`, `drmlist.c`, `fill.comp` | NullMoth, nvidia-macos-driver commit bf2dee3, `gpu-port/` (audited) | PolyForm Noncommercial 1.0.0 |
+| `scripts/`, `BUILD.md`, `*.ini` | written for this fork | as the rest of this repository |
+
+Upstream sources the scripts fetch: [Mesa](https://gitlab.freedesktop.org/mesa/mesa) bffd919 (MIT) and [libdrm](https://gitlab.freedesktop.org/mesa/drm) b97cbde (MIT).
