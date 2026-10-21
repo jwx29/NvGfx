@@ -1,0 +1,15 @@
+register_acpi_notifier
+unregister_acpi_notifier
+intel_graphics_stolen_base
+intel_graphics_stolen_size
+intel_gtt_chipset_flush
+intel_gtt_clear_range
+intel_gtt_get
+intel_gtt_install_pte
+intel_gtt_read_pte
+acpi_target_system_state
+backlight_destroy
+backlight_get_info_desc
+backlight_get_status_desc
+backlight_register
+backlight_update_status_desc
