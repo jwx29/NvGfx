@@ -88,7 +88,14 @@ def kconfig_defines():
     return d
 
 
+# LinuxKPI's own implementation, minus subsystems the GPU stack does not use
+LKPI_SKIP = ("80211", "usb", "netdev", "skbuff", "mhi", "page_pool", "i2cbb", "hdmikmod", "videokmod")
+
+
 def sources(mod):
+    if mod == "lkpi":
+        d = os.path.join(LKPI, "common/src")
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".c") and not any(k in f for k in LKPI_SKIP))
     mk = os.path.join(KMOD, mod, "Makefile")
     paths = [os.path.join(KMOD, MODULES[mod])]
     for line in open(mk):
@@ -108,6 +115,8 @@ def sources(mod):
 
 def make_cflags(mod):
     """The module Makefile's own CFLAGS+= lines with its make variables resolved."""
+    if mod == "lkpi":
+        return ['-DKBUILD_MODNAME="linuxkpi"', "-DLINUXKPI_PARAM_PREFIX=compat_"]
     out, kmodname = [], make_list(os.path.join(KMOD, mod, "Makefile"), "KMOD")
     sub = {"${.CURDIR:H}": KMOD, "${SRCDIR:H:H}": os.path.join(KMOD, "drivers"),
            "${SRCDIR}": os.path.join(KMOD, MODULES[mod]), "${KMOD}": kmodname[0] if kmodname else mod}
@@ -130,11 +139,12 @@ def flags(mod):
            os.path.join(LKPI, "dummy/include"), os.path.join(KMOD, "include"),
            os.path.join(KMOD, "include/uapi"), os.path.join(KMOD, "drivers/gpu/drm"), os.path.join(KMOD, "drivers/gpu"),
            os.path.join(ROOT, "shim/gen"),
-           os.path.join(KMOD, MODULES[mod]),
+           os.path.join(KMOD, MODULES.get(mod, "drivers/gpu/drm")),
            # FreeBSD's own kernel headers as the fallback, machine/ and x86/ mapped to amd64
            os.path.join(ROOT, "shim/fbsd"), os.path.join(SRC, "freebsd/sys"),
            os.path.join(SRC, "freebsd/sys/contrib/ck/include")]
-    f = ["-target", "x86_64-apple-macos15.0", "-ffreestanding", "-nostdinc", "-fno-builtin", "-fsyntax-only",
+    f = ["-target", "x86_64-apple-macos15.0", "-ffreestanding", "-nostdinc", "-fno-builtin",
+         "-mkernel", "-fno-common", "-O2",
          "-std=gnu11", "-D_KERNEL", "-DKLD_MODULE", "-D__FreeBSD__=15", "-U__APPLE__", "-U__MACH__", "-U__APPLE_CC__", "-D__amd64__", "-D__x86_64__", "-D__XNU_LKPI__", "-DLINUXKPI_VERSION=61400",
          "-include", os.path.join(LKPI, "common/include/linux/compiler_types.h"),
          "-include", os.path.join(LKPI, "common/include/linux/kconfig.h"),
@@ -142,18 +152,30 @@ def flags(mod):
     return f + kconfig_defines() + make_cflags(mod) + [x for i in inc for x in ("-I", i)]
 
 
+OBJ = None
+
+
 def compile_one(args):
     mod, path = args
-    r = subprocess.run(["xcrun", "clang"] + flags(mod) + [path], capture_output=True, text=True)
+    out = ["-fsyntax-only"]
+    if OBJ:
+        o = os.path.join(OBJ, mod, os.path.relpath(path, SRC).replace("/", "__") + ".o")
+        os.makedirs(os.path.dirname(o), exist_ok=True)
+        out = ["-c", "-o", o]
+    r = subprocess.run(["xcrun", "clang"] + flags(mod) + out + [path], capture_output=True, text=True)
     err = next((l for l in r.stderr.splitlines() if " error: " in l), "")
     return mod, os.path.relpath(path, KMOD), r.returncode == 0, err
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mods", default="drm,dmabuf,ttm,i915")
+    ap.add_argument("--mods", default="lkpi,drm,dmabuf,ttm,i915")
+    ap.add_argument("--obj", action="store_true", help="build objects in out/obj and list undefined symbols")
     ap.add_argument("--json", default=os.path.join(ROOT, "out/score.json"))
     a = ap.parse_args()
+    global OBJ
+    if a.obj:
+        OBJ = os.path.join(ROOT, "out/obj")
     jobs = [(m, p) for m in a.mods.split(",") for p in sources(m)]
     with cf.ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
         res = list(ex.map(compile_one, jobs))
@@ -177,7 +199,27 @@ def main():
     print("\nfirst errors:")
     for k, n in kinds.most_common(25):
         print(f"  {n:4d}  {k}")
+    if OBJ:
+        undefined_report()
     json.dump([dict(mod=m, file=f, ok=g, err=e) for m, f, g, e in res], open(a.json, "w"), indent=1)
+
+
+def undefined_report():
+    """Symbols the objects need that none of them define: the FreeBSD kernel API to implement on XNU."""
+    defined, need = set(), collections.Counter()
+    objs = [os.path.join(dp, f) for dp, _, fs in os.walk(OBJ) for f in fs if f.endswith(".o")]
+    for o in objs:
+        for line in subprocess.run(["nm", "-g", o], capture_output=True, text=True).stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "U":
+                need[parts[1]] += 1
+            elif len(parts) == 3:
+                defined.add(parts[2])
+    und = {k: v for k, v in need.items() if k not in defined}
+    open(os.path.join(ROOT, "out/undefined.txt"), "w").write("".join(f"{v} {k}\n" for k, v in sorted(und.items(), key=lambda x: -x[1])))
+    print(f"\nundefined symbols: {len(und)} (out/undefined.txt)")
+    for k, v in sorted(und.items(), key=lambda x: -x[1])[:40]:
+        print(f"  {v:4d}  {k}")
 
 
 if __name__ == "__main__":
