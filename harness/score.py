@@ -93,6 +93,9 @@ LKPI_SKIP = ("80211", "usb", "netdev", "skbuff", "mhi", "page_pool", "i2cbb", "h
 
 
 def sources(mod):
+    if mod == "shim":
+        d = os.path.join(ROOT, "shim/src/fbsd")
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".c"))
     if mod == "lkpi":
         d = os.path.join(LKPI, "common/src")
         return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".c") and not any(k in f for k in LKPI_SKIP))
@@ -115,7 +118,7 @@ def sources(mod):
 
 def make_cflags(mod):
     """The module Makefile's own CFLAGS+= lines with its make variables resolved."""
-    if mod == "lkpi":
+    if mod in ("lkpi", "shim"):
         return ['-DKBUILD_MODNAME="linuxkpi"', "-DLINUXKPI_PARAM_PREFIX=compat_"]
     out, kmodname = [], make_list(os.path.join(KMOD, mod, "Makefile"), "KMOD")
     sub = {"${.CURDIR:H}": KMOD, "${SRCDIR:H:H}": os.path.join(KMOD, "drivers"),
@@ -149,7 +152,7 @@ def flags(mod):
          "-include", os.path.join(LKPI, "common/include/linux/compiler_types.h"),
          "-include", os.path.join(LKPI, "common/include/linux/kconfig.h"),
          "-Wno-everything", "-ferror-limit=1"]
-    if mod != "lkpi":  # consumers only; the base-kernel LinuxKPI is built without it
+    if mod not in ("lkpi", "shim"):  # consumers only; the base-kernel LinuxKPI is built without it
         f.append("-DLINUXKPI_VERSION=61400")
     return f + kconfig_defines() + make_cflags(mod) + [x for i in inc for x in ("-I", i)]
 
@@ -161,17 +164,22 @@ def compile_one(args):
     mod, path = args
     out = ["-fsyntax-only"]
     if OBJ:
-        o = os.path.join(OBJ, mod, os.path.relpath(path, SRC).replace("/", "__") + ".o")
+        o = os.path.join(OBJ, mod, os.path.basename(path) + ".o")
         os.makedirs(os.path.dirname(o), exist_ok=True)
         out = ["-c", "-o", o]
-    r = subprocess.run(["xcrun", "clang"] + flags(mod) + out + [path], capture_output=True, text=True)
+    fl = flags(mod)
+    if mod == "shim":  # our own code: real warnings
+        fl = [x for x in fl if x not in ("-Wno-everything", "-ferror-limit=1")] + ["-ferror-limit=40", "-Wall", "-Wno-sign-conversion", "-Wno-shorten-64-to-32", "-Wno-macro-redefined", "-Wno-unused-variable", "-Wno-unused-function", "-Werror=implicit-function-declaration"]
+    r = subprocess.run(["xcrun", "clang"] + fl + out + [path], capture_output=True, text=True)
     err = next((l for l in r.stderr.splitlines() if " error: " in l), "")
+    if mod == "shim" and r.stderr.strip():
+        print(r.stderr)
     return mod, os.path.relpath(path, KMOD), r.returncode == 0, err
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mods", default="lkpi,drm,dmabuf,ttm,i915")
+    ap.add_argument("--mods", default="shim,lkpi,drm,dmabuf,ttm,i915")
     ap.add_argument("--obj", action="store_true", help="build objects in out/obj and list undefined symbols")
     ap.add_argument("--json", default=os.path.join(ROOT, "out/score.json"))
     a = ap.parse_args()
