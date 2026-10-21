@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Compile every drm-kmod source (drm, dmabuf, ttm, i915) for the XNU kernel target with -fsyntax-only and rank what
 # breaks: missing headers first, then the most common first errors. The scoreboard is the X1 progress measure.
-import argparse, collections, concurrent.futures as cf, glob, json, os, re, subprocess, sys
+import argparse, collections, concurrent.futures as cf, glob, json, os, re, shlex, subprocess, sys
 
 SRC = os.path.expanduser("~/src/xe-src")
 KMOD = os.path.join(SRC, "drm-kmod")
@@ -83,7 +83,9 @@ def kconfig():
 def kconfig_defines():
     d = []
     for v in kconfig():
-        k, _, val = v.partition("=")
+        # kconfig.mk values are shell words ('"*"' is the C string "*"); clang gets argv without a shell, so unquote
+        # them here or the quotes reach the source (N-217: force_probe became the multi-char constant 0x222a22)
+        k, _, val = shlex.split(v)[0].partition("=") if v else ("", "", "")
         d.append(f"-DCONFIG_{k}={val or 1}")
     return d
 
