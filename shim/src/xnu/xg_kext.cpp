@@ -21,10 +21,12 @@
 extern "C" {
 void xg_start_stage(int stage);
 int xg_drm_attached(void);
+int xg_pci_xnu_start(void *iopcidevice);
+void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.3", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.4", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 }
@@ -227,6 +229,15 @@ xg_run_stage(int s)
 		rc = xg_probe();
 	} else {
 		xg_start_stage(s);
+		if (s == 3) {
+			/* every IOPCIDevice into newbus (config reads only), then vgapci on the Intel display function so
+			 * stage 4's drm drivers have a device to probe; the old PCI personality used to trigger this */
+			IOPCIDevice *gpu = xg_find_pci(0x8086, 0x03, 0x00);
+			int err = gpu ? xg_pci_xnu_start(gpu) : ENODEV;
+			OSSafeReleaseNULL(gpu);
+			rc = err ? -err : 1;
+			xg_newbus_dump();
+		}
 		if (s == 4) {
 			rc = xg_display_check();
 			if (rc == 1 && !xg_drm_attached())
