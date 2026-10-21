@@ -41,6 +41,7 @@ static int gResult[5];	/* per stage: 0 not run, 1 pass, negative errno-style fai
 static int gWdog = 60;
 static thread_call_t gWdogCall;
 static IOLock *gStageLock;
+static uint64_t gSurfPte;	/* GGTT entry behind PLANE_SURF_1_A at probe time, 0 if unknown */
 
 bool
 XeGfxResident::start(IOService *provider)
@@ -138,6 +139,12 @@ xg_probe(void)
 			xg_progress = 22;
 			for (auto &e : regs)
 				xg_put(d, e.k, r[e.off / 4]);
+			if (mm->getLength() >= 16ull << 20) {
+				uint32_t surf = r[0x7019c / 4] & ~0xfffu;
+				volatile uint64_t *gtt = (volatile uint64_t *)(mm->getVirtualAddress() + (8ull << 20));
+				gSurfPte = gtt[surf >> 12];
+				xg_put(d, "ggtt-pte-surf", gSurfPte, 64);
+			}
 			mm->release();
 		} else {
 			rc = -5;
@@ -169,6 +176,36 @@ out:
 	return rc;
 }
 
+/* after i915 has run: the panel must still scan out the boot surface through the same GGTT entry, and pipe A must
+ * still count frames; otherwise the desktop is black even though WindowServer looks fine */
+static int
+xg_display_check(void)
+{
+	OSDictionary *d = OSDictionary::withCapacity(8);
+	IOPCIDevice *gpu = xg_find_pci(0x8086, 0x03, 0x00);
+	IOMemoryMap *mm = gpu ? gpu->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache) : nullptr;
+	int rc = -6;
+
+	if (mm && d && mm->getLength() >= 16ull << 20) {
+		volatile uint32_t *r = (volatile uint32_t *)mm->getVirtualAddress();
+		uint32_t surf = r[0x7019c / 4] & ~0xfffu, f0 = r[0x70040 / 4];
+		uint64_t pte = ((volatile uint64_t *)(mm->getVirtualAddress() + (8ull << 20)))[surf >> 12];
+		IOSleep(100);
+		uint32_t f1 = r[0x70040 / 4];
+		xg_put(d, "plane-surf-1-a", surf);
+		xg_put(d, "ggtt-pte-surf", pte, 64);
+		xg_put(d, "frmcount-delta", f1 - f0);
+		rc = (gSurfPte && pte != gSurfPte) ? -71 : (f1 == f0 ? -70 : 1);
+		xg_put(d, "result", (uint32_t)rc);
+		if (gResident)
+			gResident->setProperty("XeGfxPost", d);
+	}
+	OSSafeReleaseNULL(d);
+	OSSafeReleaseNULL(mm);
+	OSSafeReleaseNULL(gpu);
+	return rc;
+}
+
 static int
 xg_run_stage(int s)
 {
@@ -181,10 +218,13 @@ xg_run_stage(int s)
 		clock_interval_to_deadline(gWdog, NSEC_PER_SEC, &dl);
 		thread_call_enter_delayed(gWdogCall, dl);
 	}
-	if (s == 2)
+	if (s == 2) {
 		rc = xg_probe();
-	else
+	} else {
 		xg_start_stage(s);
+		if (s == 4)
+			rc = xg_display_check();
+	}
 	if (gWdogCall)
 		thread_call_cancel(gWdogCall);
 	gRunning = 0;

@@ -22,6 +22,13 @@ xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib -Xli
   -Xlinker -filelist -Xlinker "$O/objs.txt" "$O/xg_stubs.o" "$O"/*.cpp.o -o "$B/MacOS/XeGfx" 2> "$O/ld.txt" || {
   grep -E 'Undefined|duplicate|error' "$O/ld.txt" | head -40; exit 1; }
 cp "$ROOT/kext/Info.plist" "$B/Info.plist"
+# GuC only for now: HuC and GSC need MEI (none on macOS), DMC only matters once i915 owns the display.
+# Blobs come from linux-firmware (LICENSE.i915, redistributable) and are not in this repo.
+FW=${XEGFX_FW:-$HOME/src/xe-src/linux-firmware}
+if [ -f "$FW/mtl_guc_70.bin" ]; then
+  mkdir -p "$B/Resources"
+  cp "$FW/mtl_guc_70.bin" "$FW/LICENSE.i915" "$B/Resources/"
+fi
 codesign -s - -f "$ROOT/out/XeGfx.kext" >/dev/null 2>&1 || true
 echo "XeGfx.kext $(stat -f %z "$B/MacOS/XeGfx") B"
 python3 ~/src/kcabi/linkcheck.py "$ROOT/out/XeGfx.kext" | tail -25
