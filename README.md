@@ -33,7 +33,7 @@ XeGfx stands on other people's work. Thank you to all of them.
 | [sgiammori/NootedGreen](https://github.com/sgiammori/NootedGreen) | how far the Apple TGL donor approach reaches on Alder Lake and Raptor Lake |
 | [JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe) | keeping the firmware's eDP mode, the boot-programmable mode trap in WindowServer, the GGTT[0] machine-check hazard, Tahoe IOSurface offsets |
 | [m4j2rpf766-crypto/IntelIGPU-Tahoe](https://github.com/m4j2rpf766-crypto/IntelIGPU-Tahoe) | handing the panel over from IONDRVFramebuffer on Tahoe; isolating the iGPU at boot |
-| [VedCloud2/CoreUltraGraphics](https://github.com/VedCloud2/CoreUltraGraphics) | the same i915-on-XNU idea on Meteor Lake, and where it stopped (GuC loading) |
+| [VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) (earlier: [VedCloud2/CoreUltraGraphics](https://github.com/VedCloud2/CoreUltraGraphics)) | the first i915-on-XNU port to drive real Intel hardware: an i915-derived kernel driver on LinuxKPI, Mesa ANV and a NullMoth-derived Metal plugin, with Metal and Vulkan working on a Meteor Lake Dell Latitude 5350 under macOS 15 |
 | [IT-EXPRESS-Bayern/LunarBridge-Hackintosh](https://github.com/IT-EXPRESS-Bayern/LunarBridge-Hackintosh) | Lunar Lake (Xe2) groundwork on Tahoe |
 | [wallali77666-cyber/iris-xe-macos-driver](https://github.com/wallali77666-cyber/iris-xe-macos-driver) | a NullMoth-style stack aimed at Tiger Lake |
 | [lutzbichler/drm-kmod](https://github.com/lutzbichler/drm-kmod) (xe patches) and [drm-kmod #316](https://github.com/freebsd/drm-kmod/issues/316) | the state of the xe driver outside Linux |
@@ -43,7 +43,7 @@ XeGfx stands on other people's work. Thank you to all of them.
 
 ## Status (2026-10-21)
 
-Work in progress. No GPU has been driven yet. Nobody has run a Linux GPU driver on XNU against Intel hardware so far (NullMoth's NMXGPU never attached, VedCloud2's CoreUltraGraphics stopped at GuC loading), so treat every milestone below as open until a boot proves it.
+Work in progress. XeGfx has not driven a GPU yet. The approach itself is proven on real hardware: [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) runs an i915-derived driver on XNU with Metal and Vulkan working on a Dell Latitude 5350 under macOS 15. XeGfx targets Tahoe with its own LinuxKPI shim, so treat every milestone below as open until a boot proves it here.
 
 | M | Done when | State |
 |---|---|---|
