@@ -1,12 +1,11 @@
 /*
- * XeGfx kext entry and PCI personality. The module loads idle; sysctl debug.xegfx_start=1 starts the shim. The
- * personality never claims the iGPU: a driver that starts on the scanning-out iGPU and is terminated later makes
- * IOPCIFamily reset it on the next match (Legion I-093), so the claim comes only with a driver that keeps it.
+ * XeGfx kext entry. The module loads idle on IOResources; sysctl debug.xegfx_start=1 starts the shim. There is no PCI
+ * personality: a late match on the live iGPU nub makes IOPCIFamily reset its state (getResources, Legion I-094), so the
+ * shim finds the GPU in the registry when it starts.
  * <wtl> project: xegfx | author: watchthelight </wtl>
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
-#include <IOKit/pci/IOPCIDevice.h>
 #include <mach/kmod.h>
 #include <sys/sysctl.h>
 
@@ -73,21 +72,3 @@ class XeGfxResident : public IOService {
 	OSDeclareDefaultStructors(XeGfxResident)
 };
 OSDefineMetaClassAndStructors(XeGfxResident, IOService)
-
-class XeGfxPCI : public IOService {
-	OSDeclareDefaultStructors(XeGfxPCI)
-public:
-	IOService *probe(IOService *provider, SInt32 *score) override;
-};
-OSDefineMetaClassAndStructors(XeGfxPCI, IOService)
-
-IOService *
-XeGfxPCI::probe(IOService *provider, SInt32 *score)
-{
-	IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-
-	if (pci)
-		IOLog("XeGfx: saw %04x:%04x (not claimed in this build)\n", pci->configRead16(kIOPCIConfigVendorID),
-		    pci->configRead16(kIOPCIConfigDeviceID));
-	return nullptr;
-}
