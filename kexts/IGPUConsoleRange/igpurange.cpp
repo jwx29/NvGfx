@@ -17,7 +17,7 @@
 #define RLOG(fmt, ...) IOLog("IGPUConsoleRange: " fmt "\n", ##__VA_ARGS__)
 
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.IGPUConsoleRange, "0.1", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.IGPUConsoleRange, "0.2", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *, void *) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *, void *) { return KERN_SUCCESS; }
 
@@ -25,6 +25,11 @@ class IGPUConsoleRange : public IOService {
     OSDeclareDefaultStructors(IGPUConsoleRange)
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
+    bool start(IOService *provider) override {
+        if (!IOService::start(provider)) return false;
+        RLOG("holding the iGPU's framebuffer slot: the NVIDIA proxy head (nvfbigpu=1) drives this panel, not IONDRV");
+        return true;
+    }
 };
 OSDefineMetaClassAndStructors(IGPUConsoleRange, IOService)
 
@@ -67,5 +72,9 @@ IOService *IGPUConsoleRange::probe(IOService *provider, SInt32 *score)
     pci->setProperty("watchthelight-console-range", (unsigned long long)base, 64);
     RLOG("console 0x%llx (%lux%lu rowBytes %lu) is DSM+0x%llx: added as device memory %u for IONDRVFramebuffer",
          base, v.v_width, v.v_height, v.v_rowBytes, base - dsm, (unsigned)pci->getDeviceMemoryCount() - 1);
-    return nullptr;   // never starts: IONDRVFramebuffer probes next in this category
+    // nvfbigpu=1: NVRMFB's proxy head drives this panel, so IONDRV must not start a second framebuffer on the same
+    // memory; holding the category blocks it. Otherwise decline and let IONDRVFramebuffer probe next.
+    int proxy = 0;
+    if (PE_parse_boot_argn("nvfbigpu", &proxy, sizeof proxy) && proxy) return this;
+    return nullptr;
 }
