@@ -37,3 +37,10 @@ python3 ~/src/kcabi/linkcheck.py "$ROOT/out/XeGfx.kext" | tail -25
 python3 "$ROOT/tools/kpi_check.py" "$ROOT/out/XeGfx.kext" || exit 1
 # a kernel name defined inside the kext would capture the XNU-side callers (I-094)
 python3 "$ROOT/tools/shadow_check.py" "$ROOT/out/XeGfx.kext" || exit 1
+# and against every other macOS build's collection we have (~/abi-src/<build>/kc, see kcabi)
+for kc in "$HOME"/abi-src/*/kc/BootKernelExtensions.kc; do
+  [ -f "$kc" ] || continue
+  echo -n "$(basename "$(dirname "$(dirname "$kc")")"): "; python3 ~/src/kcabi/linkcheck.py "$ROOT/out/XeGfx.kext" --kc "$kc" | tail -1
+  python3 "$ROOT/tools/shadow_check.py" "$ROOT/out/XeGfx.kext" --kc "$kc" | tail -1 | grep -q "ok" || {
+    python3 "$ROOT/tools/shadow_check.py" "$ROOT/out/XeGfx.kext" --kc "$kc"; exit 1; }
+done
