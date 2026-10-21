@@ -46,4 +46,11 @@ extern int vsnprintf(char *str, unsigned long size, const char *fmt, __builtin_v
 extern void kprintf(const char *fmt, ...);
 extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
 extern void panic(const char *fmt, ...) __attribute__((__noreturn__));
+#define XG_TC_PRIORITY_KERNEL	1
+#define XG_TC_OPTIONS_ONCE	0x1
+extern xg_call_t thread_call_allocate_with_options(void (*func)(void *, void *), void *param0, int pri, unsigned int options);
+extern int thread_call_enter1_delayed(xg_call_t call, void *param1, unsigned long long deadline);
+extern int thread_call_cancel(xg_call_t call);
+extern int thread_call_cancel_wait(xg_call_t call);
+extern int thread_call_free(xg_call_t call);
 #endif

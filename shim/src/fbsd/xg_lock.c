@@ -761,3 +761,16 @@ sched_relinquish(struct thread *td)
 {
 	thread_block(NULL);
 }
+
+/* callouts take and drop their associated lock through these */
+void
+xg_lock_acquire(struct lock_object *lo)
+{
+	xg_lock_take(lo, XG_HOW_X);
+}
+
+void
+xg_lock_release(struct lock_object *lo)
+{
+	xg_lock_drop(lo);
+}

@@ -3,7 +3,7 @@
  * Do not modify anything in here by hand.
  *
  * Created from source file
- *   /Users/bash/src/xe-src/freebsd/sys/dev/pci/pci_if.m
+ *   sys/dev/pci/pci_if.m
  * with
  *   makeobjops.awk
  *
