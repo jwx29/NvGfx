@@ -79,7 +79,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 #ifdef NMINTELFB_VIRTUAL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFBVirtual, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFB, "0.2", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFB, "0.3", _start, _stop) }
 #endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
@@ -184,6 +184,17 @@ private:
 
     uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
     bool adoptFirmwareMode();
+    // nmintelfbcache=1 write-combined, 2 cache-inhibited, else IOKit's default for device memory
+    void mapSurface() {
+        unsigned c = 0; PE_parse_boot_argn("nmintelfbcache", &c, sizeof c);
+        IOOptionBits mode = c == 1 ? kIOMapWriteCombineCache : c == 2 ? kIOMapInhibitCache : kIOMapDefaultCache;
+        nmifbStep(8, c == 1 ? "map surface wc" : c == 2 ? "map surface uc" : "map surface default");
+        if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight)) {
+            fSurfMap = sm->map(mode); sm->release();
+        }
+        IFBLOG("surface map %s", fSurfMap ? "made" : "FAILED: NVIDIA rendering stays off for this panel");
+        if (fSurfMap) nmifbStep(13, "surface mapped");
+    }
 
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
@@ -408,14 +419,10 @@ bool NMIntelFB::start(IOService *provider)
     if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
     // display pipe copies each frame into fSurfMap. Without NVAccel the panel stays a plain framebuffer.
-    nmifbStep(8, "map surface wc");
-    if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight)) {
-        fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
-    }
-    if (fSurfMap) {
-        setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-        setProperty("IOFBDependentIndex", 4ull, 32);
-    } else IFBLOG("the surface would not map write-combined: NVIDIA rendering stays off for this panel");
+    // The kernel mapping of the surface is made only when NVAccel asks for the scanout (head 4 copy path): a
+    // write-combined map of the DSM framebuffer in start() hung the machine twice (I-090, stage 8).
+    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
+    setProperty("IOFBDependentIndex", 4ull, 32);
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
@@ -488,6 +495,7 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
         NVRMVramRequest *r = (NVRMVramRequest *)p1;
         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+        if (!fSurfMap) mapSurface();
         if (!fSurfMap) return kIOReturnNotReady;
         r->kva = (void *)fSurfMap->getVirtualAddress();
         r->phys = 0; r->actualSize = 0;
