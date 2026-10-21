@@ -10,8 +10,8 @@
 #include <mach/kmod.h>
 
 extern "C" {
-void xg_kern_init(void);
-void xg_task_init(void);
+void xg_start(void);
+void xg_stop(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
@@ -35,8 +35,7 @@ _start(kmod_info_t *, void *)
 		IOLog("XeGfx: loaded, idle (boot-arg xegfx=1 starts the shim)\n");
 		return KERN_SUCCESS;
 	}
-	xg_kern_init();
-	xg_task_init();
+	xg_start();
 	gShimUp = true;
 	IOLog("XeGfx: shim started\n");
 	return KERN_SUCCESS;

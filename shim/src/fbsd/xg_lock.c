@@ -774,3 +774,42 @@ xg_lock_release(struct lock_object *lo)
 {
 	xg_lock_drop(lo);
 }
+
+/* ---- msleep/wakeup: the wait is asserted before the interlock is dropped, so a wakeup issued under that
+ * interlock cannot be lost, and no chain lock is held while the interlock is released ---- */
+int
+_sleep(const void *chan, struct lock_object *lock, int pri, const char *wmesg, sbintime_t sbt, sbintime_t pr,
+    int flags)
+{
+	int how = 0, r, intr = (pri & PCATCH) != 0;
+
+	xg_sq_lock(chan);
+	if (sbt != 0)
+		assert_wait_deadline((void *)(uintptr_t)chan, intr ? XG_THREAD_ABORTSAFE : XG_THREAD_UNINT,
+		    xg_sbt_deadline((flags & C_ABSOLUTE) ? sbt : xg_sbinuptime() + sbt));
+	else
+		assert_wait((void *)(uintptr_t)chan, intr ? XG_THREAD_ABORTSAFE : XG_THREAD_UNINT);
+	xg_sq_unlock(chan);
+	if (lock != NULL)
+		how = xg_lock_drop(lock);
+	r = thread_block(NULL);
+	if (lock != NULL && !(pri & PDROP))
+		xg_lock_take(lock, how);
+	return (r == XG_THREAD_TIMED_OUT ? EWOULDBLOCK : r == XG_THREAD_INTERRUPTED ? EINTR : 0);
+}
+
+void
+wakeup(const void *chan)
+{
+	xg_sq_lock(chan);
+	xg_wake_all(chan);
+	xg_sq_unlock(chan);
+}
+
+void
+wakeup_one(const void *chan)
+{
+	xg_sq_lock(chan);
+	thread_wakeup_prim((void *)(uintptr_t)chan, 1, XG_THREAD_AWAKENED);
+	xg_sq_unlock(chan);
+}

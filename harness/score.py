@@ -88,11 +88,14 @@ def kconfig_defines():
     return d
 
 
+KERN_SRCS = ["kern/subr_eventhandler.c"]
 # LinuxKPI's own implementation, minus subsystems the GPU stack does not use
 LKPI_SKIP = ("80211", "usb", "netdev", "skbuff", "mhi", "page_pool", "i2cbb", "hdmikmod", "videokmod", "cmdline", "linux_i2c", "linux_acpi")
 
 
 def sources(mod):
+    if mod == "kern":  # FreeBSD kernel sources reused unchanged
+        return [os.path.join(SRC, "freebsd/sys", f) for f in KERN_SRCS]
     if mod == "shim":
         d = os.path.join(ROOT, "shim/src/fbsd")
         return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".c"))
@@ -118,7 +121,7 @@ def sources(mod):
 
 def make_cflags(mod):
     """The module Makefile's own CFLAGS+= lines with its make variables resolved."""
-    if mod in ("lkpi", "shim"):
+    if mod in ("lkpi", "shim", "kern"):
         return ['-DKBUILD_MODNAME="linuxkpi"', "-DLINUXKPI_PARAM_PREFIX=compat_"]
     out, kmodname = [], make_list(os.path.join(KMOD, mod, "Makefile"), "KMOD")
     sub = {"${.CURDIR:H}": KMOD, "${SRCDIR:H:H}": os.path.join(KMOD, "drivers"),
@@ -152,7 +155,7 @@ def flags(mod):
          "-include", os.path.join(LKPI, "common/include/linux/compiler_types.h"),
          "-include", os.path.join(LKPI, "common/include/linux/kconfig.h"),
          "-Wno-everything", "-ferror-limit=1"]
-    if mod not in ("lkpi", "shim"):  # consumers only; the base-kernel LinuxKPI is built without it
+    if mod not in ("lkpi", "shim", "kern"):  # consumers only; the base-kernel LinuxKPI is built without it
         f.append("-DLINUXKPI_VERSION=61400")
     return f + kconfig_defines() + make_cflags(mod) + [x for i in inc for x in ("-I", i)]
 
@@ -177,9 +180,19 @@ def compile_one(args):
     return mod, os.path.relpath(path, KMOD), r.returncode == 0, err
 
 
+def ensure_links():
+    fb = os.path.join(ROOT, "shim/fbsd")
+    os.makedirs(fb, exist_ok=True)
+    for name, target in (("machine", "freebsd/sys/amd64/include"), ("x86", "freebsd/sys/x86/include")):
+        link = os.path.join(fb, name)
+        if not os.path.lexists(link):
+            os.symlink(os.path.join(SRC, target), link)
+
+
 def main():
+    ensure_links()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mods", default="shim,lkpi,drm,dmabuf,ttm,i915")
+    ap.add_argument("--mods", default="shim,kern,lkpi,drm,dmabuf,ttm,i915")
     ap.add_argument("--obj", action="store_true", help="build objects in out/obj and list undefined symbols")
     ap.add_argument("--one", help="compile one shim source (shim flags, all errors shown) into out/one/; for parallel work")
     ap.add_argument("--json", default=os.path.join(ROOT, "out/score.json"))

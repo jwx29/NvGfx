@@ -23,6 +23,8 @@ const char *panicstr = NULL;
 int mp_ncpus = 1;
 u_int mp_maxid = 0;
 struct proc proc0;
+extern struct mtx xg_thread_lock_mtx;
+void xg_sched_td_register(struct thread *td);
 static struct ucred xg_cred0;
 static unsigned long long xg_boot_abs;
 
@@ -74,6 +76,7 @@ xg_curthread(void)
 		panic("xegfx: no memory for a thread shadow");
 	td->td_proc = &proc0;
 	td->td_ucred = &xg_cred0;
+	td->td_lock = &xg_thread_lock_mtx;
 	td->td_tid = atomic_fetchadd_int((volatile u_int *)&xg_next_tid, 1);
 	td->td_priority = PUSER;
 	strlcpy(td->td_name, "xnu", sizeof(td->td_name));
@@ -96,6 +99,7 @@ xg_curthread(void)
 	}
 	xg_spin_unlock(&xg_td_lock);
 	ml_set_interrupts_enabled(en);
+	xg_sched_td_register(td);	/* tid lookup (tdfind) and proc0's thread list */
 	return (td);
 }
 
@@ -267,7 +271,8 @@ kern_getenv(const char *name)
 	char *s;
 	size_t n;
 
-	if (!PE_parse_boot_argn(xg_tunable(name), buf, sizeof(buf)))
+	/* the _str variant: PE_parse_boot_argn stores a numeric value in binary */
+	if (!PE_parse_boot_arg_str(xg_tunable(name), buf, sizeof(buf)))
 		return (NULL);
 	n = strnlen(buf, sizeof(buf) - 1) + 1;
 	s = malloc(n, M_TEMP, M_WAITOK);

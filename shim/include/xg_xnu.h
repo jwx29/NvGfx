@@ -45,6 +45,7 @@ extern int vprintf(const char *fmt, __builtin_va_list ap);
 extern int vsnprintf(char *str, unsigned long size, const char *fmt, __builtin_va_list ap);
 extern void kprintf(const char *fmt, ...);
 extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
+extern int PE_parse_boot_arg_str(const char *arg_string, char *arg_ptr, int size);
 extern void panic(const char *fmt, ...) __attribute__((__noreturn__));
 #define XG_TC_PRIORITY_KERNEL	1
 #define XG_TC_OPTIONS_ONCE	0x1

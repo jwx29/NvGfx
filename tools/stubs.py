@@ -27,7 +27,7 @@ def main():
     nv = nf = 0
     for s in sorted(syms):
         name = s[1:] if s.startswith("_") else s
-        if name.startswith("xg_"):
+        if name.startswith(("xg_", "section$")):  # the linker defines section bounds itself
             continue
         if is_variable(name):
             out.append(f"char {name}[4096] __attribute__((aligned(64)));")
