@@ -6,7 +6,7 @@
 
 This branch is where the Intel side of NvGfx comes together: a kernel driver for Intel Xe GPUs, the same Metal-to-Vulkan plugin that runs NVIDIA cards here, and Mesa's ANV Vulkan driver in between. The aim is one driver for every Xe part (Tiger Lake to Arrow Lake and Arc first, then Lunar Lake, Battlemage and Panther Lake) on macOS 11 to 26.
 
-Status on 2026-10-21: the kernel driver builds and links, its first hardware run is queued, and ANV builds for macOS and passes a simulated test on every Intel generation. Nothing has rendered on Intel hardware yet. Progress is tracked in [XeGfx's issues](https://github.com/watchthelight-labs/XeGfx/issues) and in [issue #12](https://github.com/watchthelight-labs/NvGfx/issues/12) here.
+Status on 2026-10-21: the kernel driver builds and links, its first hardware run is queued, and ANV builds for macOS and passes a simulated test on every Intel generation. Nothing has rendered on Intel hardware with this branch yet; [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) has, with a similar stack on macOS 15. Progress is tracked in [XeGfx's issues](https://github.com/watchthelight-labs/XeGfx/issues) and in [issue #12](https://github.com/watchthelight-labs/NvGfx/issues/12) here.
 
 ## What lives where
 
@@ -59,7 +59,7 @@ XeGfx stands on other people's work. Thank you to all of them.
 | [sgiammori/NootedGreen](https://github.com/sgiammori/NootedGreen) | how far the Apple TGL donor approach reaches on Alder Lake and Raptor Lake |
 | [JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe) | keeping the firmware's eDP mode, the boot-programmable mode trap in WindowServer, the GGTT[0] machine-check hazard, Tahoe IOSurface offsets |
 | [m4j2rpf766-crypto/IntelIGPU-Tahoe](https://github.com/m4j2rpf766-crypto/IntelIGPU-Tahoe) | handing the panel over from IONDRVFramebuffer on Tahoe; isolating the iGPU at boot |
-| [VedCloud2/CoreUltraGraphics](https://github.com/VedCloud2/CoreUltraGraphics) | the same i915-on-XNU idea on Meteor Lake, and where it stopped (GuC loading) |
+| [VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) (earlier: [VedCloud2/CoreUltraGraphics](https://github.com/VedCloud2/CoreUltraGraphics)) | the first i915-on-XNU port to drive real Intel hardware: an i915-derived kernel driver on LinuxKPI, Mesa ANV and a NullMoth-derived Metal plugin, with Metal and Vulkan working on a Meteor Lake Dell Latitude 5350 under macOS 15 |
 | [IT-EXPRESS-Bayern/LunarBridge-Hackintosh](https://github.com/IT-EXPRESS-Bayern/LunarBridge-Hackintosh) | Lunar Lake (Xe2) groundwork on Tahoe |
 | [wallali77666-cyber/iris-xe-macos-driver](https://github.com/wallali77666-cyber/iris-xe-macos-driver) | a NullMoth-style stack aimed at Tiger Lake |
 | [lutzbichler/drm-kmod](https://github.com/lutzbichler/drm-kmod) (xe patches) and [drm-kmod #316](https://github.com/freebsd/drm-kmod/issues/316) | the state of the xe driver outside Linux |
