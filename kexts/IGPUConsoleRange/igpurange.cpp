@@ -10,6 +10,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSArray.h>
 #include <mach/kmod.h>
@@ -17,31 +18,50 @@
 #include <libkern/libkern.h>
 #include <string.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
+#include <sys/sysctl.h>
+#include <stdarg.h>
 
-#define RLOG(fmt, ...) IOLog("IGPUConsoleRange: " fmt "\n", ##__VA_ARGS__)
 
+static void wtlSysctlRegister(); static void wtlSysctlUnregister();
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.IGPUConsoleRange, "0.3", _start, _stop) }
-extern "C" kern_return_t _start(kmod_info_t *, void *) { return KERN_SUCCESS; }
-extern "C" kern_return_t _stop(kmod_info_t *, void *) { return KERN_SUCCESS; }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.IGPUConsoleRange, "0.4", _start, _stop) }
+extern "C" kern_return_t _start(kmod_info_t *, void *) { wtlSysctlRegister(); return KERN_SUCCESS; }
+extern "C" kern_return_t _stop(kmod_info_t *, void *) { wtlSysctlUnregister(); return KERN_SUCCESS; }
+
+// IOLog lines from this kext never reach the unified log, so every line also goes to a ring that sysctl
+// debug.wtlacpi_log and the iGPU's "watchthelight-trace" property show, and the last one to NVRAM (survives a power cut)
+static char gTrace[4096]; static size_t gTraceLen; static IOLock *gTraceLock; static IOService *gTraceNub;
+static void wtlTrace(const char *fmt, ...) __printflike(1, 2);
+static void wtlTrace(const char *fmt, ...)
+{
+    char line[256]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    IOLog("IGPUConsoleRange: %s\n", line); kprintf("IGPUConsoleRange: %s\n", line);
+    if (!gTraceLock) gTraceLock = IOLockAlloc();
+    if (gTraceLock) IOLockLock(gTraceLock);
+    uint64_t ms; absolutetime_to_nanoseconds(mach_absolute_time(), &ms); ms /= 1000000;
+    char e[300]; int n = snprintf(e, sizeof e, "%llu.%03llu %s\n", ms / 1000, ms % 1000, line);
+    if (n > 0) {
+        size_t k = (size_t)n < sizeof e ? (size_t)n : sizeof e - 1;
+        if (gTraceLen + k >= sizeof gTrace) { size_t drop = gTraceLen + k - sizeof gTrace + 1024; if (drop > gTraceLen) drop = gTraceLen; memmove(gTrace, gTrace + drop, gTraceLen - drop); gTraceLen -= drop; }
+        memcpy(gTrace + gTraceLen, e, k); gTraceLen += k; gTrace[gTraceLen] = 0;
+    }
+    if (gTraceNub) gTraceNub->setProperty("watchthelight-trace", gTrace);
+    if (gTraceLock) IOLockUnlock(gTraceLock);
+    if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
+        if (OSData *d = OSData::withBytes(line, (unsigned)strnlen(line, sizeof line))) { o->setProperty("wtl-igpurange", d); d->release(); }
+        o->release();
+    }
+}
+#define RLOG(fmt, ...) wtlTrace(fmt, ##__VA_ARGS__)
 
 class IGPUConsoleRange : public IOService {
     OSDeclareDefaultStructors(IGPUConsoleRange)
-    thread_call_t fCall = nullptr;
-    unsigned fStage = 0;
-    IOService *fPci = nullptr;
-    static bool nvidiaPresent();
-    static void fire(thread_call_param_t p0, thread_call_param_t);
-    void attachDgpu();
-    void releaseSlot(const char *why);
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
-    bool start(IOService *provider) override;
-    void stop(IOService *provider) override;
 };
 OSDefineMetaClassAndStructors(IGPUConsoleRange, IOService)
 
-bool IGPUConsoleRange::nvidiaPresent()
+static bool nvidiaPresent()
 {
     bool nv = false;
     if (OSDictionary *m = IOService::serviceMatching("IOPCIDevice")) {
@@ -56,81 +76,109 @@ bool IGPUConsoleRange::nvidiaPresent()
     return nv;
 }
 
-bool IGPUConsoleRange::start(IOService *provider)
+static IOReturn rescanRp01()
 {
-    if (!IOService::start(provider)) return false;
-    fPci = provider;
-    RLOG("holding the iGPU's framebuffer slot for the NVIDIA proxy head (nvfbigpu=1)");
-    fCall = thread_call_allocate(fire, this);
-    if (fCall) { retain(); uint64_t d; clock_interval_to_deadline(4, kSecondScale, &d); if (thread_call_enter_delayed(fCall, d)) release(); }
-    return true;
-}
-
-void IGPUConsoleRange::stop(IOService *provider)
-{
-    if (fCall) { if (thread_call_cancel(fCall)) release(); while (!thread_call_free(fCall)) { if (thread_call_cancel(fCall)) release(); IOSleep(1); } fCall = nullptr; }
-    IOService::stop(provider);
-}
-
-void IGPUConsoleRange::fire(thread_call_param_t p0, thread_call_param_t)
-{
-    IGPUConsoleRange *me = (IGPUConsoleRange *)p0;
-    if (me->fStage == 0) {
-        me->fStage = 1;
-        me->attachDgpu();
-        uint64_t d; clock_interval_to_deadline(20, kSecondScale, &d);
-        if (!thread_call_enter_delayed(me->fCall, d)) return;   // keeps the reference for the second run
-    } else if (me->fStage == 1) {
-        me->fStage = 2;
-        if (nvidiaPresent()) RLOG("NVIDIA GPU present 24 s after start: the proxy head keeps the panel");
-        else me->releaseSlot("no NVIDIA GPU 24 s after start");
-    }
-    me->release();
-}
-
-// SSDT-DGPU-ON's DGON: Lenovo's hot-plug attach (clear the EC's detached flag, power on, bus check), then a rescan
-void IGPUConsoleRange::attachDgpu()
-{
-    if (nvidiaPresent()) { RLOG("NVIDIA GPU already on PCI: no attach needed"); return; }
-    IOACPIPlatformDevice *wd = OSDynamicCast(IOACPIPlatformDevice, IORegistryEntry::fromPath("IOACPIPlane:/_SB/WDGO@0"));
-    if (!wd) wd = OSDynamicCast(IOACPIPlatformDevice, IORegistryEntry::fromPath("IOACPIPlane:/_SB/WDGO"));
-    if (!wd) { RLOG("no WDGO ACPI device (SSDT-DGPU-ON not loaded): cannot attach the dGPU"); return; }
-    UInt32 st = 0xFF, i1 = 0xFF, i2 = 0xFF, i3 = 0xFF;
-    IOReturn r = wd->evaluateInteger("DGON", &st);
-    wd->evaluateInteger("DGI1", &i1); wd->evaluateInteger("DGI2", &i2); wd->evaluateInteger("DGI3", &i3);
-    RLOG("DGON -> 0x%x result %u (1 present, 2 attached, 3 timed out); before: EC IGPS %u HPFF %u, PXP status %u",
-         (unsigned)r, (unsigned)st, (unsigned)i1, (unsigned)i2, (unsigned)i3);
-    wd->release();
-    // rescan the root port the dGPU sits behind (acpi-path ends in RP01)
+    IOReturn pr = kIOReturnNotFound;
     if (OSDictionary *m = IOService::serviceMatching("IOPCIDevice")) {
         if (OSIterator *it = IOService::getMatchingServices(m)) {
             while (OSObject *o = it->getNextObject()) {
                 IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
                 OSString *ap = d ? OSDynamicCast(OSString, d->getProperty("acpi-path")) : nullptr;
-                if (!ap || !strnstr(ap->getCStringNoCopy(), "/PC00/RP01@", ap->getLength() + 1)) continue;
-                IOReturn pr = d->requestProbe(kIOPCIProbeOptionNeedsScan | kIOPCIProbeOptionDone);
-                RLOG("rescan of %s -> 0x%x", d->getName(), (unsigned)pr);
+                if (!ap || !strnstr(ap->getCStringNoCopy(), "/PC00@0/RP01@60000", ap->getLength() + 1)) continue;
+                pr = d->requestProbe(kIOPCIProbeOptionNeedsScan | kIOPCIProbeOptionDone);
+                RLOG("rescan of %s (link status 0x%x) -> 0x%x", d->getName(), (unsigned)d->configRead16(0x52), (unsigned)pr);
                 break;
             }
             it->release();
         }
         m->release();
     }
+    return pr;
 }
 
-void IGPUConsoleRange::releaseSlot(const char *why)
+// "<IOACPIPlane path> <method or name> [integer args]": evaluates it and logs the result
+static void acpiEval(char *cmd)
 {
-    RLOG("%s: giving the iGPU's framebuffer slot back to IONDRVFramebuffer", why);
-    IOService *p = fPci;
-    if (p) p->retain();
-    terminate(kIOServiceAsynchronous);
-    if (p) { p->registerService(kIOServiceAsynchronous); p->release(); }
+    char *tok[10]; int nt = 0;
+    for (char *p = cmd; *p && nt < 10; ) {
+        while (*p == ' ' || *p == '\n') *p++ = 0;
+        if (!*p) break;
+        tok[nt++] = p;
+        while (*p && *p != ' ' && *p != '\n') p++;
+    }
+    if (nt == 1 && !strncmp(tok[0], "rescan", 7)) { rescanRp01(); return; }
+    if (nt == 1 && !strncmp(tok[0], "nv", 3)) { RLOG("NVIDIA GPU on PCI: %s", nvidiaPresent() ? "yes" : "no"); return; }
+    if (nt < 2) { RLOG("usage: <IOACPIPlane path> <name> [ints] | rescan | nv"); return; }
+    char path[200]; snprintf(path, sizeof path, "IOACPIPlane:%s", tok[0]);
+    IOACPIPlatformDevice *dev = OSDynamicCast(IOACPIPlatformDevice, IORegistryEntry::fromPath(path));
+    if (!dev) { RLOG("%s: no such ACPI device", tok[0]); return; }
+    OSObject *args[8] = {}; IOItemCount na = 0;
+    for (int i = 2; i < nt && na < 8; i++) args[na++] = OSNumber::withNumber(strtoq(tok[i], nullptr, 0), 64);
+    OSObject *res = nullptr;
+    IOReturn r = dev->evaluateObject(tok[1], &res, na ? args : nullptr, na);
+    char rv[96] = "none";
+    if (OSNumber *n = OSDynamicCast(OSNumber, res)) snprintf(rv, sizeof rv, "0x%llx", n->unsigned64BitValue());
+    else if (OSString *s = OSDynamicCast(OSString, res)) snprintf(rv, sizeof rv, "\"%s\"", s->getCStringNoCopy());
+    else if (OSData *d = OSDynamicCast(OSData, res)) {
+        int o = snprintf(rv, sizeof rv, "buf[%u]", d->getLength());
+        const uint8_t *b = (const uint8_t *)d->getBytesNoCopy();
+        for (unsigned i = 0; b && i < d->getLength() && i < 24 && o < (int)sizeof rv - 4; i++) o += snprintf(rv + o, sizeof rv - o, " %02x", b[i]);
+    } else if (res) snprintf(rv, sizeof rv, "%s", res->getMetaClass()->getClassName());
+    RLOG("%s %s(%u args) -> 0x%x result %s", tok[0], tok[1], (unsigned)na, (unsigned)r, rv);
+    OSSafeReleaseNULL(res);
+    for (IOItemCount i = 0; i < na; i++) OSSafeReleaseNULL(args[i]);
+    dev->release();
+}
+
+static int wtlacpi_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+    char cmd[256] = {};
+    int err = sysctl_handle_string(nullptr, cmd, sizeof cmd, req);
+    if (err || !req->newptr) return err;
+    acpiEval(cmd);
+    return 0;
+}
+static int wtlacpi_log_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+    return SYSCTL_OUT(req, gTrace, gTraceLen + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, wtlacpi, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, wtlacpi_sysctl, "A",
+            "evaluate an ACPI object: <IOACPIPlane path> <name> [ints] | rescan | nv");
+SYSCTL_PROC(_debug, OID_AUTO, wtlacpi_log, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, wtlacpi_log_sysctl, "A",
+            "IGPUConsoleRange trace");
+static void wtlSysctlRegister() { sysctl_register_oid(&sysctl__debug_wtlacpi); sysctl_register_oid(&sysctl__debug_wtlacpi_log); }
+static void wtlSysctlUnregister() { sysctl_unregister_oid(&sysctl__debug_wtlacpi); sysctl_unregister_oid(&sysctl__debug_wtlacpi_log); }
+
+// nvfbigpu=1: attach the dGPU (SSDT-DGPU-ON's DGON) from probe, before anything has used the iGPU slot. A driver that
+// starts on the iGPU and is terminated later marks it for a function reset on the next match, and that reset of the
+// scanning-out iGPU cuts the laptop's power (I-093), so the slot is decided once here and never handed back.
+static bool attachFromProbe()
+{
+    if (nvidiaPresent()) { RLOG("NVIDIA GPU already on PCI: no attach needed"); return true; }
+    IOService *ec = IOService::waitForMatchingService(IOService::nameMatching("EC0"), 20ull * kSecondScale);
+    RLOG("EC0 %s", ec ? "matched" : "not matched after 20 s");
+    OSSafeReleaseNULL(ec);
+    IOACPIPlatformDevice *wd = OSDynamicCast(IOACPIPlatformDevice, IORegistryEntry::fromPath("IOACPIPlane:/_SB/WDGO"));
+    if (!wd) { RLOG("no WDGO ACPI device (SSDT-DGPU-ON not loaded): cannot attach the dGPU"); return false; }
+    UInt32 st = 0xFF, i1 = 0xFF, i2 = 0xFF, i3 = 0xFF;
+    RLOG("calling DGON");
+    IOReturn r = wd->evaluateInteger("DGON", &st);
+    wd->evaluateInteger("DGI1", &i1); wd->evaluateInteger("DGI2", &i2); wd->evaluateInteger("DGI3", &i3);
+    RLOG("DGON -> 0x%x result %u (1 present, 2 attached, 3 timed out); before: EC IGPS %u HPFF %u, PXP status %u",
+         (unsigned)r, (unsigned)st, (unsigned)i1, (unsigned)i2, (unsigned)i3);
+    wd->release();
+    rescanRp01();
+    for (int i = 0; i < 50 && !nvidiaPresent(); i++) IOSleep(200);
+    bool nv = nvidiaPresent();
+    RLOG("NVIDIA GPU %s after the attach", nv ? "present" : "absent");
+    return nv;
 }
 
 IOService *IGPUConsoleRange::probe(IOService *provider, SInt32 *score)
 {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci || pci->getFunctionNumber() != 0) return nullptr;
+    gTraceNub = pci;
     char b[4];
     if (PE_parse_boot_argn("-igpurangeoff", b, sizeof b)) { RLOG("off by boot-arg"); return nullptr; }
 
@@ -167,10 +215,11 @@ IOService *IGPUConsoleRange::probe(IOService *provider, SInt32 *score)
     RLOG("console 0x%llx (%lux%lu rowBytes %lu) is DSM+0x%llx: added as device memory %u for IONDRVFramebuffer",
          base, v.v_width, v.v_height, v.v_rowBytes, base - dsm, (unsigned)pci->getDeviceMemoryCount() - 1);
     // nvfbigpu=1: NVRMFB's proxy head drives this panel, so IONDRV must not start a second framebuffer on the same
-    // memory; holding the category blocks it. Otherwise decline and let IONDRVFramebuffer probe next.
-    // nvfbigpu=1: hold the slot (start() attaches the dGPU if Hybrid mode left it detached); the slot goes back to
-    // IONDRVFramebuffer if no NVIDIA GPU shows up
+    // memory; holding the category blocks it. Without an NVIDIA GPU, decline and let IONDRVFramebuffer probe next.
     int proxy = 0;
-    if (PE_parse_boot_argn("nvfbigpu", &proxy, sizeof proxy) && proxy) return this;
+    if (PE_parse_boot_argn("nvfbigpu", &proxy, sizeof proxy) && proxy && attachFromProbe()) {
+        RLOG("holding the iGPU's framebuffer slot for the NVIDIA proxy head");
+        return this;
+    }
     return nullptr;
 }
