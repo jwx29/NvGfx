@@ -12,7 +12,7 @@ The approach is to reuse a driver that already works rather than write one. Free
 
 Work in progress. Nothing links or loads yet.
 
-What works today: every drm, dma-buf, ttm, i915 and LinuxKPI source (411 files) compiles to an object for the macOS kernel target. Linking those objects leaves about 400 FreeBSD kernel functions that XNU does not export and XeGfx has to implement itself; `docs/kpi-todo-baseline.txt` is the first list. The XNU-side implementations are just starting.
+What works today: every drm, dma-buf, ttm, i915 and LinuxKPI source (411 files) compiles to an object for the macOS kernel target. Linking those objects first left about 400 FreeBSD kernel functions that XNU does not export and XeGfx has to implement itself (`docs/kpi-todo-baseline.txt`). The first XNU implementations are in `shim/src/fbsd` (threads, per-CPU data, clock, tunables, malloc and uma, mutexes, sx and rw locks, condition variables and sleep queues), which brings it to 322. None of it has run yet.
 
 Progress is posted in [NvGfx issue #12](https://github.com/watchthelight-labs/NvGfx/issues/12).
 
@@ -37,6 +37,7 @@ X1 is done. X2 is the current work. Any milestone can end in "not feasible", and
 | `harness/score.py` | Builds every drm-kmod source for the XNU kernel target and ranks what breaks, or with `--obj` builds objects and lists undefined symbols. |
 | `tools/kpi_split.py` | Splits those undefined symbols into the ones the running macOS kernel already exports and the ones XeGfx must provide. |
 | `shim/include` | XNU overrides of FreeBSD and LinuxKPI headers. |
+| `shim/src/fbsd` | The FreeBSD kernel API implemented on XNU. |
 | `shim/gen` | Headers generated from FreeBSD's `*_if.m` interface files, plus empty kernel option headers. |
 | `docs/` | Baseline lists the tools produce. |
 
