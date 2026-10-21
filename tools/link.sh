@@ -28,3 +28,5 @@ python3 ~/src/kcabi/linkcheck.py "$ROOT/out/XeGfx.kext" | tail -25
 # every undefined symbol must resolve from a declared, public KPI library (kmutil enforces this when it builds a
 # collection; linkcheck only knows what the kernel exports)
 python3 "$ROOT/tools/kpi_check.py" "$ROOT/out/XeGfx.kext" || exit 1
+# a kernel name defined inside the kext would capture the XNU-side callers (I-094)
+python3 "$ROOT/tools/shadow_check.py" "$ROOT/out/XeGfx.kext" || exit 1

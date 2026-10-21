@@ -69,18 +69,38 @@ xg_run_set(const char *set, int reverse)
 	free(v, M_TEMP);
 }
 
-/* the shim's own state first (clock, threads, VM, tunables, queues, bus), then the drivers' SYSINITs */
+/*
+ * The start sequence in stages, so a boot can stop after any of them: 1 the shim's own state (clock, threads, VM,
+ * tunables, queues), 3 the bus and DMA layers (newbus over every IOPCIDevice), 4 the drivers' SYSINITs (drm, i915
+ * probe). Stage 2, a read-only look at the GPU, lives on the XNU side. Each stage runs once.
+ */
+void
+xg_start_stage(int stage)
+{
+	switch (stage) {
+	case 1:
+		xg_kern_init();
+		xg_sched_init();
+		xg_vm_init();
+		xg_misc_init();
+		xg_task_init();
+		break;
+	case 3:
+		xg_pci_init();
+		xg_dma_init();
+		break;
+	case 4:
+		xg_run_set("sysinit_set", 0);
+		break;
+	}
+}
+
 void
 xg_start(void)
 {
-	xg_kern_init();
-	xg_sched_init();
-	xg_vm_init();
-	xg_misc_init();
-	xg_task_init();
-	xg_pci_init();
-	xg_dma_init();
-	xg_run_set("sysinit_set", 0);
+	xg_start_stage(1);
+	xg_start_stage(3);
+	xg_start_stage(4);
 }
 
 void

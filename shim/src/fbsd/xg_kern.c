@@ -251,11 +251,44 @@ xg_tunable(const char *name)
 	return (name);
 }
 
+/*
+ * debug.xegfx_env (set by the xe-guard before a stage) overrides boot-args, so one boot can try several settings:
+ * space-separated name=value pairs under the same names as the boot-args.
+ */
+extern char xg_env[];
+
+static int
+xg_env_lookup(const char *name, char *buf, size_t len)
+{
+	const char *key = xg_tunable(name), *p = xg_env;
+	size_t kl = strlen(key), n;
+
+	while (*p) {
+		while (*p == ' ')
+			p++;
+		if (strncmp(p, key, kl) == 0 && p[kl] == '=') {
+			p += kl + 1;
+			for (n = 0; n + 1 < len && p[n] && p[n] != ' '; n++)
+				buf[n] = p[n];
+			buf[n] = 0;
+			return (1);
+		}
+		while (*p && *p != ' ')
+			p++;
+	}
+	return (0);
+}
+
 int
 getenv_int(const char *name, int *data)
 {
+	char buf[32];
 	int v;
 
+	if (xg_env_lookup(name, buf, sizeof(buf))) {
+		*data = (int)strtol(buf, NULL, 0);
+		return (1);
+	}
 	if (!PE_parse_boot_argn(xg_tunable(name), &v, sizeof(v)))
 		return (0);
 	*data = v;
@@ -265,8 +298,13 @@ getenv_int(const char *name, int *data)
 int
 getenv_long(const char *name, long *data)
 {
+	char buf[32];
 	long v;
 
+	if (xg_env_lookup(name, buf, sizeof(buf))) {
+		*data = strtol(buf, NULL, 0);
+		return (1);
+	}
 	if (!PE_parse_boot_argn(xg_tunable(name), &v, sizeof(v)))
 		return (0);
 	*data = v;
@@ -281,7 +319,7 @@ kern_getenv(const char *name)
 	size_t n;
 
 	/* the _str variant: PE_parse_boot_argn stores a numeric value in binary */
-	if (!PE_parse_boot_arg_str(xg_tunable(name), buf, sizeof(buf)))
+	if (!xg_env_lookup(name, buf, sizeof(buf)) && !PE_parse_boot_arg_str(xg_tunable(name), buf, sizeof(buf)))
 		return (NULL);
 	n = strnlen(buf, sizeof(buf) - 1) + 1;
 	s = malloc(n, M_TEMP, M_WAITOK);

@@ -199,7 +199,7 @@ xg_vm_x_kextract(const void *va)
 	return pa != 0 ? pa + (a & PAGE_MASK) : 0;
 }
 
-extern "C" extern "C" unsigned long long
+extern "C" unsigned long long
 xg_vm_x_memsize(void)
 {
 	return max_mem;

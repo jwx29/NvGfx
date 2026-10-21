@@ -154,6 +154,7 @@ def flags(mod):
          "-std=gnu11", "-D_KERNEL", "-DKLD_MODULE", "-D__FreeBSD__=15", "-U__APPLE__", "-U__MACH__", "-U__APPLE_CC__", "-D__amd64__", "-D__x86_64__", "-D__XNU_LKPI__",
          "-include", os.path.join(LKPI, "common/include/linux/compiler_types.h"),
          "-include", os.path.join(LKPI, "common/include/linux/kconfig.h"),
+         "-include", os.path.join(ROOT, "shim/include/xg_bsdnames.h"),
          "-Wno-everything", "-ferror-limit=1"]
     if mod not in ("lkpi", "shim", "kern"):  # consumers only; the base-kernel LinuxKPI is built without it
         f.append("-DLINUXKPI_VERSION=61400")
