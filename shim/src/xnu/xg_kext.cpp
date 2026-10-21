@@ -68,6 +68,12 @@ _stop(kmod_info_t *, void *)
 	return KERN_SUCCESS;
 }
 
+/* attaches to IOResources and stays, so the kext is not unloaded while it has no device */
+class XeGfxResident : public IOService {
+	OSDeclareDefaultStructors(XeGfxResident)
+};
+OSDefineMetaClassAndStructors(XeGfxResident, IOService)
+
 class XeGfxPCI : public IOService {
 	OSDeclareDefaultStructors(XeGfxPCI)
 public:
