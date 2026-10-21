@@ -2947,7 +2947,7 @@ xg_pci_bus_add(xg_pci_xnu_t *h)
 	di->pd.conf.pc_progif = cfg->progif;
 	di->pd.conf.pc_revid = cfg->revid;
 	/* rid 0 is the legacy INTx line, when IOKit has one for it */
-	if (cfg->intpin != 0 && (idx = xg_pci_xnu_intx_index(h)) >= 0 &&
+	if (cfg->intpin != 0 && cfg->baseclass == PCIC_DISPLAY && (idx = xg_pci_xnu_intx_index(h)) >= 0 &&
 	    (irq = xg_pci_irq_get(h, idx, cfg->intline, false)) >= 0)
 		xg_pci_rle_add(&di->pd.resources, SYS_RES_IRQ, 0, irq, irq, 1);
 	if ((child = device_add_child(bus, NULL, DEVICE_UNIT_ANY)) == NULL) {
