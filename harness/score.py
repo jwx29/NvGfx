@@ -181,8 +181,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mods", default="shim,lkpi,drm,dmabuf,ttm,i915")
     ap.add_argument("--obj", action="store_true", help="build objects in out/obj and list undefined symbols")
+    ap.add_argument("--one", help="compile one shim source (shim flags, all errors shown) into out/one/; for parallel work")
     ap.add_argument("--json", default=os.path.join(ROOT, "out/score.json"))
     a = ap.parse_args()
+    if a.one:
+        src = os.path.abspath(a.one)
+        o = os.path.join(ROOT, "out/one", os.path.basename(src) + ".o")
+        os.makedirs(os.path.dirname(o), exist_ok=True)
+        fl = [x for x in flags("shim") if x not in ("-Wno-everything", "-ferror-limit=1")]
+        fl += ["-ferror-limit=60", "-Wall", "-Wno-sign-conversion", "-Wno-shorten-64-to-32", "-Wno-macro-redefined",
+               "-Wno-unused-variable", "-Wno-unused-function", "-Werror=implicit-function-declaration"]
+        r = subprocess.run(["xcrun", "clang"] + fl + ["-c", "-o", o, src], capture_output=True, text=True)
+        msgs = [l for l in r.stderr.splitlines() if src in l and (" error: " in l or " warning: " in l)]
+        print("\n".join(msgs) if msgs else r.stderr[-4000:])
+        if r.returncode == 0:
+            und = [l.split()[-1] for l in subprocess.run(["nm", "-u", o], capture_output=True, text=True).stdout.split()]
+            print(f"OK {o}; undefined in this object: {len(und)}")
+        else:
+            print("FAILED")
+        return r.returncode
     global OBJ
     if a.obj:
         OBJ = os.path.join(ROOT, "out/obj")
