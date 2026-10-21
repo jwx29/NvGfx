@@ -1,0 +1,8 @@
+# drm-kmod sources XeGfx must not build: GPL-only, or paired with a replacement under src/
+dma-buf.c                     # BSD itself, but built against GPL headers; replaced by src/dmabuf/nmx_dma_buf.c
+sync_file.c                   # GPL-2.0; kexts cannot create the fd anyway (sync_file.h here)
+dma-fence-unwrap.c            # GPL-2.0-only; replaced by src/dmabuf/nmx_dma_fence_unwrap.c
+drm_hdcp_helper.c             # GPL-2.0; display HDCP, i915 display stays off
+drm_writeback.c               # GPL-2.0; writeback connectors, unused by i915
+drm_panel_backlight_quirks.c  # GPL-2.0; panel quirks for the display code
+intel_uncore_trace.c          # GPL-2.0; tracepoints, no-ops here
