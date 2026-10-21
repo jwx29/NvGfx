@@ -47,4 +47,9 @@
 #define wakeup xg_bsd_wakeup
 #define wakeup_one xg_bsd_wakeup_one
 #define zfree xg_bsd_zfree
+/* not shadows, a tap: FreeBSD/Linux console output also lands in the ring behind sysctl debug.xegfx_log */
+#define printf(...) xg_printf(__VA_ARGS__)
+#define vprintf(...) xg_vprintf(__VA_ARGS__)
+int xg_printf(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
+int xg_vprintf(const char *, __builtin_va_list) __attribute__((__format__(__printf__, 1, 0)));
 #endif
