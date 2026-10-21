@@ -185,7 +185,11 @@ def flags(mod):
          "-Wno-everything", "-ferror-limit=1"]
     if mod not in ("lkpi", "shim", "kern"):  # consumers only; the base-kernel LinuxKPI is built without it
         f.append("-DLINUXKPI_VERSION=61400")
-    return f + kconfig_defines() + make_cflags(mod) + [x for i in inc for x in ("-I", i)]
+    mk = make_cflags(mod)
+    if OVERLAY:  # the module Makefiles add drm-kmod's gplv2 include dir themselves; the overlay replaces it
+        mk = [x for x in mk if "gplv2" not in x]
+        f = ["-I", os.path.join(OVERLAY, "include")] + f
+    return f + kconfig_defines() + mk + [x for i in inc for x in ("-I", i)]
 
 
 OBJ = None
