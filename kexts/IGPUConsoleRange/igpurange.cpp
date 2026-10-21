@@ -75,6 +75,19 @@ IOService *IGPUConsoleRange::probe(IOService *provider, SInt32 *score)
     // nvfbigpu=1: NVRMFB's proxy head drives this panel, so IONDRV must not start a second framebuffer on the same
     // memory; holding the category blocks it. Otherwise decline and let IONDRVFramebuffer probe next.
     int proxy = 0;
-    if (PE_parse_boot_argn("nvfbigpu", &proxy, sizeof proxy) && proxy) return this;
+    if (PE_parse_boot_argn("nvfbigpu", &proxy, sizeof proxy) && proxy) {
+        bool nv = false;   // only with an NVIDIA GPU on PCI to stand in; otherwise IONDRV keeps the panel (software desktop)
+        if (OSDictionary *m = IOService::serviceMatching("IOPCIDevice")) {
+            if (OSIterator *it = IOService::getMatchingServices(m)) {
+                while (OSObject *o = it->getNextObject())
+                    if (IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o))
+                        if (d->configRead16(kIOPCIConfigVendorID) == 0x10de && (d->configRead8(kIOPCIConfigClassCode + 2) == 0x03)) { nv = true; break; }
+                it->release();
+            }
+            m->release();
+        }
+        if (nv) return this;
+        RLOG("nvfbigpu=1 but no NVIDIA GPU on PCI: IONDRVFramebuffer keeps the panel");
+    }
     return nullptr;
 }
