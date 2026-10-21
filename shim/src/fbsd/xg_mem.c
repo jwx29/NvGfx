@@ -9,6 +9,8 @@
 #include <sys/malloc.h>
 #include <vm/vm.h>
 #include <vm/uma.h>
+#include <machine/atomic.h>
+#include <machine/cpu.h>
 #include "xg_xnu.h"
 
 MALLOC_DEFINE(M_TEMP, "temp", "misc temporary data buffers");
@@ -17,6 +19,7 @@ MALLOC_DEFINE(M_DEVBUF, "devbuf", "device driver memory");
 #define XG_HDR		16
 #define XG_MAGIC	0x5867414cu	/* "XgAL" */
 struct xg_hdr { size_t size; uint32_t magic; uint32_t pad; };
+size_t malloc_usable_size(const void *addr);
 
 void
 malloc_init(void *data)
@@ -46,6 +49,59 @@ void *
 	return ((char *)h + XG_HDR);
 }
 
+/*
+ * contigmalloc blocks are recorded by address: LinuxKPI's kmalloc hands every request above a page to contigmalloc
+ * but frees it with plain free(), which FreeBSD resolves through its slab lookup (N-218 panicked in free() on a
+ * 13.6 KiB drm device). Contig blocks are page-aligned and header blocks never are, so only aligned pointers look here.
+ */
+#define XG_CONTIG_BUCKETS 1024
+struct xg_contig { void *addr; unsigned long size; struct xg_contig *next; };
+static struct xg_contig *xg_contig_tab[XG_CONTIG_BUCKETS];
+static volatile u_int xg_contig_lock;
+
+static u_int
+xg_contig_bucket(const void *p)
+{
+	return ((u_int)(((uintptr_t)p >> PAGE_SHIFT) & (XG_CONTIG_BUCKETS - 1)));
+}
+
+static void
+xg_contig_lock_acquire(void)
+{
+	while (!atomic_cmpset_acq_int(&xg_contig_lock, 0, 1))
+		cpu_spinwait();
+}
+
+static void
+xg_contig_lock_release(void)
+{
+	atomic_store_rel_int(&xg_contig_lock, 0);
+}
+
+/* the block's size, 0 if p is not a contigmalloc block; remove drops the record */
+static unsigned long
+xg_contig_find(const void *p, bool remove)
+{
+	struct xg_contig **pp, *c;
+	unsigned long size = 0;
+
+	if (p == NULL || ((uintptr_t)p & PAGE_MASK) != 0)
+		return (0);
+	xg_contig_lock_acquire();
+	for (pp = &xg_contig_tab[xg_contig_bucket(p)]; (c = *pp) != NULL; pp = &c->next) {
+		if (c->addr == p) {
+			size = c->size;
+			if (remove)
+				*pp = c->next;
+			break;
+		}
+	}
+	xg_contig_lock_release();
+	if (remove && c != NULL)
+		IOFree(c, sizeof(*c));
+	return (size);
+}
+
 static struct xg_hdr *
 xg_hdr_of(const void *p)
 {
@@ -61,8 +117,14 @@ free(void *addr, struct malloc_type *type)
 {
 	struct xg_hdr *h;
 
+	unsigned long csize;
+
 	if (addr == NULL)
 		return;
+	if ((csize = xg_contig_find(addr, true)) != 0) {
+		IOFreeContiguous(addr, csize);
+		return;
+	}
 	h = xg_hdr_of(addr);
 	h->magic = 0;
 	IOFree(h, h->size + XG_HDR);
@@ -72,14 +134,16 @@ void
 zfree(void *addr, struct malloc_type *type)
 {
 	if (addr != NULL)
-		explicit_bzero(addr, xg_hdr_of(addr)->size);
+		explicit_bzero(addr, malloc_usable_size(addr));
 	free(addr, type);
 }
 
 size_t
 malloc_usable_size(const void *addr)
 {
-	return (addr == NULL ? 0 : xg_hdr_of(addr)->size);
+	unsigned long csize = xg_contig_find(addr, false);
+
+	return (addr == NULL ? 0 : csize != 0 ? csize : xg_hdr_of(addr)->size);
 }
 
 size_t
@@ -96,7 +160,7 @@ realloc(void *addr, size_t size, struct malloc_type *type, int flags)
 
 	if (addr == NULL)
 		return (malloc(size, type, flags));
-	old = xg_hdr_of(addr)->size;
+	old = malloc_usable_size(addr);
 	if (size <= old)
 		return (addr);
 	if ((n = malloc(size, type, flags)) == NULL)
@@ -152,6 +216,21 @@ contigmalloc(unsigned long size, struct malloc_type *type, int flags, vm_paddr_t
 	}
 	if (flags & M_ZERO)
 		memset(p, 0, size);
+	{
+		struct xg_contig *c = IOMalloc(sizeof(*c));
+		u_int b = xg_contig_bucket(p);
+
+		if (c == NULL) {
+			IOFreeContiguous(p, size);
+			return (NULL);
+		}
+		c->addr = p;
+		c->size = size;
+		xg_contig_lock_acquire();
+		c->next = xg_contig_tab[b];
+		xg_contig_tab[b] = c;
+		xg_contig_lock_release();
+	}
 	return (p);
 }
 
@@ -165,8 +244,10 @@ contigmalloc_domainset(unsigned long size, struct malloc_type *type, struct doma
 void
 contigfree(void *addr, unsigned long size, struct malloc_type *type)
 {
+	unsigned long csize = xg_contig_find(addr, true);
+
 	if (addr != NULL)
-		IOFreeContiguous(addr, round_page(size));
+		IOFreeContiguous(addr, csize != 0 ? csize : round_page(size));
 }
 
 /* UMA zones without caching: each item is a malloc block, ctor/dtor and init/fini run on every alloc/free */
