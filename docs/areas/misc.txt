@@ -26,11 +26,6 @@ sysctl_ctx_init
 sysctl_oid_list_RB_MINMAX
 sysctl_oid_list_RB_NEXT
 sysctl___dev
-backlight_destroy
-backlight_get_info_desc
-backlight_get_status_desc
-backlight_register
-backlight_update_status_desc
 counter_u64_alloc
 counter_u64_free
 resource_list_find
