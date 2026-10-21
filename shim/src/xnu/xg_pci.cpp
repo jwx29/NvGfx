@@ -262,7 +262,27 @@ xg_pci_key(IOPCIDevice *pci)
 }
 
 /*
- * Every IOPCIDevice, in bus order: a bridge always sits on a lower bus number than the bus behind it, so newbus
+ * Only what i915 needs on bus 0: the display function, the host bridge (MCHBAR) and the ISA/LPC bridge (PCH type).
+ * N-216 froze seconds after a scan of every device; resolving interrupts on devices other drivers own is the
+ * suspect. xegfx.pci_scan_all=1 (debug.xegfx_env or boot-args) brings the full scan back for experiments.
+ */
+extern "C" int getenv_int(const char *name, int *data);
+
+static bool
+xg_pci_wanted(IOPCIDevice *pci)
+{
+	int all = 0;
+	uint8_t cls = pci->configRead8(kIOPCIConfigClassCode + 2), sub = pci->configRead8(kIOPCIConfigClassCode + 1);
+
+	if (getenv_int("xegfx.pci_scan_all", &all) && all)
+		return true;
+	if (pci->getBusNumber() != 0)
+		return false;
+	return cls == 0x03 || (cls == 0x06 && (sub == 0x00 || sub == 0x01));
+}
+
+/*
+ * Every wanted IOPCIDevice, in bus order: a bridge always sits on a lower bus number than the bus behind it, so newbus
  * sees each bridge before the devices it leads to. Config reads only.
  */
 static int
@@ -285,7 +305,7 @@ xg_pci_scan(void)
 	while ((obj = it->getNextObject()) != NULL) {
 		IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, obj);
 
-		if (pci == NULL || xg_pci_lookup(pci) != NULL)
+		if (pci == NULL || xg_pci_lookup(pci) != NULL || !xg_pci_wanted(pci))
 			continue;
 		if ((h = (xg_pci_xnu *)IOMallocZero(sizeof(*h))) == NULL)
 			break;
