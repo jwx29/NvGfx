@@ -47,6 +47,11 @@
 #define wakeup xg_bsd_wakeup
 #define wakeup_one xg_bsd_wakeup_one
 #define zfree xg_bsd_zfree
+/* exported by older kernels only (macOS 11 to 15) */
+#define allproc xg_bsd_allproc
+#define kmem_alloc_contig xg_bsd_kmem_alloc_contig
+#define proc0 xg_bsd_proc0
+#define vm_page_replace xg_bsd_vm_page_replace
 /* not shadows, a tap: FreeBSD/Linux console output also lands in the ring behind sysctl debug.xegfx_log */
 #define printf(...) xg_printf(__VA_ARGS__)
 #define vprintf(...) xg_vprintf(__VA_ARGS__)
