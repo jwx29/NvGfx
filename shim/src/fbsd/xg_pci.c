@@ -3200,3 +3200,52 @@ xg_pci_init(void)
 {
 	xg_pci_once();
 }
+
+/* the newbus tree into the console ring, so a boot shows which driver took (or did not take) each device */
+static void
+xg_newbus_dump_one(device_t dev, int depth)
+{
+	device_t c;
+
+	if (dev->parent != NULL && dev->parent->devclass != NULL &&
+	    strcmp(devclass_get_name(dev->parent->devclass), "pci") == 0 && dev->ivars != NULL)
+		printf("xegfx: newbus %*s%s state %d driver %s pci %04x:%04x class %06x\n", depth * 2, "",
+		    dev->nameunit ? dev->nameunit : "?", dev->state, dev->driver ? dev->driver->name : "-",
+		    pci_get_vendor(dev), pci_get_device(dev),
+		    (pci_get_class(dev) << 16) | (pci_get_subclass(dev) << 8) | pci_get_progif(dev));
+	else
+		printf("xegfx: newbus %*s%s state %d driver %s\n", depth * 2, "",
+		    dev->nameunit ? dev->nameunit : "?", dev->state, dev->driver ? dev->driver->name : "-");
+	TAILQ_FOREACH(c, &dev->children, link)
+		xg_newbus_dump_one(c, depth + 1);
+}
+
+void
+xg_newbus_dump(void)
+{
+	devclass_t dc;
+
+	if (xg_pci_root != NULL)
+		xg_newbus_dump_one(xg_pci_root, 0);
+	TAILQ_FOREACH(dc, &xg_pci_devclasses, link) {
+		struct driverlink *dl;
+
+		printf("xegfx: devclass %s:", devclass_get_name(dc));
+		TAILQ_FOREACH(dl, &dc->drivers, link)
+			printf(" %s", dl->driver->name);
+		printf("\n");
+	}
+}
+
+/* 1 when a drm driver (i915kms or xe) is attached to some device; stage 4 fails without one */
+int
+xg_drm_attached(void)
+{
+	device_t d;
+
+	TAILQ_FOREACH(d, &xg_pci_devices, devlink)
+		if (d->state == DS_ATTACHED && d->driver != NULL &&
+		    (strncmp(d->driver->name, "i915", 4) == 0 || strncmp(d->driver->name, "xe", 2) == 0))
+			return (1);
+	return (0);
+}

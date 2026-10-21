@@ -20,10 +20,11 @@
 
 extern "C" {
 void xg_start_stage(int stage);
+int xg_drm_attached(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.2", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.3", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 }
@@ -226,8 +227,11 @@ xg_run_stage(int s)
 		rc = xg_probe();
 	} else {
 		xg_start_stage(s);
-		if (s == 4)
+		if (s == 4) {
 			rc = xg_display_check();
+			if (rc == 1 && !xg_drm_attached())
+				rc = -19;	/* the init routines ran but no drm driver bound the GPU */
+		}
 	}
 	if (gWdogCall)
 		thread_call_cancel(gWdogCall);
