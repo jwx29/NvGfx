@@ -6,12 +6,10 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/IOGuardPageMemoryDescriptor.h>
 #include <mach/vm_param.h>
 #include "xg_vm_xnu.h"
 
 /* osfmk/i386/pmap.h: the bounds of XNU's direct map; exported by the kernel but not declared in the SDK */
-extern "C" uint64_t physmap_base, physmap_max;
 
 struct xg_vm_xmem {
 	IOMemoryDescriptor *md;
@@ -98,19 +96,21 @@ xg_vm_x_map_phys(unsigned long long pa, unsigned long long size, int cache, void
 extern "C" xg_vm_xmem_t
 xg_vm_x_reserve(unsigned long long size, void **kva)
 {
-	IOGuardPageMemoryDescriptor *gmd;
+	IOBufferMemoryDescriptor *bmd;
 	IOMemoryMap *map;
 
-	gmd = IOGuardPageMemoryDescriptor::withSize((vm_size_t)size);
-	if (gmd == nullptr)
+	/* pageable backing: it claims the address range, its pages exist only if something touches an empty slot */
+	bmd = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIOMemoryPageable | kIODirectionInOut,
+	    (vm_size_t)size, PAGE_SIZE);
+	if (bmd == nullptr)
 		return nullptr;
-	map = gmd->createMappingInTask(kernel_task, 0, kIOMapAnywhere, 0, size);
+	map = bmd->createMappingInTask(kernel_task, 0, kIOMapAnywhere, 0, size);
 	if (map == nullptr) {
-		gmd->release();
+		bmd->release();
 		return nullptr;
 	}
 	*kva = (void *)map->getVirtualAddress();
-	return xg_vm_xnew(gmd, map);
+	return xg_vm_xnew(bmd, map);
 }
 
 extern "C" xg_vm_xmem_t
@@ -141,7 +141,7 @@ xg_vm_x_map_at(xg_vm_xmem_t resv, void *va, const unsigned long long *pa, unsign
 	IOFree(r, sizeof(*r) * n);
 	if (md == nullptr)
 		return nullptr;
-	/* Overwrite replaces the guard entries in place; such a map leaves its PTEs behind when released */
+	/* Overwrite replaces the reservation's entries in place; such a map leaves its PTEs behind when released */
 	map = md->createMappingInTask(kernel_task, (mach_vm_address_t)va, kIOMapOverwrite | xg_vm_cacheopt(cache), 0,
 	    ptoa_64(n));
 	if (map == nullptr) {
@@ -159,7 +159,7 @@ xg_vm_x_unmap_at(xg_vm_xmem_t resv, void *va, unsigned long long size)
 
 	if ((mach_vm_address_t)va < base || (mach_vm_address_t)va + size > base + resv->map->getLength())
 		return -1;
-	/* Unique: a fresh mapping of the guard range, never the reservation's own map reused */
+	/* Unique: a fresh mapping of the reservation's backing, never its own map reused */
 	map = resv->md->createMappingInTask(kernel_task, (mach_vm_address_t)va, kIOMapOverwrite | kIOMapUnique,
 	    (mach_vm_address_t)va - base, size);
 	if (map == nullptr)
@@ -199,14 +199,7 @@ xg_vm_x_kextract(const void *va)
 	return pa != 0 ? pa + (a & PAGE_MASK) : 0;
 }
 
-extern "C" void
-xg_vm_x_dmap(unsigned long long *base, unsigned long long *limit)
-{
-	*base = physmap_base;
-	*limit = physmap_max - physmap_base;
-}
-
-extern "C" unsigned long long
+extern "C" extern "C" unsigned long long
 xg_vm_x_memsize(void)
 {
 	return max_mem;

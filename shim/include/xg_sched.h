@@ -15,7 +15,7 @@ void xg_sched_init(void);
 /* puts a thread shadow on proc0's thread list and the tid hash (tdfind); any context, never sleeps */
 void xg_sched_td_register(struct thread *td);
 
-/* sched_pin()/sched_unpin() that really keep the XNU thread on its CPU (thread_bind) */
+/* sched_pin()/sched_unpin() as critical sections: the XNU thread can neither migrate nor be preempted */
 void xg_sched_pin(void);
 void xg_sched_unpin(void);
 

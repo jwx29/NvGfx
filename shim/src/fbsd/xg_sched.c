@@ -1,5 +1,5 @@
 /*
- * XeGfx: FreeBSD threads and scheduling on XNU: kthreads on kernel_thread_start, CPU binding through thread_bind,
+ * XeGfx: FreeBSD threads and scheduling on XNU: kthreads on kernel_thread_start, pinning as critical sections (no public CPU binding),
  * the proc0/allproc/tid registry behind pfind and tdfind, the ck_epoch calls LinuxKPI's RCU is built on, group task
  * queues for tasklets, kernel FPU sections, Giant and the CPUID globals.
  * <wtl> project: xegfx | author: watchthelight </wtl>
@@ -304,15 +304,10 @@ tdfind(lwpid_t tid, pid_t pid)
 void
 tdsignal(struct thread *td, int sig)
 {
-	void *th;
-
 	if (!_SIG_VALID(sig))
 		panic("tdsignal: invalid signal %d", sig);
 	SIGADDSET(td->td_siglist, sig);
-	/* an interruptible XNU wait (xg_lock's ABORTSAFE sleeps) ends with EINTR; others are left alone */
-	th = XG_TD_XTHREAD(td);
-	if (th != NULL && td != curthread)
-		clear_wait(th, XG_THREAD_INTERRUPTED);
+	/* no public KPI aborts another thread's wait: a sleeper sees the signal when its sleep ends */
 }
 
 /* ---- priorities: recorded for FreeBSD's bookkeeping; XNU keeps its own (callers hold a spin lock) ---- */
@@ -364,35 +359,18 @@ rtp_to_pri(struct rtprio *rtp, struct thread *td)
 }
 
 /* ---- CPU binding ---- */
-static int
-xg_sched_can_block(void)
-{
-	return (preemption_enabled() && !ml_at_interrupt_context());
-}
-
-/* the XNU binding that matches td's FreeBSD state: its bound CPU, the current CPU while pinned, or none */
-static void
-xg_sched_apply(struct thread *td)
-{
-	if (ml_at_interrupt_context())
-		return;
-	if (td->td_flags & XG_TDF_BOUND)
-		thread_bind(cpu_to_processor(td->td_oncpu));
-	else if (td->td_pinned > 0) {
-		_disable_preemption();
-		thread_bind(current_processor());
-		_enable_preemption();
-	} else
-		thread_bind(XG_PROCESSOR_NULL);
-}
-
+/*
+ * Kexts have no public CPU binding. sched_pin is a critical section, so a pinned thread neither migrates nor gets
+ * preempted (LinuxKPI's RCU readers pin; they never sleep). sched_bind only records the CPU: linux_synchronize_rcu
+ * binds just to avoid spinning on a preempted reader, and readers here cannot be preempted.
+ */
 void
 xg_sched_pin(void)
 {
 	struct thread *td = curthread;
 
-	if (td->td_pinned++ == 0 && !(td->td_flags & XG_TDF_BOUND))
-		xg_sched_apply(td);
+	td->td_pinned++;
+	critical_enter();
 	atomic_interrupt_fence();
 }
 
@@ -402,8 +380,8 @@ xg_sched_unpin(void)
 	struct thread *td = curthread;
 
 	atomic_interrupt_fence();
-	if (--td->td_pinned == 0 && !(td->td_flags & XG_TDF_BOUND))
-		xg_sched_apply(td);
+	td->td_pinned--;
+	critical_exit();
 }
 
 void
@@ -414,8 +392,6 @@ sched_unbind(struct thread *td)
 	if ((td->td_flags & XG_TDF_BOUND) == 0)
 		return;
 	td->td_flags &= ~XG_TDF_BOUND;
-	td->td_pinned--;
-	xg_sched_apply(td);
 }
 
 int
@@ -427,8 +403,6 @@ sched_is_bound(struct thread *td)
 void
 sched_bind(struct thread *td, int cpu)
 {
-	int held, here;
-
 	if (td != curthread)
 		panic("sched_bind: can only bind curthread");
 	if (cpu < 0 || cpu >= mp_ncpus)
@@ -437,23 +411,6 @@ sched_bind(struct thread *td, int cpu)
 		sched_unbind(td);
 	td->td_flags |= XG_TDF_BOUND;
 	td->td_oncpu = cpu;
-	td->td_pinned++;
-	if (ml_at_interrupt_context())
-		return;
-	_disable_preemption();
-	here = cpu_number() == cpu;
-	thread_bind(cpu_to_processor(cpu));
-	_enable_preemption();
-	if (here)
-		return;
-	/* like ULE's mi_switch(SWT_BIND): give up the thread lock, move, take it again */
-	held = td->td_lock != NULL && mtx_owned(td->td_lock) && !mtx_recursed(td->td_lock);
-	if (held)
-		thread_unlock(td);
-	if (xg_sched_can_block())
-		thread_block(NULL);
-	if (held)
-		thread_lock(td);
 }
 
 /* ---- kthreads ---- */

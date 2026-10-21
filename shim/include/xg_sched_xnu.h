@@ -16,8 +16,4 @@ extern void thread_set_thread_name(xg_thread_t th, const char *name);
 extern int preemption_enabled(void);
 
 /* xnu osfmk, exported but private */
-extern xg_processor_t thread_bind(xg_processor_t processor);
-extern xg_processor_t cpu_to_processor(int cpu);
-extern xg_processor_t current_processor(void);
-extern int clear_wait(xg_thread_t thread, xg_wait_result_t result);
 #endif

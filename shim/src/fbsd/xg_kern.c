@@ -28,6 +28,10 @@ void xg_sched_td_register(struct thread *td);
 static struct ucred xg_cred0;
 static unsigned long long xg_boot_abs;
 
+/* each shadow is followed by its thread's own lck_spin, held for the length of a critical section */
+#define XG_TD_CRIT(td)	(*(xg_lck_spin_t **)((char *)(td) + sizeof(struct thread)))
+static xg_lck_grp_t *xg_lck_grp;
+
 /* thread shadows: open addressing on the XNU thread pointer, entries are never removed (see xg_thread_reap) */
 #define XG_TD_SLOTS 4096
 static struct { void *key; struct thread *td; } xg_td[XG_TD_SLOTS];
@@ -71,9 +75,13 @@ xg_curthread(void)
 			break;
 	}
 	/* first FreeBSD-side call on this XNU thread: make its shadow */
-	td = IOMallocZero(sizeof(*td));
+	td = IOMallocZero(sizeof(*td) + sizeof(xg_lck_spin_t *));
 	if (td == NULL)
 		panic("xegfx: no memory for a thread shadow");
+	if (xg_lck_grp == NULL)
+		xg_lck_grp = lck_grp_alloc_init("xegfx", NULL);
+	if ((XG_TD_CRIT(td) = lck_spin_alloc_init(xg_lck_grp, NULL)) == NULL)
+		panic("xegfx: no spin lock for a thread shadow");
 	td->td_proc = &proc0;
 	td->td_ucred = &xg_cred0;
 	td->td_lock = &xg_thread_lock_mtx;
@@ -85,7 +93,7 @@ xg_curthread(void)
 	for (u_int i = 0; i < XG_TD_SLOTS; i++) {
 		u_int s = (h + i) % XG_TD_SLOTS;
 		if (xg_td[s].key == k) {	/* raced with ourselves through an interrupt: keep the first */
-			IOFree(td, sizeof(*td));
+			IOFree(td, sizeof(*td) + sizeof(xg_lck_spin_t *));	/* its lck_spin is leaked: rare race */
 			td = xg_td[s].td;
 			break;
 		}
@@ -150,14 +158,15 @@ xg_dpcpu_block(const void *tmpl, unsigned long size)
 	return (blk);
 }
 
-/* critical sections: no preemption, so the current CPU (and its DPCPU data) stays put */
+/* critical sections: no preemption, so the current CPU (and its DPCPU data) stays put. Holding the thread's own,
+ * never contended lck_spin is how a kext turns preemption off; sleeping inside one panics, as it should. */
 void
 critical_enter_KBI(void)
 {
 	struct thread *td = curthread;
 
 	if (td->td_critnest++ == 0)
-		_disable_preemption();
+		lck_spin_lock(XG_TD_CRIT(td));
 }
 
 void
@@ -166,7 +175,7 @@ critical_exit_KBI(void)
 	struct thread *td = curthread;
 
 	if (--td->td_critnest == 0)
-		_enable_preemption();
+		lck_spin_unlock(XG_TD_CRIT(td));
 }
 
 void

@@ -23,18 +23,16 @@ xg_vm_xmem_t xg_vm_x_alloc(unsigned long long size, unsigned long long physmask,
     unsigned long long *pa);
 /* kernel mapping of a physical range (device memory or RAM) */
 xg_vm_xmem_t xg_vm_x_map_phys(unsigned long long pa, unsigned long long size, int cache, void **kva);
-/* kernel VA reserved with no-access guard pages, filled later by xg_vm_x_map_at() */
+/* kernel VA reserved by a pageable buffer mapping, filled later by xg_vm_x_map_at() */
 xg_vm_xmem_t xg_vm_x_reserve(unsigned long long size, void **kva);
 /* map n pages (physical addresses pa[]) over va, which lies inside the reservation resv */
 xg_vm_xmem_t xg_vm_x_map_at(xg_vm_xmem_t resv, void *va, const unsigned long long *pa, unsigned int n, int cache);
-/* put guard pages back over [va, va + size) inside the reservation */
+/* put the reservation's own backing back over [va, va + size) */
 int xg_vm_x_unmap_at(xg_vm_xmem_t resv, void *va, unsigned long long size);
 void xg_vm_x_release(xg_vm_xmem_t xm);
 
 /* physical address behind a wired kernel VA, 0 when none; may block (it wires the page for the lookup) */
 unsigned long long xg_vm_x_kextract(const void *va);
-/* XNU's direct map of all RAM (physmap), the FreeBSD DMAP on this kernel */
-void xg_vm_x_dmap(unsigned long long *base, unsigned long long *limit);
 unsigned long long xg_vm_x_memsize(void);
 /* write back and invalidate CPU caches for a kernel range */
 void xg_vm_x_flush(void *va, unsigned long long len);

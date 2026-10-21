@@ -1806,3 +1806,31 @@ lkpi_i2cbb_transfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int nmsgs
 {
 	return (-ENXIO);
 }
+
+/* not in the kext KPI sets: our own bsearch, and suword64 as a copyout */
+void *
+bsearch(const void *key, const void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *))
+{
+	const char *lo = base;
+	size_t n = nmemb;
+
+	while (n > 0) {
+		const char *mid = lo + (n / 2) * size;
+		int c = compar(key, mid);
+
+		if (c == 0)
+			return ((void *)(uintptr_t)mid);
+		if (c > 0) {
+			lo = mid + size;
+			n = n - n / 2 - 1;
+		} else
+			n /= 2;
+	}
+	return (NULL);
+}
+
+int
+suword64(volatile void *base, int64_t word)
+{
+	return (copyout(&word, (void *)(uintptr_t)base, sizeof(word)) == 0 ? 0 : -1);
+}

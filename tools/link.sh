@@ -25,3 +25,6 @@ cp "$ROOT/kext/Info.plist" "$B/Info.plist"
 codesign -s - -f "$ROOT/out/XeGfx.kext" >/dev/null 2>&1 || true
 echo "XeGfx.kext $(stat -f %z "$B/MacOS/XeGfx") B"
 python3 ~/src/kcabi/linkcheck.py "$ROOT/out/XeGfx.kext" | tail -25
+# every undefined symbol must resolve from a declared, public KPI library (kmutil enforces this when it builds a
+# collection; linkcheck only knows what the kernel exports)
+python3 "$ROOT/tools/kpi_check.py" "$ROOT/out/XeGfx.kext" || exit 1

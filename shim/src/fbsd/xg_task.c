@@ -265,12 +265,15 @@ xg_callout_fire(void *p0, void *p1)
 	callout_func_t *fn;
 	void *arg;
 
+	/* c_cpu counts runs in progress, so a draining stop can wait for them (no public cancel-and-wait) */
+	atomic_add_int((volatile u_int *)&c->c_cpu, 1);
 	if (c->c_lock != NULL)
 		xg_lock_acquire(c->c_lock);
 	/* stopped (or rescheduled to a later time) after this run was queued: skip it */
 	if (!(c->c_iflags & CALLOUT_PENDING) || (uintptr_t)p1 != (uintptr_t)c->c_time) {
 		if (c->c_lock != NULL)
 			xg_lock_release(c->c_lock);
+		atomic_subtract_int((volatile u_int *)&c->c_cpu, 1);
 		return;
 	}
 	c->c_iflags &= ~CALLOUT_PENDING;
@@ -279,6 +282,7 @@ xg_callout_fire(void *p0, void *p1)
 	fn(arg);
 	if (c->c_lock != NULL && !(c->c_flags & CALLOUT_RETURNUNLOCKED))
 		xg_lock_release(c->c_lock);
+	atomic_subtract_int((volatile u_int *)&c->c_cpu, 1);
 }
 
 void
@@ -333,9 +337,9 @@ _callout_stop_safe(struct callout *c, int flags)
 	c->c_flags &= ~CALLOUT_ACTIVE;
 	if (XG_CALL(c) == NULL)
 		return (0);
+	thread_call_cancel(XG_CALL(c));
 	if (flags & CS_DRAIN)
-		thread_call_cancel_wait(XG_CALL(c));
-	else
-		thread_call_cancel(XG_CALL(c));
+		while (atomic_load_acq_int((volatile u_int *)&c->c_cpu) != 0)
+			pause_sbt("cdrain", SBT_1MS, 0, 0);
 	return (was);
 }

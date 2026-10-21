@@ -88,6 +88,7 @@ struct xg_vm_run {
 	volatile u_long	nlive;		/* pages not freed yet */
 	int		kind;
 	xg_vm_xmem_t	xm;
+	char		*kva;		/* the IOKit allocation's kernel mapping */
 	struct vm_page	pages[];
 };
 
@@ -95,6 +96,8 @@ struct xg_vm_run {
 #define	XG_KM_KMEM	1
 #define	XG_KM_DEV	2
 #define	XG_KM_KVA	3
+#define	XG_KM_PAGES	4	/* a page run's mapping: what PHYS_TO_DMAP returns for its pages */
+#define	XG_KM_PMAP	5	/* a kept one-page mapping of a physical page the shim did not allocate */
 
 struct xg_vm_sub {			/* one pmap_qenter mapping inside a kva_alloc range */
 	struct xg_vm_sub *next;
@@ -140,6 +143,19 @@ xg_vm_node_free(struct pctrie *ptree, void *node)
 
 PCTRIE_DEFINE(XG_VM_RUN, xg_vm_run, pa, xg_vm_node_alloc, xg_vm_node_free);
 PCTRIE_DEFINE(XG_VM_KMAP, xg_vm_kmap, kva, xg_vm_node_alloc, xg_vm_node_free);
+
+/* physical page -> kept kernel mapping, for PHYS_TO_DMAP of pages outside the shim's runs */
+struct xg_vm_pmap {
+	uint64_t	pa;		/* trie key, page aligned */
+	void		*kva;
+	xg_vm_xmem_t	xm;
+};
+PCTRIE_DEFINE(XG_VM_PMAP, xg_vm_pmap, pa, xg_vm_node_alloc, xg_vm_node_free);
+static struct pctrie xg_vm_pmaps;
+static int xg_vm_kmap_insert(struct xg_vm_kmap *k);
+static struct xg_vm_kmap *xg_vm_kmap_find_locked(vm_offset_t va);
+static struct xg_vm_kmap *xg_vm_kmap_take(vm_offset_t kva, int kind);
+void linux_free_pages(struct vm_page *page, unsigned int order);	/* LinuxKPI's struct page is vm_page */
 
 /* object page tries (vm_radix.h) */
 void *
@@ -187,22 +203,18 @@ xg_vm_object_init(vm_object_t obj, objtype_t type, vm_pindex_t size)
 static void
 xg_vm_setup(void)
 {
-	unsigned long long base, limit;
-
 	mtx_init(&xg_vm_mtx, "xgvm", NULL, MTX_DEF);
 	sx_init(&xg_vm_devsx, "xgvmdev");
 	pctrie_init(&xg_vm_runs);
 	pctrie_init(&xg_vm_kmaps);
-	xg_vm_x_dmap(&base, &limit);
-	kva_layout.dmap_low = base;
-	kva_layout.dmap_high = base + limit;
+	pctrie_init(&xg_vm_pmaps);
+	/* no direct map: PHYS_TO_DMAP and friends are lookups (shim machine/vmparam.h, xg_vm_phys_to_kva) */
+	kva_layout.dmap_low = 0;
+	kva_layout.dmap_high = 0;
 	kva_layout.km_low = XG_VM_KM_LOW;
 	kva_layout.km_high = XG_VM_KM_HIGH;
-	kva_layout.kva_min = MIN(base, XG_VM_KM_LOW);
+	kva_layout.kva_min = XG_VM_KM_LOW;
 	kva_layout.kva_max = XG_VM_KM_HIGH;
-	/* linux_free_kmem tells kmem from DMAP addresses by this range */
-	if (base == 0 || (base < XG_VM_KM_HIGH && base + limit > XG_VM_KM_LOW))
-		printf("xegfx: vm: physmap 0x%llx+0x%llx overlaps the kernel map\n", base, limit);
 	physmem = (long)atop(xg_vm_x_memsize());
 	xg_vm_object_init(&kernel_object_store, OBJT_PHYS, atop(XG_VM_KM_HIGH - XG_VM_KM_LOW));
 }
@@ -220,13 +232,6 @@ xg_vm_init(void)
 	}
 	while (atomic_load_acq_int(&xg_vm_state) != 2)
 		cpu_spinwait();
-}
-
-/* runs as a kext constructor, so the DMAP base is right before any consumer reads kva_layout */
-static void __attribute__((constructor))
-xg_vm_ctor(void)
-{
-	xg_vm_init();
 }
 
 static int
@@ -434,6 +439,10 @@ xg_vm_run_find(vm_paddr_t pa)
 static void
 xg_vm_run_destroy(struct xg_vm_run *r)
 {
+	struct xg_vm_kmap *k;
+
+	if (r->kind == XG_RUN_PAGES && (k = xg_vm_kmap_take((vm_offset_t)r->kva, XG_KM_PAGES)) != NULL)
+		free(k, M_XGVM);
 	mtx_lock(&xg_vm_mtx);
 	XG_VM_RUN_PCTRIE_REMOVE(&xg_vm_runs, r->pa);
 	mtx_unlock(&xg_vm_mtx);
@@ -465,6 +474,7 @@ xg_vm_run_alloc(u_long npages, vm_paddr_t low, vm_paddr_t high, u_long alignment
     vm_memattr_t ma, int kind, void **kvap)
 {
 	struct xg_vm_run *r;
+	struct xg_vm_kmap *pk = NULL;
 	unsigned long long pa;
 	void *kva;
 	vm_size_t size = ptoa(npages);
@@ -486,16 +496,34 @@ xg_vm_run_alloc(u_long npages, vm_paddr_t low, vm_paddr_t high, u_long alignment
 		goto fail;
 	}
 	r->pa = pa;
+	r->kva = kva;
 	/* page runs take their attribute after zeroing (pmap_page_set_memattr), kmem runs are mapped with it */
 	for (i = 0; i < npages; i++)
 		xg_vm_page_init(&r->pages[i], pa + ptoa(i), kind == XG_RUN_KMEM ? ma : VM_MEMATTR_DEFAULT);
+	if (kind == XG_RUN_PAGES) {
+		/* the run's mapping, so DMAP_TO_PHYS and VIRT_IN_DMAP find its pages' addresses */
+		if ((pk = malloc(sizeof(*pk), M_XGVM, M_NOWAIT | M_ZERO)) == NULL)
+			goto fail;
+		pk->kva = (uint64_t)kva;
+		pk->size = size;
+		pk->kind = XG_KM_PAGES;
+		pk->pa = pa;
+		pk->run = r;
+	}
 	if (xg_vm_run_insert(r) != 0)
 		goto fail;
+	if (pk != NULL && xg_vm_kmap_insert(pk) != 0) {
+		mtx_lock(&xg_vm_mtx);
+		XG_VM_RUN_PCTRIE_REMOVE(&xg_vm_runs, r->pa);
+		mtx_unlock(&xg_vm_mtx);
+		goto fail;
+	}
 	atomic_add_long(&xg_vm_npages, npages);
 	if (kvap != NULL)
 		*kvap = kva;
 	return (r);
 fail:
+	free(pk, M_XGVM);
 	xg_vm_x_release(r->xm);
 	free(r, M_XGVM);
 	return (NULL);
@@ -1309,8 +1337,15 @@ kmem_free(void *addr, vm_size_t size)
 
 	if (addr == NULL)
 		return;
-	if ((k = xg_vm_kmap_take((vm_offset_t)addr, XG_KM_KMEM)) == NULL)
+	if ((k = xg_vm_kmap_take((vm_offset_t)addr, XG_KM_KMEM)) == NULL) {
+		/* linux_free_kmem sends page addresses here too: they sit in the kernel map range on XNU */
+		if (xg_vm_virt_in_dmap((vm_offset_t)addr)) {
+			linux_free_pages(PHYS_TO_VM_PAGE(pmap_kextract((vm_offset_t)addr)),
+			    (unsigned int)(flsl((long)atop(round_page(size))) - 1));
+			return;
+		}
 		panic("xegfx: vm: kmem_free(%p, %lu) of memory kmem_alloc_contig did not return", addr, (u_long)size);
+	}
 	k->run->nlive = 1;
 	xg_vm_run_destroy(k->run);
 	free(k, M_XGVM);
@@ -1495,8 +1530,6 @@ pmap_kextract(vm_offset_t va)
 	bool found = false;
 
 	xg_vm_init();
-	if (va >= kva_layout.dmap_low && va < kva_layout.dmap_high)
-		return (va - kva_layout.dmap_low);
 	mtx_lock(&xg_vm_mtx);
 	if ((k = xg_vm_kmap_find_locked(va)) != NULL) {
 		found = true;
@@ -1523,7 +1556,7 @@ pmap_copy_page(vm_page_t src, vm_page_t dst)
 }
 
 /*
- * The attribute applies to later mappings (pmap_qenter, user maps). XNU's physmap alias stays write-back, so moving
+ * The attribute applies to later mappings (pmap_qenter, user maps). the page's own kernel mapping stays write-back, so moving
  * a RAM page to WC or UC writes its lines back first, as FreeBSD's pmap does when it changes the DMAP.
  */
 void
@@ -1532,8 +1565,7 @@ pmap_page_set_memattr(vm_page_t m, vm_memattr_t ma)
 	vm_memattr_t old = (vm_memattr_t)m->md.pat_mode;
 
 	m->md.pat_mode = ma;
-	if (old != ma && ma != VM_MEMATTR_WRITE_BACK && (m->flags & PG_FICTITIOUS) == 0 &&
-	    VM_PAGE_TO_PHYS(m) < kva_layout.dmap_high - kva_layout.dmap_low)
+	if (old != ma && ma != VM_MEMATTR_WRITE_BACK && (m->flags & PG_FICTITIOUS) == 0)
 		xg_vm_x_flush(PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m)), PAGE_SIZE);
 }
 
@@ -1660,4 +1692,75 @@ uma_zcache_create(const char *name, int size, uma_ctor ctor, uma_dtor dtor, uma_
     uma_import zimport, uma_release zrelease, void *arg, int flags)
 {
 	xg_unimpl("uma_zcache_create");
+}
+
+/* ---- the FreeBSD DMAP as lookups: XNU gives kexts no direct map of RAM ---- */
+
+void *
+xg_vm_phys_to_kva(vm_paddr_t pa)
+{
+	struct xg_vm_run *r = xg_vm_run_find(pa);
+	struct xg_vm_pmap *p, *n;
+	struct xg_vm_kmap *k;
+	vm_paddr_t page = trunc_page(pa);
+	void *kva;
+
+	if (r != NULL && r->kva != NULL)
+		return (r->kva + (pa - r->pa));
+	mtx_lock(&xg_vm_mtx);
+	p = XG_VM_PMAP_PCTRIE_LOOKUP(&xg_vm_pmaps, page);
+	mtx_unlock(&xg_vm_mtx);
+	if (p != NULL)
+		return ((char *)p->kva + (pa & PAGE_MASK));
+	/* first CPU access to a page the shim did not allocate: a one-page IOKit mapping, kept (this may block) */
+	if (curthread->td_critnest != 0)
+		printf("xegfx: vm: PHYS_TO_DMAP(0x%lx) maps a page inside a critical section\n", (u_long)pa);
+	n = malloc(sizeof(*n), M_XGVM, M_WAITOK | M_ZERO);
+	k = malloc(sizeof(*k), M_XGVM, M_WAITOK | M_ZERO);
+	if ((n->xm = xg_vm_x_map_phys(page, PAGE_SIZE, XG_VM_CACHE_DEFAULT, &kva)) == NULL)
+		panic("xegfx: vm: cannot map physical page 0x%lx", (u_long)page);
+	n->pa = page;
+	n->kva = kva;
+	mtx_lock(&xg_vm_mtx);
+	p = XG_VM_PMAP_PCTRIE_LOOKUP(&xg_vm_pmaps, page);
+	if (p == NULL && XG_VM_PMAP_PCTRIE_INSERT(&xg_vm_pmaps, n) == 0) {
+		p = n;
+		n = NULL;
+	}
+	mtx_unlock(&xg_vm_mtx);
+	if (n != NULL) {		/* raced with another mapper, or no trie node: use theirs or fail */
+		xg_vm_x_release(n->xm);
+		free(n, M_XGVM);
+		free(k, M_XGVM);
+		if (p == NULL)
+			panic("xegfx: vm: no memory to record the mapping of 0x%lx", (u_long)page);
+		return ((char *)p->kva + (pa & PAGE_MASK));
+	}
+	k->kva = (uint64_t)kva;
+	k->size = PAGE_SIZE;
+	k->kind = XG_KM_PMAP;
+	k->pa = page;
+	k->xm = NULL;		/* owned by the pmap entry */
+	if (xg_vm_kmap_insert(k) != 0)
+		free(k, M_XGVM);	/* the mapping still works; only DMAP_TO_PHYS falls back to IOKit */
+	return ((char *)p->kva + (pa & PAGE_MASK));
+}
+
+vm_paddr_t
+xg_vm_kva_to_phys(vm_offset_t va)
+{
+	return (pmap_kextract(va));
+}
+
+int
+xg_vm_virt_in_dmap(vm_offset_t va)
+{
+	struct xg_vm_kmap *k;
+	int in;
+
+	mtx_lock(&xg_vm_mtx);
+	k = xg_vm_kmap_find_locked(va);
+	in = k != NULL && (k->kind == XG_KM_PAGES || k->kind == XG_KM_PMAP);
+	mtx_unlock(&xg_vm_mtx);
+	return (in);
 }

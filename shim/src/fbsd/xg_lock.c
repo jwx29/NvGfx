@@ -33,7 +33,7 @@ sbintime_t xg_sbinuptime(void);
 #define XG_LC_RW	(4 << LO_CLASSSHIFT)
 #define XG_SPIN_TRIES	256
 
-/* wait-channel chains: a spin lock per bucket, held with preemption off */
+/* wait-channel chains: a spin lock per bucket, held inside a critical section */
 #define XG_SQ_BUCKETS 512
 static struct { volatile u_int lock; char pad[CACHE_LINE_SIZE - sizeof(u_int)]; } xg_sq[XG_SQ_BUCKETS];
 
@@ -48,7 +48,7 @@ xg_sq_lock(const volatile void *w)
 {
 	volatile u_int *l = &xg_sq[xg_sq_hash(w)].lock;
 
-	_disable_preemption();
+	critical_enter();
 	while (!atomic_cmpset_acq_int(l, 0, 1))
 		while (*l != 0)
 			cpu_spinwait();
@@ -58,7 +58,7 @@ static void
 xg_sq_unlock(const volatile void *w)
 {
 	atomic_store_rel_int(&xg_sq[xg_sq_hash(w)].lock, 0);
-	_enable_preemption();
+	critical_exit();
 }
 
 static unsigned long long

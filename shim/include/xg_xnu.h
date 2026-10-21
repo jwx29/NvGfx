@@ -22,8 +22,13 @@ extern xg_wait_result_t assert_wait(void *event, int interruptible);
 extern xg_wait_result_t assert_wait_deadline(void *event, int interruptible, unsigned long long deadline);
 extern xg_wait_result_t thread_block(void *continuation);
 extern int thread_wakeup_prim(void *event, int one_thread, xg_wait_result_t result);
-extern void _disable_preemption(void);
-extern void _enable_preemption(void);
+/* spin locks: a held lck_spin keeps preemption off, the public way for a kext to stay on its CPU */
+typedef struct xg_lck_grp xg_lck_grp_t;
+typedef struct xg_lck_spin xg_lck_spin_t;
+extern xg_lck_grp_t *lck_grp_alloc_init(const char *grp_name, void *attr);
+extern xg_lck_spin_t *lck_spin_alloc_init(xg_lck_grp_t *grp, void *attr);
+extern void lck_spin_lock(xg_lck_spin_t *lck);
+extern void lck_spin_unlock(xg_lck_spin_t *lck);
 extern int ml_set_interrupts_enabled(int enable);
 extern int ml_get_interrupts_enabled(void);
 extern int ml_at_interrupt_context(void);
@@ -52,6 +57,5 @@ extern void panic(const char *fmt, ...) __attribute__((__noreturn__));
 extern xg_call_t thread_call_allocate_with_options(void (*func)(void *, void *), void *param0, int pri, unsigned int options);
 extern int thread_call_enter1_delayed(xg_call_t call, void *param1, unsigned long long deadline);
 extern int thread_call_cancel(xg_call_t call);
-extern int thread_call_cancel_wait(xg_call_t call);
 extern int thread_call_free(xg_call_t call);
 #endif
