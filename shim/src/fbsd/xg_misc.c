@@ -11,7 +11,6 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/sx.h>
-#include <sys/condvar.h>
 #include <sys/proc.h>
 #include <sys/smp.h>
 #include <sys/pcpu.h>
@@ -48,6 +47,8 @@
 #include <dev/vt/colors/vt_termcolors.h>
 #include "xg_xnu.h"
 #include "xg_misc.h"
+#include "xg_sched.h"
+#include "xg_fd.h"
 
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 
@@ -61,7 +62,6 @@ static struct sx xg_fw_lock;
 static struct mtx xg_dev_mtx;
 static struct mtx xg_knlist_mtx;
 static struct mtx xg_gtq_mtx;
-static struct cv xg_gtq_cv;
 static volatile u_int xg_misc_state;	/* 0 not started, 1 running, 2 done */
 
 static void xg_sysctl_register_static(void);
@@ -82,8 +82,7 @@ xg_misc_init(void)
 	sx_init(&xg_fw_lock, "firmware lock");
 	mtx_init(&xg_dev_mtx, "cdev", NULL, MTX_DEF);
 	mtx_init(&xg_knlist_mtx, "knlist lock for lockless objects", NULL, MTX_DEF);
-	mtx_init(&xg_gtq_mtx, "gtaskqueue", NULL, MTX_DEF);
-	cv_init(&xg_gtq_cv, "gtqdrn");
+	mtx_init(&xg_gtq_mtx, "taskqgroup", NULL, MTX_DEF);
 	xg_sysctl_register_static();
 	atomic_store_rel_int(&xg_misc_state, 2);
 }
@@ -1099,6 +1098,16 @@ smp_rendezvous(void (*setup)(void *), void (*action)(void *), void (*teardown)(v
 
 /* ---- scheduling ---- */
 
+/*
+ * A relinquish sleeps a tick instead of only yielding: a kernel thread that just yields can keep a lower-priority
+ * thread holding an RCU read section off its CPU (docs/xg_sched.md).
+ */
+static void
+xg_relinquish(void)
+{
+	pause("yield", 1);
+}
+
 /* the caller holds its thread lock (a spin mutex), which mi_switch drops before switching */
 void
 mi_switch(int flags)
@@ -1108,14 +1117,17 @@ mi_switch(int flags)
 	thread_unlock(td);
 	if (SCHEDULER_STOPPED())
 		return;
-	thread_block(NULL);
+	if ((flags & SW_TYPE_MASK) == SWT_RELINQUISH)
+		xg_relinquish();
+	else
+		thread_block(NULL);
 }
 
+/* XNU picks priorities itself; this is FreeBSD's mi_switch(SW_VOL | SWT_RELINQUISH) part only */
 void
 kern_yield(int prio)
 {
-	/* XNU picks priorities itself; this is only the voluntary switch */
-	thread_block(NULL);
+	xg_relinquish();
 }
 
 /* every CPU is in NUMA domain 0 on the laptops XeGfx targets */
@@ -1132,73 +1144,17 @@ struct domainset domainset_roundrobin = {
 	.ds_cnt = 1,
 };
 
-/* ---- group taskqueues: one FreeBSD taskqueue (xg_task.c) per CPU slot, pumped by one task ---- */
-
-struct gtaskqueue {
-	STAILQ_HEAD(, gtask)	gq_queue;
-	struct gtask		*gq_running;
-	struct taskqueue	*gq_tq;
-	struct task		gq_pump;
-};
+/* ---- group taskqueues: the queues are the sched area's (xg_sched_gtq_*), this is the group around them ---- */
 
 struct taskqgroup {
 	const char		*tqg_name;
 	int			tqg_cnt;
 	struct gtaskqueue	**tqg_queue;	/* made on first attach to that slot */
+	char			(*tqg_qname)[24];
 	int			*tqg_ntasks;
 };
 
 struct taskqgroup *qgroup_softirq;
-
-static void
-xg_gtq_pump(void *arg, int pending)
-{
-	struct gtaskqueue *q = arg;
-	struct gtask *t;
-
-	mtx_lock(&xg_gtq_mtx);
-	while ((t = STAILQ_FIRST(&q->gq_queue)) != NULL) {
-		STAILQ_REMOVE_HEAD(&q->gq_queue, ta_link);
-		t->ta_flags &= ~TASK_ENQUEUED;
-		q->gq_running = t;
-		mtx_unlock(&xg_gtq_mtx);
-		t->ta_func(t->ta_context);
-		mtx_lock(&xg_gtq_mtx);
-		q->gq_running = NULL;
-		cv_broadcast(&xg_gtq_cv);
-	}
-	mtx_unlock(&xg_gtq_mtx);
-}
-
-/* runs in thread context (an ithread or IOKit work loop), never in a primary interrupt filter: the lock sleeps */
-int
-xg_misc_gtq_enqueue(struct gtaskqueue *q, struct gtask *t)
-{
-	mtx_lock(&xg_gtq_mtx);
-	if (t->ta_flags & TASK_ENQUEUED) {
-		mtx_unlock(&xg_gtq_mtx);
-		return (0);
-	}
-	if (t->ta_flags & TASK_NOENQUEUE) {
-		mtx_unlock(&xg_gtq_mtx);
-		return (EAGAIN);
-	}
-	STAILQ_INSERT_TAIL(&q->gq_queue, t, ta_link);
-	t->ta_flags |= TASK_ENQUEUED;
-	mtx_unlock(&xg_gtq_mtx);
-	taskqueue_enqueue(q->gq_tq, &q->gq_pump);
-	return (0);
-}
-
-/* waits until the task is neither queued nor running; called without xg_gtq_mtx */
-static void
-xg_gtq_drain_task(struct gtaskqueue *q, struct gtask *t)
-{
-	mtx_lock(&xg_gtq_mtx);
-	while ((t->ta_flags & TASK_ENQUEUED) || q->gq_running == t)
-		cv_wait(&xg_gtq_cv, &xg_gtq_mtx);
-	mtx_unlock(&xg_gtq_mtx);
-}
 
 static struct taskqgroup *
 xg_tqg_create(const char *name)
@@ -1209,8 +1165,18 @@ xg_tqg_create(const char *name)
 	g->tqg_name = name;
 	g->tqg_cnt = mp_ncpus;
 	g->tqg_queue = malloc(sizeof(*g->tqg_queue) * g->tqg_cnt, M_XGMISC, M_WAITOK | M_ZERO);
+	g->tqg_qname = malloc(sizeof(*g->tqg_qname) * g->tqg_cnt, M_XGMISC, M_WAITOK | M_ZERO);
 	g->tqg_ntasks = malloc(sizeof(*g->tqg_ntasks) * g->tqg_cnt, M_XGMISC, M_WAITOK | M_ZERO);
 	return (g);
+}
+
+static void
+xg_tqg_destroy(struct taskqgroup *g)
+{
+	free(g->tqg_ntasks, M_XGMISC);
+	free(g->tqg_qname, M_XGMISC);
+	free(g->tqg_queue, M_XGMISC);
+	free(g, M_XGMISC);
 }
 
 /* TASKQGROUP_DEFINE's SYSINIT does not run on XNU, so the one group LinuxKPI uses is made on first use */
@@ -1221,45 +1187,28 @@ xg_tqg_get(struct taskqgroup *g)
 
 	if (g != NULL)
 		return (g);
-	if (qgroup_softirq != NULL)
-		return (qgroup_softirq);
+	g = (struct taskqgroup *)atomic_load_acq_ptr((volatile uintptr_t *)&qgroup_softirq);
+	if (g != NULL)
+		return (g);
 	n = xg_tqg_create("softirq");
-	if (!atomic_cmpset_ptr((volatile uintptr_t *)&qgroup_softirq, 0, (uintptr_t)n)) {
-		free(n->tqg_ntasks, M_XGMISC);
-		free(n->tqg_queue, M_XGMISC);
-		free(n, M_XGMISC);
-	}
+	if (!atomic_cmpset_ptr((volatile uintptr_t *)&qgroup_softirq, 0, (uintptr_t)n))
+		xg_tqg_destroy(n);
 	return (qgroup_softirq);
 }
 
 static struct gtaskqueue *
-xg_gtq_slot(struct taskqgroup *g, int i)
+xg_tqg_slot(struct taskqgroup *g, int i)
 {
-	struct gtaskqueue *q, *n;
+	struct gtaskqueue *q;
 
 	mtx_lock(&xg_gtq_mtx);
 	q = g->tqg_queue[i];
-	mtx_unlock(&xg_gtq_mtx);
-	if (q != NULL)
-		return (q);
-	n = malloc(sizeof(*n), M_XGMISC, M_WAITOK | M_ZERO);
-	STAILQ_INIT(&n->gq_queue);
-	TASK_INIT(&n->gq_pump, 0, xg_gtq_pump, n);
-	n->gq_tq = taskqueue_create(g->tqg_name, M_WAITOK, taskqueue_thread_enqueue, &n->gq_tq);
-	if (n->gq_tq == NULL) {
-		free(n, M_XGMISC);
-		return (NULL);
+	if (q == NULL) {
+		/* xg_gtq_mtx is a sleep mutex, so creating the worker under it is fine and avoids a second queue */
+		snprintf(g->tqg_qname[i], sizeof(g->tqg_qname[i]), "%s_%d", g->tqg_name, i);
+		q = g->tqg_queue[i] = xg_sched_gtq_create(g->tqg_qname[i]);
 	}
-	taskqueue_start_threads(&n->gq_tq, 1, PI_SOFT, "%s_%d", g->tqg_name, i);
-	mtx_lock(&xg_gtq_mtx);
-	q = g->tqg_queue[i];
-	if (q == NULL)
-		q = g->tqg_queue[i] = n;
 	mtx_unlock(&xg_gtq_mtx);
-	if (q != n)
-		taskqueue_free(n->gq_tq);
-	if (q != n)
-		free(n, M_XGMISC);
 	return (q);
 }
 
@@ -1280,8 +1229,7 @@ taskqgroup_attach_cpu(struct taskqgroup *qgroup, struct grouptask *gtask, void *
 		printf("%s: qid not found for %s cpu=%d\n", __func__, gtask->gt_name, cpu);
 		return (EINVAL);
 	}
-	/* no thread binding on XNU: the slot only spreads tasks over worker threads */
-	q = xg_gtq_slot(qgroup, cpu);
+	q = xg_tqg_slot(qgroup, cpu);
 	if (q == NULL)
 		return (ENOMEM);
 	mtx_lock(&xg_gtq_mtx);
@@ -1295,17 +1243,23 @@ void
 taskqgroup_detach(struct taskqgroup *qgroup, struct grouptask *gtask)
 {
 	struct gtaskqueue *q = gtask->gt_taskqueue;
+	struct gtask *t = &gtask->gt_task;
 	int i;
 
 	xg_misc_init();
 	qgroup = xg_tqg_get(qgroup);
 	if (q == NULL)
 		return;
-	/* grouptask_block(): refuse new enqueues, then wait out the queued and running instance */
-	mtx_lock(&xg_gtq_mtx);
-	gtask->gt_task.ta_flags |= TASK_NOENQUEUE;
-	mtx_unlock(&xg_gtq_mtx);
-	xg_gtq_drain_task(q, &gtask->gt_task);
+	/*
+	 * grouptask_block() without the queue's lock: an enqueue racing with the flag write can drop it, but the drain
+	 * takes that lock after the write, so the check below sees the loss and goes round again.
+	 */
+	for (;;) {
+		t->ta_flags |= TASK_NOENQUEUE;
+		xg_sched_gtq_drain(q, t);
+		if ((t->ta_flags & (TASK_NOENQUEUE | TASK_ENQUEUED)) == TASK_NOENQUEUE)
+			break;
+	}
 	mtx_lock(&xg_gtq_mtx);
 	for (i = 0; i < qgroup->tqg_cnt; i++)
 		if (qgroup->tqg_queue[i] == q)
@@ -1313,9 +1267,9 @@ taskqgroup_detach(struct taskqgroup *qgroup, struct grouptask *gtask)
 	if (i == qgroup->tqg_cnt)
 		panic("%s: task %s not in group", __func__, gtask->gt_name);
 	qgroup->tqg_ntasks[i]--;
-	gtask->gt_taskqueue = NULL;
-	gtask->gt_task.ta_flags &= ~TASK_NOENQUEUE;
 	mtx_unlock(&xg_gtq_mtx);
+	gtask->gt_taskqueue = NULL;
+	t->ta_flags &= ~TASK_NOENQUEUE;
 }
 
 void
@@ -1330,14 +1284,8 @@ taskqgroup_drain_all(struct taskqgroup *qgroup)
 		mtx_lock(&xg_gtq_mtx);
 		q = qgroup->tqg_queue[i];
 		mtx_unlock(&xg_gtq_mtx);
-		if (q == NULL)
-			continue;
-		/* the pump empties the list before it finishes, so draining the pump drains every gtask in it */
-		taskqueue_drain(q->gq_tq, &q->gq_pump);
-		mtx_lock(&xg_gtq_mtx);
-		while (!STAILQ_EMPTY(&q->gq_queue) || q->gq_running != NULL)
-			cv_wait(&xg_gtq_cv, &xg_gtq_mtx);
-		mtx_unlock(&xg_gtq_mtx);
+		if (q != NULL)
+			xg_sched_gtq_drain_all(q);
 	}
 }
 
@@ -1498,39 +1446,17 @@ firmware_put(const struct firmware *p, int flags)
 	free(f, M_XGMISC);
 }
 
-/* ---- select and knlist: FreeBSD's kqueue does not exist here, the fd area bridges select ---- */
+/* ---- select and knlist: FreeBSD's kqueue does not exist here ---- */
 
-static const struct xg_misc_sel_ops *xg_sel_ops;
-
-void
-xg_misc_set_sel_ops(const struct xg_misc_sel_ops *ops)
-{
-	atomic_store_rel_ptr((volatile uintptr_t *)&xg_sel_ops, (uintptr_t)ops);
-}
-
-/* these shadow XNU's selrecord/selwakeup, which take an XNU struct selinfo */
-void
-selrecord(struct thread *selector, struct selinfo *sip)
-{
-	const struct xg_misc_sel_ops *ops = (const void *)atomic_load_acq_ptr((volatile uintptr_t *)&xg_sel_ops);
-
-	if (ops != NULL && ops->record != NULL)
-		ops->record(selector, sip);
-}
-
-void
-selwakeup(struct selinfo *sip)
-{
-	const struct xg_misc_sel_ops *ops = (const void *)atomic_load_acq_ptr((volatile uintptr_t *)&xg_sel_ops);
-
-	if (ops != NULL && ops->wakeup != NULL)
-		ops->wakeup(sip);
-}
-
+/*
+ * selrecord and selwakeup are not defined here: xg_fd.cpp calls XNU's functions of those names, and a FreeBSD
+ * definition in the kext would capture those calls. FreeBSD-side callers reach xg_fd_selrecord/xg_fd_selwakeup
+ * once sys/selinfo.h maps the names (see docs/xg_fd.md).
+ */
 void
 seldrain(struct selinfo *sip)
 {
-	selwakeup(sip);
+	xg_fd_selwakeup(sip);
 }
 
 static void

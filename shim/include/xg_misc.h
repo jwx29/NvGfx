@@ -15,21 +15,6 @@ void xg_misc_init(void);
  * first refusal (the remaining modules stay loaded) */
 int xg_misc_module_unload_all(void);
 
-/* select/poll bridge: the fd area points these at its XNU select glue; without them selrecord/selwakeup do nothing */
-struct thread;
-struct selinfo;
-struct xg_misc_sel_ops {
-	void (*record)(struct thread *td, struct selinfo *sip);
-	void (*wakeup)(struct selinfo *sip);
-};
-void xg_misc_set_sel_ops(const struct xg_misc_sel_ops *ops);
-
-/* group task queues (taskqgroup_*): the sched area's grouptaskqueue_enqueue() forwards here, the queue layout is
- * private to xg_misc.c */
-struct gtaskqueue;
-struct gtask;
-int xg_misc_gtq_enqueue(struct gtaskqueue *queue, struct gtask *task);
-
 /* XNU side (xg_misc.cpp): read a file from the kext's Contents/Resources through OSKextRequestResource and wait for
  * it. On success *datap is an IOMalloc() copy of *lenp bytes (free it with IOFree). Returns 0 or an errno value.
  * Sleeps: never call it with a spin lock held, or from the kext start routine (kernelmanagerd answers only after

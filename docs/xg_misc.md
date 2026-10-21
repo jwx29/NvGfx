@@ -32,9 +32,11 @@ the RB tree per node, OID_AUTO numbering, contexts, refcounted nodes, and remova
 
 Besides the sysctl ones above, xg_misc.c defines the whole FreeBSD `sbuf(9)` API (`sbuf_new`, `_delete`,
 `_finish`, `_data`, `_len`, `_clear`, `_setpos`, `_bcat`, `_bcpy`, `_cat`, `_cpy`, `_putc`, `_printf`,
-`_vprintf`, `_error`, `_done`). It also defines `selrecord`, `selwakeup` and `knote`. XNU's versions take XNU
-structs (its `struct sbuf` and `struct selinfo` differ, and its `knote` takes a `klist`), so LinuxKPI must never
-bind to them. Other XNU exports with the same problem belong to other areas and are listed in the report:
+`_vprintf`, `_error`, `_done`). It also defines `knote`. XNU's versions take XNU structs (its `struct sbuf` differs, and its `knote` takes
+a `klist`), so LinuxKPI must never bind to them. The catch: this applies to the whole kext. XNU-side `.cpp` code
+in XeGfx that wants XNU's own `sysctl_handle_*`, `sysctl__children`, `sbuf_*` or `knote` would get the FreeBSD ones.
+None does today. The clean long-term fix is renaming them in shim header overrides (`#define sbuf_new
+xg_sbuf_new`, and so on). Other XNU exports with the same problem belong to other areas and are listed in the report:
 `eventhandler_*`, `kmem_free`, `vm_page_*`, `pmap_*_page`, `log`, `osrelease`, `copyin`/`copyout`.
 
 ## counter(9)
@@ -52,17 +54,15 @@ a DMA failure path. A `shim/include/machine/counter.h` override should provide:
 
 ## Group taskqueues
 
-`struct gtaskqueue` and `struct taskqgroup` are private to xg_misc.c. Each CPU slot of a group gets one FreeBSD
-taskqueue from `xg_task.c`, created on the first attach to that slot. A pump task in it runs the queued gtasks in
-order. XNU threads cannot be bound to a CPU, so the slot only spreads the work over threads.
+The queues come from the sched area (`xg_sched_gtq_create`, `_drain`, `_drain_all`), and `grouptaskqueue_enqueue` is
+sched's too, safe from interrupt context. This file holds only `struct taskqgroup`: one slot per CPU, each slot's
+queue made on the first attach to it.
 
 - `qgroup_softirq` is created on first use, because `TASKQGROUP_DEFINE`'s SYSINIT does not run.
-- **Contract with the sched area:** `grouptaskqueue_enqueue(q, t)` (in sched's list) has to be
-  `return (xg_misc_gtq_enqueue(q, t));`. That keeps FreeBSD's semantics: an already queued task returns 0, and
-  TASK_NOENQUEUE returns EAGAIN.
-- Enqueue takes a sleep mutex. It must run in thread context (an ithread or an IOKit work loop), never in a primary
-  interrupt filter.
-- `taskqgroup_detach` blocks new enqueues, waits until the task is neither queued nor running, then unlinks it.
+- `taskqgroup_detach` does FreeBSD's `grouptask_block()` without the queue's private lock. It sets
+  TASK_NOENQUEUE, drains, and repeats if a racing enqueue dropped the flag. The drain takes the queue lock after
+  the write, so a lost flag is always visible afterwards. An `xg_sched_gtq_block(q, t)` in sched would make this a
+  single call.
 
 ## Firmware
 
@@ -80,16 +80,19 @@ two-reference handoff, so a late callback after a timeout is safe. Images are ca
 ## select and knlist
 
 There is no FreeBSD kqueue on XNU. `knlist_*` keep FreeBSD's list and lock semantics. `knote()` runs each note's
-`f_event`, but activation has nowhere to go. `selrecord` and `selwakeup` call the hooks the fd area installs with
-`xg_misc_set_sel_ops()`, and do nothing until then. `seldrain` is `selwakeup`, as on FreeBSD.
+`f_event`, but activation has nowhere to go. `seldrain` calls `xg_fd_selwakeup`. `selrecord` and `selwakeup` are
+deliberately not defined here: `xg_fd.cpp` calls XNU's functions of those names, and a FreeBSD definition anywhere
+in the kext would capture those calls. FreeBSD callers need the `sys/selinfo.h` rename that `docs/xg_fd.md`
+describes.
 
 ## Deliberately minimal
 
 - `smp_rendezvous` runs setup, action and teardown on the calling CPU only, with interrupts off. The SDK has no
   cross-call KPI (`mp_rendezvous` is exported but not declared). The only caller is `on_each_cpu` in
   `vlv_sideband.c`, which is Valleyview, not Xe.
-- `mi_switch` drops the thread lock and yields with `thread_block(NULL)`. `kern_yield` only yields, because XNU
-  picks the priority.
+- `mi_switch` drops the thread lock. For SWT_RELINQUISH it sleeps one tick (`pause`), as `docs/xg_sched.md` asks,
+  because a bare yield can keep a lower-priority RCU reader off the CPU. Other switches use `thread_block(NULL)`.
+  `kern_yield` sleeps the same tick and leaves the priority alone, since XNU picks it.
 - `XG_PCPU_domain()` returns 0 and the domainsets describe a single domain 0. `PCPU_GET(domain)` in
   `linux_page.c` reaches this function.
 - vnodes: XeGfx files have no FreeBSD vnode. `vref` and `vrele` count `v_usecount`, `_vn_lock` succeeds, and
