@@ -41,7 +41,11 @@ static int gResult[5];	/* per stage: 0 not run, 1 pass, negative errno-style fai
 static int gWdog = 60;
 static thread_call_t gWdogCall;
 static IOLock *gStageLock;
-static uint64_t gSurfPte;	/* GGTT entry behind PLANE_SURF_1_A at probe time, 0 if unknown */
+static uint64_t gSurfPte;
+static char gLog[64 * 1024];	/* last 64 KiB of the shim's console output, for sysctl debug.xegfx_log */
+static size_t gLogLen;
+static IOSimpleLock *gLogLock;
+static IOLock *gSnapLock;	/* GGTT entry behind PLANE_SURF_1_A at probe time, 0 if unknown */
 
 bool
 XeGfxResident::start(IOService *provider)
@@ -267,13 +271,69 @@ SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFL
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_progress, CTLFLAG_RD | CTLFLAG_LOCKED, &xg_progress, 0, "last breadcrumb");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_wdog, CTLFLAG_RW | CTLFLAG_LOCKED, &gWdog, 0, "stage stall panic, seconds");
+static int xegfx_log_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
+SYSCTL_PROC(_debug, OID_AUTO, xegfx_log, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_log_sysctl,
+    "S", "the shim's console output (last 64 KiB)");
 SYSCTL_STRING(_debug, OID_AUTO, xegfx_env, CTLFLAG_RW | CTLFLAG_LOCKED, xg_env, sizeof(xg_env),
     "tunables for the stages, name=value pairs");
 
 static struct sysctl_oid *const gOids[] = {
 	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_running,
-	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env,
+	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env, &sysctl__debug_xegfx_log,
 };
+
+extern "C" int
+xg_vprintf(const char *fmt, va_list ap)
+{
+	char buf[512];
+	va_list aq;
+	int n;
+
+	va_copy(aq, ap);
+	n = vsnprintf(buf, sizeof(buf), fmt, aq);
+	va_end(aq);
+	if (gLogLock && n > 0) {
+		size_t l = MIN((size_t)n, sizeof(buf) - 1);
+		IOInterruptState is = IOSimpleLockLockDisableInterrupt(gLogLock);
+		if (gLogLen + l > sizeof(gLog)) {
+			size_t drop = gLogLen + l - sizeof(gLog) + sizeof(gLog) / 4;
+			memmove(gLog, gLog + drop, gLogLen - drop);
+			gLogLen -= drop;
+		}
+		memcpy(gLog + gLogLen, buf, l);
+		gLogLen += l;
+		IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
+	}
+	return vprintf(fmt, ap);
+}
+
+extern "C" int
+xg_printf(const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = xg_vprintf(fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+static int
+xegfx_log_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	static char snap[sizeof(gLog)];
+	size_t n;
+
+	IOLockLock(gSnapLock);	/* one reader at a time owns the snapshot; not the stage lock, a stage holds that */
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(gLogLock);
+	n = gLogLen;
+	memcpy(snap, gLog, n);
+	IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
+	int err = SYSCTL_OUT(req, snap, n);
+	IOLockUnlock(gSnapLock);
+	return err;
+}
 
 extern "C" void
 xg_unimpl(const char *name)
@@ -285,8 +345,10 @@ extern "C" kern_return_t
 _start(kmod_info_t *, void *)
 {
 	gStageLock = IOLockAlloc();
+	gLogLock = IOSimpleLockAlloc();
+	gSnapLock = IOLockAlloc();
 	gWdogCall = thread_call_allocate(xg_wdog_fire, nullptr);
-	if (!gStageLock || !gWdogCall)
+	if (!gStageLock || !gWdogCall || !gLogLock || !gSnapLock)
 		return KERN_FAILURE;
 	/* i915 stays off the display until NMIntelFB owns it; the guard can override per experiment */
 	strlcpy(xg_env, "compat.linuxkpi.i915_disable_display=1", sizeof(xg_env));
@@ -305,5 +367,7 @@ _stop(kmod_info_t *, void *)
 		sysctl_unregister_oid(o);
 	thread_call_free(gWdogCall);
 	IOLockFree(gStageLock);
+	IOSimpleLockFree(gLogLock);
+	IOLockFree(gSnapLock);
 	return KERN_SUCCESS;
 }
