@@ -89,7 +89,7 @@ def kconfig_defines():
 
 
 # LinuxKPI's own implementation, minus subsystems the GPU stack does not use
-LKPI_SKIP = ("80211", "usb", "netdev", "skbuff", "mhi", "page_pool", "i2cbb", "hdmikmod", "videokmod")
+LKPI_SKIP = ("80211", "usb", "netdev", "skbuff", "mhi", "page_pool", "i2cbb", "hdmikmod", "videokmod", "cmdline", "linux_i2c", "linux_acpi")
 
 
 def sources(mod):
@@ -145,10 +145,12 @@ def flags(mod):
            os.path.join(SRC, "freebsd/sys/contrib/ck/include")]
     f = ["-target", "x86_64-apple-macos15.0", "-ffreestanding", "-nostdinc", "-fno-builtin",
          "-mkernel", "-fno-common", "-O2",
-         "-std=gnu11", "-D_KERNEL", "-DKLD_MODULE", "-D__FreeBSD__=15", "-U__APPLE__", "-U__MACH__", "-U__APPLE_CC__", "-D__amd64__", "-D__x86_64__", "-D__XNU_LKPI__", "-DLINUXKPI_VERSION=61400",
+         "-std=gnu11", "-D_KERNEL", "-DKLD_MODULE", "-D__FreeBSD__=15", "-U__APPLE__", "-U__MACH__", "-U__APPLE_CC__", "-D__amd64__", "-D__x86_64__", "-D__XNU_LKPI__",
          "-include", os.path.join(LKPI, "common/include/linux/compiler_types.h"),
          "-include", os.path.join(LKPI, "common/include/linux/kconfig.h"),
          "-Wno-everything", "-ferror-limit=1"]
+    if mod != "lkpi":  # consumers only; the base-kernel LinuxKPI is built without it
+        f.append("-DLINUXKPI_VERSION=61400")
     return f + kconfig_defines() + make_cflags(mod) + [x for i in inc for x in ("-I", i)]
 
 
