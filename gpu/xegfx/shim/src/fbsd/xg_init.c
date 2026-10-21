@@ -18,6 +18,7 @@ void xg_misc_init(void);
 void xg_task_init(void);
 void xg_pci_init(void);
 void xg_dma_init(void);
+void xg_newbus_dump(void);
 
 extern const struct xg_set_entry xg_set_start __asm("section$start$__DATA$__xg_set");
 extern const struct xg_set_entry xg_set_end __asm("section$end$__DATA$__xg_set");
@@ -88,9 +89,11 @@ xg_start_stage(int stage)
 	case 3:
 		xg_pci_init();
 		xg_dma_init();
+		xg_newbus_dump();
 		break;
 	case 4:
 		xg_run_set("sysinit_set", 0);
+		xg_newbus_dump();
 		break;
 	}
 }
