@@ -89,7 +89,6 @@ xg_start_stage(int stage)
 	case 3:
 		xg_pci_init();
 		xg_dma_init();
-		xg_newbus_dump();
 		break;
 	case 4:
 		xg_run_set("sysinit_set", 0);
