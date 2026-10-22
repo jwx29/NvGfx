@@ -31,7 +31,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.17", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.18", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -563,12 +563,22 @@ struct xg_va_format {
  * printf knows; drm prints most of its messages through it (N-225 logged "MCR Steering: 0x...V"). Every other
  * conversion goes to vsnprintf one at a time with its argument taken at the right width.
  */
+/* a Linux pointer extension: %p followed by a letter */
+static bool
+xg_has_pext(const char *f)
+{
+	for (; *f; f++)
+		if (f[0] == '%' && f[1] == 'p' && ((f[2] >= 'A' && f[2] <= 'Z') || (f[2] >= 'a' && f[2] <= 'z')))
+			return true;
+	return false;
+}
+
 static int
 xg_fmt(char *out, size_t len, const char *fmt, va_list *ap)
 {
 	size_t o = 0;
 
-	if (!strstr_kpi(fmt, "%pV"))
+	if (!xg_has_pext(fmt))
 		return vsnprintf(out, len, fmt, *ap);
 	for (const char *p = fmt; *p && o + 1 < len; ) {
 		if (*p != '%') {
@@ -590,7 +600,16 @@ xg_fmt(char *out, size_t len, const char *fmt, va_list *ap)
 		}
 		if (!*q)
 			break;
-		if (q[0] == 'p' && q[1] == 'V') {
+		if (q[0] == 'p' && q[1] == 'e') {	/* an ERR_PTR, printed as its errno */
+			n = snprintf(out + o, len - o, "%ld", (long)(intptr_t)va_arg(*ap, void *));
+			p = q + 2;
+		} else if (q[0] == 'p' && ((q[1] >= 'A' && q[1] <= 'Z') || (q[1] >= 'a' && q[1] <= 'z')) && q[1] != 'V') {
+			/* other Linux pointer extensions (%ps, %ph, %pI4...): the pointer, and skip the letters */
+			n = snprintf(out + o, len - o, "%p", va_arg(*ap, void *));
+			p = q + 1;
+			while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9'))
+				p++;
+		} else if (q[0] == 'p' && q[1] == 'V') {
 			struct xg_va_format *vf = va_arg(*ap, struct xg_va_format *);
 			va_list inner;
 			va_copy(inner, *vf->va);
@@ -622,6 +641,39 @@ xg_fmt(char *out, size_t len, const char *fmt, va_list *ap)
 	}
 	out[o] = 0;
 	return (int)o;
+}
+
+/* vsnprintf for the FreeBSD and Linux code (xg_bsdnames.h). Like vsnprintf it returns the full length even when
+ * out is NULL or short, since drm sizes buffers with snprintf(NULL, 0, ...) */
+extern "C" int
+xg_vsnprintf(char *out, size_t len, const char *fmt, va_list ap)
+{
+	static char scratch[2048];
+	va_list aq;
+	int n;
+
+	va_copy(aq, ap);
+	if (!xg_has_pext(fmt)) {
+		n = vsnprintf(out, len, fmt, aq);
+	} else if (out == nullptr || len == 0) {
+		n = xg_fmt(scratch, sizeof(scratch), fmt, &aq);	/* length only; racy scratch is fine for a count */
+	} else {
+		n = xg_fmt(out, len, fmt, &aq);
+	}
+	va_end(aq);
+	return n;
+}
+
+extern "C" int
+xg_snprintf(char *out, size_t len, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = xg_vsnprintf(out, len, fmt, ap);
+	va_end(ap);
+	return n;
 }
 
 extern "C" int
