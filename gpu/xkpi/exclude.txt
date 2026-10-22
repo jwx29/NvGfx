@@ -10,3 +10,4 @@ linux_schedule.c              # FreeBSD BSD-2; replaced by src/lkpi/linux_schedu
 intel_breadcrumbs.c           # MIT; replaced by src/i915/intel_breadcrumbs.c (signal_irq_work takes the next signaler before the last context put)
 i915_gem_stolen.c             # MIT; replaced by src/i915/i915_gem_stolen.c (stolen allocator starts after the firmware console image)
 linux_page.c                  # FreeBSD BSD-2; replaced by src/lkpi/linux_page.c (vmap family maps at an address IOKit picks, N-221)
+intel_display_device.c        # MIT; replaced by src/i915/intel_display_device.c (xegfx_no_display tunable, N-223)
