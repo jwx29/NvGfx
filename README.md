@@ -2,11 +2,11 @@
 
 XeGfx is an attempt at hardware-accelerated graphics for Intel Xe GPUs on macOS. The goal is one driver for every Xe part (Tiger Lake through Arrow Lake, Arc A-series, then Lunar Lake, Battlemage and Panther Lake) on every macOS from Big Sur 11 to Tahoe 26.
 
-It does not write a GPU driver from scratch. FreeBSD's [drm-kmod](https://github.com/freebsd/drm-kmod) already runs the Linux i915 driver on a non-Linux kernel through LinuxKPI, a layer that implements the Linux kernel API on top of FreeBSD's. XeGfx puts a small FreeBSD-kernel-API layer for XNU underneath LinuxKPI, so drm core and i915 build as one kext. Userspace is planned as Mesa's ANV Vulkan driver under the Metal-to-Vulkan plugin of [NvGfx](https://github.com/watchthelight-labs/NvGfx), the same way that project runs NVIDIA GPUs.
+Rather than a new GPU driver written from scratch, it builds on FreeBSD's [drm-kmod](https://github.com/freebsd/drm-kmod), which already runs the Linux i915 driver on a non-Linux kernel through LinuxKPI, a layer that implements the Linux kernel API on top of FreeBSD's. XeGfx puts a small FreeBSD-kernel-API layer for XNU underneath LinuxKPI, so drm core and i915 build as one kext. Userspace is planned as Mesa's ANV Vulkan driver under the Metal-to-Vulkan plugin of [NvGfx](https://github.com/watchthelight-labs/NvGfx), the same way that project runs NVIDIA GPUs.
 
 ## Built on, and learned from
 
-XeGfx stands on other people's work. Thank you to all of them.
+XeGfx is built on other people's work. Thanks to all of them.
 
 **Code XeGfx builds or ships** (their licences apply to their files):
 
@@ -58,8 +58,8 @@ Hardware so far: one Lenovo Legion 5 15IAX10 (Arrow Lake-HX, `8086:7D67`, Xe-LPG
 
 A broken GPU driver can stop a machine before anything reaches the disk, so the kext is built to be harmless until asked:
 
-- **It never loads at boot.** Its only IOKit personality waits for a resource the kext publishes itself, after `kmutil load -b org.watchthelight.XeGfx`. If a test crashes the Mac, it reboots into a system where XeGfx is not loaded.
-- **It runs in stages**, one sysctl write at a time:
+- It never loads at boot. Its only IOKit personality waits for a resource the kext publishes itself, after `kmutil load -b org.watchthelight.XeGfx`. If a test crashes the Mac, it reboots into a system where XeGfx is not loaded.
+- It runs in stages, one sysctl write at a time:
 
   | `debug.xegfx_stage` | What runs |
   |---|---|
@@ -75,7 +75,7 @@ A broken GPU driver can stop a machine before anything reaches the disk, so the 
 
 ## Where development happens
 
-This repository holds the XNU side: the FreeBSD-kernel-API layer (`shim/`), the build harness and the checks. It is pulled as a subtree into the [NvGfx](https://github.com/watchthelight-labs/NvGfx) fork, branch `xe`, under `gpu/xegfx`. **Build from there.** The fork adds `gpu/xkpi`, an overlay that replaces the few drm-kmod files that are GPL-only, and the Metal plugin and accelerator glue. A build from this repository alone still uses drm-kmod's GPL-only headers and is only good for development.
+This repository holds the XNU side: the FreeBSD-kernel-API layer (`shim/`), the build harness and the checks. It is pulled as a subtree into the [NvGfx](https://github.com/watchthelight-labs/NvGfx) fork, branch `xe`, under `gpu/xegfx`, and that is where you should build it. The fork adds `gpu/xkpi`, an overlay that replaces the few drm-kmod files that are GPL-only, and the Metal plugin and accelerator glue. A build from this repository alone still uses drm-kmod's GPL-only headers and is only good for development.
 
 ## Building
 

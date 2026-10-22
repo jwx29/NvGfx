@@ -16,7 +16,7 @@ This is the long version of the README, for anyone who wants to change the code 
  XNU: IOKit, Mach, BSD KPIs
 ```
 
-Everything above the shim is someone else's code, compiled unchanged. That is the point: i915 is hundreds of thousands of lines that Intel and the Linux community keep current, and FreeBSD already proved the Linux driver can run on a different kernel through LinuxKPI. What XeGfx adds is the bottom layer, the FreeBSD kernel interfaces that LinuxKPI and drm-kmod call, implemented on what a macOS kext is allowed to use.
+Everything above the shim is someone else's code, compiled unchanged, on purpose: i915 is hundreds of thousands of lines that Intel and the Linux community keep current, and FreeBSD already proved the Linux driver can run on a different kernel through LinuxKPI. What XeGfx adds is the bottom layer, the FreeBSD kernel interfaces that LinuxKPI and drm-kmod call, implemented on what a macOS kext is allowed to use.
 
 ## The shim, area by area
 
@@ -31,9 +31,9 @@ Each area has its own design note in `docs/`:
 
 Rules the shim keeps:
 
-- **Public KPIs only.** No `com.apple.kpi.private`, no unexported kernel symbols. `tools/kpi_check.py` enforces it at link time.
-- **No shadowing of kernel symbols.** The FreeBSD and Linux code is linked statically into the kext, so any function it defines with the same name as a kernel export captures the kext's own XNU-side callers. That is how the first hardware tests died: `_start` registered an XNU sysctl through FreeBSD's `sysctl_register_oid` and dereferenced NULL. `shim/include/xg_bsdnames.h` renames the FreeBSD copies for every FreeBSD and Linux compilation unit, and `tools/shadow_check.py` fails the link if a new clash appears.
-- **No GPL-only code in the shipping build.** The harness records every header each object includes and refuses (with an overlay set) to build if any compiled source or included header is GPL-only. The NvGfx fork's overlay supplies replacements for drm-kmod's few GPL-only files.
+- Public KPIs only. No `com.apple.kpi.private`, no unexported kernel symbols. `tools/kpi_check.py` enforces it at link time.
+- No shadowing of kernel symbols. The FreeBSD and Linux code is linked statically into the kext, so any function it defines with the same name as a kernel export captures the kext's own XNU-side callers. That is how the first hardware tests died: `_start` registered an XNU sysctl through FreeBSD's `sysctl_register_oid` and dereferenced NULL. `shim/include/xg_bsdnames.h` renames the FreeBSD copies for every FreeBSD and Linux compilation unit, and `tools/shadow_check.py` fails the link if a new clash appears.
+- No GPL-only code in the shipping build. The harness records every header each object includes and refuses (with an overlay set) to build if any compiled source or included header is GPL-only. The NvGfx fork's overlay supplies replacements for drm-kmod's few GPL-only files.
 
 ## Load and start
 
@@ -43,7 +43,7 @@ Rules the shim keeps:
 
 Stage 2 never maps BAR2 or touches stolen memory directly. On Meteor Lake class parts, CPU access to stolen memory through a BAR can hang the machine (i915's `Wa_22018444074`). It reads registers through an uncached BAR0 mapping only, and reads the GGTT entry that maps the firmware's framebuffer (GGTT sits at BAR0 + 8 MiB on Gen12 and later).
 
-Stage 4 runs every SYSINIT in the kext, the way FreeBSD's module loader does: drm, TTM, dma-buf, then i915, which finds the GPU through newbus and probes it. i915's display code is off (`compat.linuxkpi.i915_disable_display=1` by default), because the firmware already lit the panel and macOS's own framebuffer driver uses it. Afterwards the stage reads the GGTT entry behind the panel's surface again and samples pipe A's frame counter. If i915 rewrote the entry or the pipe stopped, the stage fails with "display lost". WindowServer would look fine in that state while the screen is black, so the check matters.
+Stage 4 runs every SYSINIT in the kext, the way FreeBSD's module loader does: drm, TTM, dma-buf, then i915, which finds the GPU through newbus and probes it. i915's display code is off (`compat.linuxkpi.i915_disable_display=1` by default), because the firmware already lit the panel and macOS's own framebuffer driver uses it. Afterwards the stage reads the GGTT entry behind the panel's surface again and samples pipe A's frame counter. If i915 rewrote the entry or the pipe stopped, the stage fails with "display lost". Without the check this would go unnoticed: WindowServer looks fine while the screen is black.
 
 ## Firmware
 
