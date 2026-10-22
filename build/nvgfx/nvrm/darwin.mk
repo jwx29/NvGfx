@@ -6,6 +6,10 @@
 # are left out: kexts/NVRM/nvkms_shaders.cpp provides the _binary_*_shaders_xz_* symbols instead.
 # <wtl> fork: nvgfx | author: watchthelight </wtl>
 
+# 615 builds NVKMS with -mfunction-return=thunk-extern (a Linux return-thunk mitigation); XNU exports no
+# __x86_return_thunk, and the shipped 2.5.x NVRM has none, so it is dropped here.
+CFLAGS := $(filter-out -mfunction-return=thunk-extern,$(CFLAGS))
+
 NVGFX_LIB  ?= libnvkernel.a
 NVGFX_OBJS  = $(filter-out $(SHADER_OBJS),$(OBJS))
 
