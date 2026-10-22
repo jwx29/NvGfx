@@ -12,11 +12,15 @@ extern "C" {
 
 /*
  * XNU minor layout of XeGfx nodes: a devfs node (cdev or alias) has its cdev slot as minor; the clone function
- * gives every open its own instance minor, XG_FD_INST_FLAG | instance.
+ * gives every open its own instance minor, XG_FD_INST_FLAG | instance << XG_FD_SLOT_BITS | slot. The slot stays in
+ * the low bits so fstat on an open fd still names its node (libdrm maps it to card%d/renderD%d through /dev/dri).
  */
 #define XG_FD_NCDEV		1024
 #define XG_FD_NINST		512
 #define XG_FD_INST_FLAG		0x800000
+#define XG_FD_SLOT_BITS		10
+#define XG_FD_INST_MINOR(inst, slot)	(XG_FD_INST_FLAG | (inst) << XG_FD_SLOT_BITS | (slot))
+#define XG_FD_MINOR_INST(m)	(((m) & ~XG_FD_INST_FLAG) >> XG_FD_SLOT_BITS)
 
 /* private descriptor numbers start here, far above any real fd, so a stray close(2) on one is only EBADF */
 #define XG_FD_BASE		0x40000000
