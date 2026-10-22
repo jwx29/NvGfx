@@ -154,6 +154,13 @@ __mtx_lock_flags(volatile uintptr_t *c, int opts, const char *file, int line)
 				return;
 			cpu_spinwait();
 		}
+		/*
+		 * LinuxKPI's spin_lock is mtx_lock plus local_bh_disable, which pins the thread with preemption off, and
+		 * Linux nests spinlocks freely: a second, contended one must spin as on Linux, because blocking with
+		 * preemption off panics (N-239: guc ct send lock, then uncore->lock in fwtable_write32)
+		 */
+		if (curthread->td_critnest != 0)
+			continue;
 		xg_sq_lock(c);
 		v = *c;
 		if (v == MTX_UNOWNED || (!(v & MTX_WAITERS) && !atomic_cmpset_ptr(c, v, v | MTX_WAITERS))) {
