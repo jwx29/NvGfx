@@ -12,7 +12,7 @@ index 5bc9388..0194cd1 100644
    ),
    config_file, format_mod_static_table
 diff --git a/xf86drm.c b/xf86drm.c
-index 73e4861..e18b5ab 100644
+index 73e4861..271692f 100644
 --- a/xf86drm.c
 +++ b/xf86drm.c
 @@ -57,6 +57,7 @@
@@ -23,7 +23,7 @@ index 73e4861..e18b5ab 100644
  #include "libdrm_macros.h"
  #include "drm_fourcc.h"
  
-@@ -107,25 +108,70 @@ static drmServerInfoPtr drm_server_info;
+@@ -107,25 +108,72 @@ static drmServerInfoPtr drm_server_info;
  
  static bool drmNodeIsDRM(int maj, int min);
  #ifdef __APPLE__
@@ -35,6 +35,8 @@ index 73e4861..e18b5ab 100644
 +#define DRM_DARWIN_RAW_MINOR(d)	((int)((uint32_t)(d) & 0xffffff))
 +#define DRM_DARWIN_INST_FLAG	0x800000
 +#define DRM_DARWIN_SLOT_MASK	0x3ff
++/* stat on a /dev/dri entry already goes through the clone, so both sides carry instance bits (N-232) */
++#define DRM_DARWIN_SLOT(m)	(((m) & DRM_DARWIN_INST_FLAG) ? ((m) & DRM_DARWIN_SLOT_MASK) : (m))
 +
 +static int drm_darwin_name_minor(const char *name)
 +{
@@ -52,7 +54,7 @@ index 73e4861..e18b5ab 100644
 +    DIR *dir = opendir(DRM_DIR_NAME);
 +    struct dirent *ent;
 +
-+    slot = (raw & DRM_DARWIN_INST_FLAG) ? (raw & DRM_DARWIN_SLOT_MASK) : raw;
++    slot = DRM_DARWIN_SLOT(raw);
 +    if (!dir)
 +        return -1;
 +    while (id < 0 && (ent = readdir(dir)) != NULL) {
@@ -63,7 +65,7 @@ index 73e4861..e18b5ab 100644
 +            continue;
 +        snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
 +        if (stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) && major(sbuf.st_rdev) == major(rdev) &&
-+            DRM_DARWIN_RAW_MINOR(sbuf.st_rdev) == slot)
++            DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(sbuf.st_rdev)) == slot)
 +            id = drm_darwin_name_minor(ent->d_name);
 +    }
 +    closedir(dir);
@@ -100,7 +102,7 @@ index 73e4861..e18b5ab 100644
      }
      closedir(dir);
      return found;
-@@ -699,6 +745,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
+@@ -699,6 +747,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
  {
      int ret;
  
