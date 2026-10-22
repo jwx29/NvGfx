@@ -1033,6 +1033,8 @@ xg_fd_dev_close(int inst)
 	xi->xi_state = XI_FREE;
 	xg_fd_unlock();
 
+	if (xg_fd_map_close != NULL)
+		xg_fd_map_close(fp);
 	error = fdrop(fp, td);
 	if (dead != NULL)
 		xg_fd_tbl_close(dead, td);
@@ -1067,6 +1069,15 @@ xg_fd_sync_nonblock(struct file *fp, int nonblock)
 		atomic_clear_int(&fp->f_flag, FNONBLOCK);
 }
 
+/*
+ * Device mmap(2) is not open to kexts, so GEM objects are mapped through ioctls in group 'N' (NullMoth's Darwin
+ * libdrm ABI). The drm glue sets these; it gets the LinuxKPI file and uses the FreeBSD file only as a key.
+ * Unlike mmap(2), a mapping ends when its node is closed (Mesa keeps the node open while it maps).
+ */
+extern struct fileops linuxfileops;
+int (*xg_fd_map_ioctl)(void *lfile, void *key, unsigned long cmd, void *data);
+void (*xg_fd_map_close)(void *key);
+
 int
 xg_fd_dev_ioctl(int inst, unsigned long cmd, void *data, int fflags)
 {
@@ -1076,6 +1087,13 @@ xg_fd_dev_ioctl(int inst, unsigned long cmd, void *data, int fflags)
 
 	if (xg_fd_inst_fget(inst, &fp) != 0)
 		return (ENXIO);
+	if (IOCGROUP(cmd) == 'N' && xg_fd_map_ioctl != NULL && fp->f_ops == &linuxfileops) {
+		error = xg_fd_map_ioctl(fp->f_data, fp, cmd, data);
+		if (error != ENOTTY) {
+			fdrop(fp, td);
+			return (error);
+		}
+	}
 	if (cmd == FIONBIO)
 		xg_fd_sync_nonblock(fp, *(int *)data != 0);
 	else

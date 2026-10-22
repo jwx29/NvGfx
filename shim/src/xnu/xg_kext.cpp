@@ -1,7 +1,8 @@
 /*
  * XeGfx kext entry. The module loads idle on IOResources and does nothing until a stage is asked for:
  *   sysctl debug.xegfx_stage=N runs every stage up to N that has not run yet (1 shim, 2 read-only GPU probe,
- *   3 bus and DMA, 4 drm/i915 SYSINITs and a GT health check, 5 one request on every engine). debug.xegfx_env sets tunables for the stages (overrides boot-args).
+ *   3 bus and DMA, 4 drm/i915 SYSINITs and a GT health check, 5 one request on every engine,
+ *   6 every engine writes a dword the CPU reads back). debug.xegfx_env sets tunables for the stages (overrides boot-args).
  * Nothing loads it at boot: its one personality waits for the XeGfxArm resource, which _start publishes after a
  * manual `kmutil load -b org.watchthelight.XeGfx`. There is no PCI personality: the shim finds the GPU in the registry. A stage that runs longer than
  * debug.xegfx_wdog seconds panics on purpose, so a stall becomes a panic report and an automatic reboot.
@@ -27,10 +28,12 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.10", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.11", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
+/* the firmware's console image, when pipe A scans it out at probe; i915's stolen allocator starts after it */
+unsigned long long xg_boot_fb_phys, xg_boot_fb_size;
 }
 
 class XeGfxResident : public IOService {
@@ -42,7 +45,7 @@ public:
 static XeGfxResident *gResident;
 static int gStage;	/* highest stage done */
 static int gRunning;	/* stage in progress, 0 when idle */
-static int gResult[6];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
+static int gResult[7];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
 static int gWdog = 60;
 static thread_call_t gWdogCall;
 static IOLock *gStageLock;
@@ -144,7 +147,8 @@ xg_probe(void)
 				{ "dsm-base-lo", 0x1080c0 }, { "dsm-base-hi", 0x1080c4 },
 				{ "pcode-stolen-access", 0x138914 },
 				{ "transconf-a", 0x70008 }, { "pipe-frmcount-a", 0x70040 },
-				{ "plane-ctl-1-a", 0x70180 }, { "plane-stride-1-a", 0x70188 }, { "plane-surf-1-a", 0x7019c },
+				{ "plane-ctl-1-a", 0x70180 }, { "plane-stride-1-a", 0x70188 }, { "plane-size-1-a", 0x70190 },
+				{ "plane-surf-1-a", 0x7019c },
 			};
 			xg_progress = 22;
 			for (auto &e : regs)
@@ -156,6 +160,12 @@ xg_probe(void)
 				volatile uint64_t *gtt = (volatile uint64_t *)(mm->getVirtualAddress() + (8ull << 20));
 				gSurfPte = gtt[surf >> 12];
 				xg_put(d, "ggtt-pte-surf", gSurfPte, 64);
+				if (gPipeLit && (gSurfPte & 1)) {
+					/* linear stride is in 64-byte units; PLANE_SIZE holds height - 1 in bits 31:16 */
+					xg_boot_fb_phys = gSurfPte & 0x3ffffffff000ull;	/* GEN12_GGTT_PTE_ADDR_MASK */
+					xg_boot_fb_size = (uint64_t)(r[0x70188 / 4] & 0x7ff) * 64 * ((r[0x70190 / 4] >> 16) + 1);
+					xg_put(d, "boot-fb-size", xg_boot_fb_size, 64);
+				}
 			}
 			mm->release();
 		} else {
@@ -285,6 +295,34 @@ xg_exec_check(void)
 	return rc;
 }
 
+/* stage 6: the GPU writes memory the CPU then reads, through the GGTT, on every engine that can */
+static int
+xg_store_check(void)
+{
+	static struct xg_i915_store sd;
+	OSDictionary *d = OSDictionary::withCapacity(2 * XG_I915_MAX_ENGINES + 3);
+	int rc = xg_i915_store(&sd, 2000) == 0 ? 1 : -19;
+
+	if (rc == 1 && (sd.engines == 0 || sd.ok != sd.engines))
+		rc = -5;
+	if (d) {
+		for (int i = 0; i < sd.engines; i++) {
+			char k[24];
+			snprintf(k, sizeof(k), "%s-got", sd.name[i]);
+			xg_put(d, k, sd.got[i]);
+			snprintf(k, sizeof(k), "%s-err", sd.name[i]);
+			xg_put(d, k, (uint32_t)sd.err[i]);
+		}
+		xg_put(d, "engines", (uint32_t)sd.engines, 8);
+		xg_put(d, "ok", (uint32_t)sd.ok, 8);
+		xg_put(d, "result", (uint32_t)rc);
+		if (gResident)
+			gResident->setProperty("XeGfxStore", d);
+		d->release();
+	}
+	return rc;
+}
+
 static int
 xg_run_stage(int s)
 {
@@ -314,12 +352,16 @@ xg_run_stage(int s)
 			rc = xg_display_check();
 			if (rc == 1 && !xg_drm_attached())
 				rc = -19;	/* the init routines ran but no drm driver bound the GPU */
-			if (rc == 1)
+			if (rc == 1) {
+				xg_i915_map_init();
 				rc = xg_gt_check();
+			}
 		}
 	}
 	if (s == 5)
 		rc = xg_exec_check();
+	if (s == 6)
+		rc = xg_store_check();
 	if (gWdogCall)
 		thread_call_cancel(gWdogCall);
 	gRunning = 0;
@@ -333,7 +375,7 @@ xegfx_stage_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 
 	if (err || !req->newptr)
 		return err;
-	if (v < 0 || v > 5)
+	if (v < 0 || v > 6)
 		return EINVAL;
 	IOLockLock(gStageLock);
 	while (gStage < v) {
@@ -356,7 +398,7 @@ xegfx_results_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_stage_sysctl,
-    "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec)");
+    "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec, 6 store)");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
     xegfx_results_sysctl, "S", "per-stage result: 0 not run, 1 pass, negative failure");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");

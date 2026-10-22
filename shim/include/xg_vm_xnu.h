@@ -30,6 +30,9 @@ xg_vm_xmem_t xg_vm_x_map_at(xg_vm_xmem_t resv, void *va, const unsigned long lon
 /* put the reservation's own backing back over [va, va + size) */
 int xg_vm_x_unmap_at(xg_vm_xmem_t resv, void *va, unsigned long long size);
 void xg_vm_x_release(xg_vm_xmem_t xm);
+/* map n physical ranges, in order, into the calling process (writable or read-only); *uaddr gets the address */
+xg_vm_xmem_t xg_vm_x_map_user(const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache,
+    int writable, unsigned long long *uaddr);
 
 /* physical address behind a wired kernel VA, 0 when none; may block (it wires the page for the lookup) */
 unsigned long long xg_vm_x_kextract(const void *va);
