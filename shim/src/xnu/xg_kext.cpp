@@ -26,7 +26,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.7", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.8", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 }
@@ -45,6 +45,7 @@ static int gWdog = 60;
 static thread_call_t gWdogCall;
 static IOLock *gStageLock;
 static uint64_t gSurfPte;
+static bool gPipeLit;	/* pipe A was scanning out at probe time (Hybrid); in Discrete mode the NVIDIA GPU has the panel */
 static char gLog[64 * 1024];	/* last 64 KiB of the shim's console output, for sysctl debug.xegfx_log */
 static size_t gLogLen;
 static IOSimpleLock *gLogLock;
@@ -146,6 +147,8 @@ xg_probe(void)
 			xg_progress = 22;
 			for (auto &e : regs)
 				xg_put(d, e.k, r[e.off / 4]);
+			gPipeLit = (r[0x70008 / 4] & 0x80000000u) != 0;
+			xg_put(d, "pipe-a-lit", gPipeLit, 8);
 			if (mm->getLength() >= 16ull << 20) {
 				uint32_t surf = r[0x7019c / 4] & ~0xfffu;
 				volatile uint64_t *gtt = (volatile uint64_t *)(mm->getVirtualAddress() + (8ull << 20));
@@ -193,7 +196,14 @@ xg_display_check(void)
 	IOMemoryMap *mm = gpu ? gpu->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache) : nullptr;
 	int rc = -6;
 
-	if (mm && d && mm->getLength() >= 16ull << 20) {
+	if (!gPipeLit && d) {
+		/* nothing of ours on the panel to lose; say so instead of failing on a stopped frame counter */
+		xg_put(d, "skipped-pipe-a-off", 1, 8);
+		xg_put(d, "result", 1);
+		if (gResident)
+			gResident->setProperty("XeGfxPost", d);
+		rc = 1;
+	} else if (mm && d && mm->getLength() >= 16ull << 20) {
 		volatile uint32_t *r = (volatile uint32_t *)mm->getVirtualAddress();
 		uint32_t surf = r[0x7019c / 4] & ~0xfffu, f0 = r[0x70040 / 4];
 		uint64_t pte = ((volatile uint64_t *)(mm->getVirtualAddress() + (8ull << 20)))[surf >> 12];
