@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.5.3-nvgfx.1 (fork, booted 2026-10-22)
+
+- Rebased onto NullMoth 2.5.3, which moves NVRM to NVIDIA's 615.78.08 driver and GSP firmware. Upstream now carries
+  three things this fork used to: the boot hold that waits for the bring-up (our PR #317, `nvrmholdcap`), the
+  function-table pipeline link (#318) and desktop scaling at the head viewport (#273); the fork's copies are dropped.
+- NVRM rebuilt from source for 615 with the fork's power code (115 W TGP on AC, NVPCF and GPS `_DSM`, physctl):
+  `build_nvrm.sh` takes `NVRM_TAG` (default 615.78.08), drops NVKMS's `-mfunction-return=thunk-extern` (XNU exports no
+  `__x86_return_thunk`) and applies `615-viewport-scaling.patch`, which upstream's patch notes list but its published
+  completion script leaves out. The result matches the shipped 2.5.3 NVRM in 30875 of 30884 functions.
+- Plugin: upstream's host-import surface upload (#296) and the fork's asynchronous upload at bind live side by side;
+  an A/B is still to do.
+- Booted on the Legion 5 15IAX10 (RTX 5070 Laptop, macOS 26.7.1, BIOS Discrete): Metal 3, 1680x1050 HiDPI at 165 Hz,
+  115 W on AC, GSP bring-up 13 s (40 to 48 s on 610).
+
 ## 2.4.3-nvgfx.1 (fork, not yet booted)
 
 - NVRM: the boot hold no longer lets WindowServer in while the card is still coming up. The cap used to fire at
