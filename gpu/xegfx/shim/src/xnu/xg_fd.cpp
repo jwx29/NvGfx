@@ -50,9 +50,9 @@ xg_fd_inst_of(dev_t dev)
 {
 	int m = xg_fd_minor(dev);
 
-	if ((m & XG_FD_INST_FLAG) == 0 || (m & ~XG_FD_INST_FLAG) >= XG_FD_NINST)
+	if ((m & XG_FD_INST_FLAG) == 0 || XG_FD_MINOR_INST(m) >= XG_FD_NINST)
 		return (-1);
-	return (m & ~XG_FD_INST_FLAG);
+	return (XG_FD_MINOR_INST(m));
 }
 
 /* the FreeBSD errnos that XNU numbers differently (sys/errno.h of both); the rest match */
@@ -180,10 +180,10 @@ xg_fd_clone(dev_t dev, int action)
 		if ((m & XG_FD_INST_FLAG) != 0)
 			return (-1);
 		inst = xg_fd_inst_alloc(m);
-		return (inst < 0 ? -1 : (XG_FD_INST_FLAG | inst));
+		return (inst < 0 ? -1 : XG_FD_INST_MINOR(inst, m));
 	}
 	if ((m & XG_FD_INST_FLAG) != 0)
-		xg_fd_inst_free(m & ~XG_FD_INST_FLAG);
+		xg_fd_inst_free(XG_FD_MINOR_INST(m));
 	return (0);
 }
 
