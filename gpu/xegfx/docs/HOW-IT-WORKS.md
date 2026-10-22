@@ -55,6 +55,8 @@ XNU does not let a kext implement mmap(2) on a device node. Userspace maps GEM o
 
 Around a userspace check, `debug.xegfx_hold=N` arms a second watchdog that panics unless it is reset to 0 within N seconds, so a GPU deadlock in a test program also ends as a panic report and a reboot.
 
+A whole-machine hang leaves neither a panic nor a log. With `xegfx.nvram_trace=1` in `debug.xegfx_env`, a timer writes the running stage, the breadcrumb (`xg_progress`, which names the SYSINIT entry during stage 4) and the newest console line to the NVRAM variable `xegfx-step` every 250 ms while something changed, and syncs it; the previous boot's value moves to `xegfx-step-prev`. It is off by default because it writes NVRAM.
+
 `tools/xgprobe.c` is the first client: it opens the render node, reads the DRM version and i915 params, queries the engines, creates a context and, on every legacy ring, runs a softpinned batch that stores a dword into a second buffer, both mapped through the ioctl. i915 refuses pread, pwrite and relocations after Tiger Lake, so the mapping is the only way to get a batch to the GPU.
 
 ## Fences without file descriptors

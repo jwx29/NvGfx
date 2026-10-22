@@ -56,6 +56,8 @@ xg_sysinit_is_gpu_driver(const struct sysinit *si)
 	return (md->name != NULL && (strcmp(md->name, "i915kms") == 0 || strcmp(md->name, "xe") == 0));
 }
 
+extern int xg_progress;
+
 static void
 xg_run_set(const char *set, int reverse)
 {
@@ -83,6 +85,8 @@ xg_run_set(const char *set, int reverse)
 
 			if (si->func == NULL || xg_sysinit_is_gpu_driver(si) != (pass == 1))
 				continue;
+			if (!reverse)
+				xg_progress = 1000 + pass * 500 + i;	/* the NVRAM trace names the entry a hang stopped in */
 			si->func(si->udata);
 		}
 	}
