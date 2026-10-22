@@ -5717,6 +5717,13 @@ int nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
     if (!pro && nvmtl_pre_submit_hook) { const int k0 = g_perf_kind; g_perf_kind |= 1; nvmtl_pre_submit_hook(); g_perf_kind = k0; }
     const uint64_t sA = nvmtl_perf_now();
     const uint32_t wseq = nvmtl_keep_on() ? nvmtl_wit_record(c) : 0;
+    /* a finished Metal command buffer's writes are visible to the CPU; Vulkan needs a dependency to HOST for that.
+     * NVK gets away without one, ANV does not (N-235: stale 64-byte lines in shared buffers on the 7D67) */
+    if (nvmtl_vk_vendor() == 0x8086 && !c->in_rp) {
+        VkMemoryBarrier hb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+                               VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT };
+        pvkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+    }
     VkResult result = pvkEndCommandBuffer(c->cb);
     const uint64_t sB = nvmtl_perf_now();
     if (result != VK_SUCCESS) { nvmtl_cmd_retire(c); return -1; }
