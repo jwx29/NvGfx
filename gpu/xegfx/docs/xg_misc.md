@@ -33,9 +33,9 @@ the RB tree per node, OID_AUTO numbering, contexts, refcounted nodes, and remova
 Besides the sysctl ones above, xg_misc.c defines the whole FreeBSD `sbuf(9)` API (`sbuf_new`, `_delete`,
 `_finish`, `_data`, `_len`, `_clear`, `_setpos`, `_bcat`, `_bcpy`, `_cat`, `_cpy`, `_putc`, `_printf`,
 `_vprintf`, `_error`, `_done`). It also defines `knote`. XNU's versions take XNU structs (its `struct sbuf` differs, and its `knote` takes
-a `klist`), so LinuxKPI must never bind to them. The catch: this applies to the whole kext. XNU-side `.cpp` code
+a `klist`), so LinuxKPI must never bind to them. This applies to the whole kext, though: XNU-side `.cpp` code
 in XeGfx that wants XNU's own `sysctl_handle_*`, `sysctl__children`, `sbuf_*` or `knote` would get the FreeBSD ones.
-None does today. The clean long-term fix is renaming them in shim header overrides (`#define sbuf_new
+None does today. The proper fix is to rename them in shim header overrides (`#define sbuf_new
 xg_sbuf_new`, and so on). Other XNU exports with the same problem belong to other areas and are listed in the report:
 `eventhandler_*`, `kmem_free`, `vm_page_*`, `pmap_*_page`, `log`, `osrelease`, `copyin`/`copyout`.
 

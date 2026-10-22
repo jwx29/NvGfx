@@ -1,6 +1,6 @@
 # xe-userland: Mesa ANV and libdrm for x86_64 macOS
 
-Built 2026-10-21 on the Legion (macOS Tahoe 26.7.1 25G241, Core Ultra 9 275HX), native x86_64, nothing installed outside `~/src/xe-userland` and the new venv `~/.venvs/mesa`. Result: **build OK**, all 28 simulated Intel chips create a device and compile the compute pipeline through the Darwin noop drm-shim.
+Built 2026-10-21 on the Legion (macOS Tahoe 26.7.1 25G241, Core Ultra 9 275HX), native x86_64, nothing installed outside `~/src/xe-userland` and the new venv `~/.venvs/mesa`. Result: the build works, and all 28 simulated Intel chips create a device and compile the compute pipeline through the Darwin noop drm-shim.
 
 ## Sources
 
@@ -43,9 +43,9 @@ meson setup mesa/build mesa --native-file native-target.ini --prefix=$X/prefix -
 
 No diffs to Mesa or libdrm sources beyond the two NullMoth patches. Build-side changes:
 
-- **libdrm `-Dintel=disabled` instead of `enabled`.** `-Dintel` builds `libdrm_intel`, the legacy GEM helper, which hard-requires libpciaccess (no Darwin backend, not installed). Mesa uses `libdrm_intel` only for gallium i915 (`meson.build:777-779`); ANV and the noop shim use core libdrm only. So the core `libdrm.2.dylib` is all ANV needs.
+- libdrm `-Dintel=disabled` instead of `enabled`. `-Dintel` builds `libdrm_intel`, the legacy GEM helper, which hard-requires libpciaccess (no Darwin backend, not installed). Mesa uses `libdrm_intel` only for gallium i915 (`meson.build:777-779`); ANV and the noop shim use core libdrm only. So the core `libdrm.2.dylib` is all ANV needs.
 - libdrm b97cbde has no `freedreno` option; it was dropped from the option list.
-- **expat from the macOS SDK.** With `-Dexpat=disabled`, `libintel_decoder_gen.a` has no sources and Apple `ar` refuses an empty archive (`ar: no archive members specified`). Rather than pull in MacPorts expat, `sdk-pc/expat.pc` points at the SDK's `-lexpat` (2.7.1, `/usr/lib/libexpat.1.dylib`):
+- expat from the macOS SDK. With `-Dexpat=disabled`, `libintel_decoder_gen.a` has no sources and Apple `ar` refuses an empty archive (`ar: no archive members specified`). Rather than pull in MacPorts expat, `sdk-pc/expat.pc` points at the SDK's `-lexpat` (2.7.1, `/usr/lib/libexpat.1.dylib`):
 
 ```
 Name: expat
@@ -59,7 +59,7 @@ Cflags:
 ## Minimum macOS target
 
 - `-mmacosx-version-min=11.0` compiles and links (log kept as `logs/mesa-min11.0.log`), but the binary is not correct there: the patch's futex code in `src/util/futex.c` calls `os_sync_wait_on_address`, `os_sync_wait_on_address_with_timeout`, `os_sync_wake_by_address_any/all`, which are macOS 14.4 API and get weak-linked, so they would be NULL calls on older systems. `intel_measure.c` also uses `mkfifoat` (13.0, only with `INTEL_MEASURE`).
-- **Shipped build: Mesa at 14.4** (`minos 14.4`, no `-Wunguarded-availability` warnings left), libdrm at 11.0 (`minos 11.0`, no newer API used). Going below 14.4 would need a runtime fallback in `futex.c` (for example `__ulock_wait`, private API), not done.
+- Shipped build: Mesa at 14.4 (`minos 14.4`, no `-Wunguarded-availability` warnings left), libdrm at 11.0 (`minos 11.0`, no newer API used). Going below 14.4 would need a runtime fallback in `futex.c` (for example `__ulock_wait`, private API), not done.
 
 ## Outputs
 

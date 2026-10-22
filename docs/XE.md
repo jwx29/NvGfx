@@ -32,7 +32,7 @@ See `gpu/userland/BUILD.md`. In short: libdrm `b97cbde` and Mesa `bffd919` with 
 
 ## Built on, and learned from
 
-XeGfx stands on other people's work. Thank you to all of them.
+XeGfx is built on other people's work. Thanks to all of them.
 
 **Code XeGfx builds or ships** (their licences apply to their files):
 

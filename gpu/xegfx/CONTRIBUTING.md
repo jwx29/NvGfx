@@ -14,11 +14,11 @@ Please do not run stage 4 on a machine you depend on yet. It starts i915 on your
 
 ## Code
 
-- **Public KPIs only.** Anything the kext calls must come from a library it declares, never `com.apple.kpi.private`. `tools/link.sh` checks this.
-- **No new kernel-symbol shadows.** If `tools/shadow_check.py` fails, add the name to `shim/include/xg_bsdnames.h` instead of allow-listing it.
-- **No GPL-only code.** drm-kmod and Linux are mixed MIT, BSD and GPL. The shipping build refuses GPL-only sources and headers. If you need one of those files, write a replacement or take one with a compatible licence, and say where it came from.
-- **Keep the drm-kmod and LinuxKPI sources unchanged** where possible. Fix things in the shim; if a third-party file must change, prefer an overlay file to a patch.
-- **Comments say why, briefly.** History belongs in commit messages.
+- Public KPIs only. Anything the kext calls must come from a library it declares, never `com.apple.kpi.private`. `tools/link.sh` checks this.
+- No new kernel-symbol shadows. If `tools/shadow_check.py` fails, add the name to `shim/include/xg_bsdnames.h` instead of allow-listing it.
+- No GPL-only code. drm-kmod and Linux are mixed MIT, BSD and GPL. The shipping build refuses GPL-only sources and headers. If you need one of those files, write a replacement or take one with a compatible licence, and say where it came from.
+- Keep the drm-kmod and LinuxKPI sources unchanged where possible. Fix things in the shim; if a third-party file must change, prefer an overlay file to a patch.
+- Comments say why, briefly. History belongs in commit messages.
 - Small commits, lowercase subject lines.
 
 ## Where to send changes

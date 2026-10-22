@@ -1,6 +1,6 @@
 # VM shim design (xg_vm)
 
-`shim/src/fbsd/xg_vm.c` gives drm-kmod, TTM, i915 GEM and LinuxKPI the FreeBSD VM they expect: `struct vm_page`, VM objects with radix tries of pages, a direct map, `pmap_qenter`, `pmap_mapdev_attr`, `kmem_alloc_contig` and the device pager. `shim/src/xnu/xg_vm.cpp` holds the IOKit half behind the C header `shim/include/xg_vm_xnu.h`. Nothing here has run yet. This note records the decisions and what is still open.
+`shim/src/fbsd/xg_vm.c` gives drm-kmod, TTM, i915 GEM and LinuxKPI the FreeBSD VM they expect: `struct vm_page`, VM objects with radix tries of pages, a direct map, `pmap_qenter`, `pmap_mapdev_attr`, `kmem_alloc_contig` and the device pager. `shim/src/xnu/xg_vm.cpp` holds the IOKit half behind the C header `shim/include/xg_vm_xnu.h`. Nothing here has run yet.
 
 ## Pages
 
