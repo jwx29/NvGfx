@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>XeGfx</string>
   <key>CFBundleExecutable</key><string>XeGfx</string>
   <key>CFBundlePackageType</key><string>KEXT</string>
-  <key>CFBundleVersion</key><string>0.0.18</string>
-  <key>CFBundleShortVersionString</key><string>0.0.18</string>
+  <key>CFBundleVersion</key><string>0.0.19</string>
+  <key>CFBundleShortVersionString</key><string>0.0.19</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>IOKitPersonalities</key><dict>
     <!-- matches only the XeGfxArm resource that _start publishes: nothing loads the kext at boot, kmutil load arms it -->

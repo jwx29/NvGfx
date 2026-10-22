@@ -31,7 +31,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.18", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.19", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -757,8 +757,12 @@ _start(kmod_info_t *, void *)
 	gTraceCall = thread_call_allocate(xg_trace_fire, nullptr);
 	if (!gStageLock || !gWdogCall || !gHoldCall || !gTraceCall || !gLogLock || !gSnapLock)
 		return KERN_FAILURE;
-	/* i915 stays off the display until NMIntelFB owns it; the guard can override per experiment */
-	strlcpy(xg_env, "compat.linuxkpi.i915_disable_display=1", sizeof(xg_env));
+	/*
+	 * i915 stays off the display until XeGfx owns it, and gets the GuC explicitly: drm-kmod leaves enable_guc at -1 on
+	 * FreeBSD ("GuC is known to be broken"), which on Meteor/Arrow Lake means no submission at all and a wedged GT
+	 * (Legion N-225 to N-227). The guard can override both per experiment.
+	 */
+	strlcpy(xg_env, "compat.linuxkpi.i915_disable_display=1 compat.linuxkpi.i915_enable_guc=3", sizeof(xg_env));
 	for (auto *o : gOids)
 		sysctl_register_oid(o);
 	IOService::publishResource("XeGfxArm");
