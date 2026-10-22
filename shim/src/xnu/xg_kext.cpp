@@ -21,6 +21,7 @@
 #include <sys/sysctl.h>
 #include <string.h>
 #include "xg_i915.h"
+#include "xg_fd.h"
 #include "xg_vmap.h"
 
 extern "C" {
@@ -31,7 +32,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.23", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.24", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -555,6 +556,16 @@ SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
     "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec, 6 store, 7 Metal accelerator)");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
     xegfx_results_sysctl, "S", "per-stage result: 0 not run, 1 pass, negative failure");
+static int
+xegfx_fd_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	char b[192];
+
+	xg_fd_diag(b, sizeof(b));
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, xegfx_fd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_fd_sysctl, "A",
+    "XeGfx node instances by state and the fd lock holder");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_progress, CTLFLAG_RD | CTLFLAG_LOCKED, &xg_progress, 0, "last breadcrumb");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_wdog, CTLFLAG_RW | CTLFLAG_LOCKED, &gWdog, 0, "stage stall panic, seconds");
@@ -567,7 +578,7 @@ SYSCTL_STRING(_debug, OID_AUTO, xegfx_env, CTLFLAG_RW | CTLFLAG_LOCKED, xg_env, 
     "tunables for the stages, name=value pairs");
 
 static struct sysctl_oid *const gOids[] = {
-	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_running,
+	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_fd, &sysctl__debug_xegfx_running,
 	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env, &sysctl__debug_xegfx_log,
 	&sysctl__debug_xegfx_hold,
 };
