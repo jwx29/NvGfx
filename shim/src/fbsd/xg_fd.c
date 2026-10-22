@@ -1087,7 +1087,9 @@ xg_fd_dev_ioctl(int inst, unsigned long cmd, void *data, int fflags)
 
 	if (xg_fd_inst_fget(inst, &fp) != 0)
 		return (ENXIO);
-	if (IOCGROUP(cmd) == 'N' && xg_fd_map_ioctl != NULL && fp->f_ops == &linuxfileops) {
+	/* group 'N', plus DRM_IOCTL_GET_PCIINFO ('d' 0x15), which drm-kmod declares but does not implement */
+	if ((IOCGROUP(cmd) == 'N' || (IOCGROUP(cmd) == 'd' && (cmd & 0xff) == 0x15)) && xg_fd_map_ioctl != NULL &&
+	    fp->f_ops == &linuxfileops) {
 		error = xg_fd_map_ioctl(fp->f_data, fp, cmd, data);
 		if (error != ENOTTY) {
 			fdrop(fp, td);
