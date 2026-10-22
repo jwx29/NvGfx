@@ -31,7 +31,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.15", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.16", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -59,7 +59,7 @@ static int gHold;
  */
 static thread_call_t gTraceCall;
 static bool gTraceOn;
-static char gLast[200];
+static char gLast[600];	/* the newest console lines, oldest dropped first */
 static unsigned gLastSeq, gTraceSeq;
 static int gTraceProgress;
 static void xg_trace_write(void);
@@ -97,8 +97,16 @@ OSDefineMetaClassAndStructors(XeGfxResident, IOService)
 static void
 xg_wdog_fire(thread_call_param_t, thread_call_param_t)
 {
-	if (gRunning)
-		panic("XeGfx: stage %d stalled for %d s at progress %d", gRunning, gWdog, xg_progress);
+	/* the panic report is the only record a stall leaves, so it carries the end of the driver's log (N-224) */
+	static char tail[3072];
+	size_t n = MIN(gLogLen, sizeof(tail) - 1);
+
+	if (!gRunning)
+		return;
+	memcpy(tail, gLog + gLogLen - n, n);	/* no lock: the stalled thread may hold it; a torn line is fine here */
+	tail[n] = 0;
+	panic("XeGfx: stage %d stalled for %d s at progress %d\n--- last driver log ---\n%s", gRunning, gWdog,
+	    xg_progress, tail);
 }
 
 /* ---- stage 2: read-only look at the iGPU and the PCH watchdog, published as XeGfxProbe ---- */
@@ -440,7 +448,7 @@ static void
 xg_trace_write(void)
 {
 	static bool kept;
-	char b[256], line[sizeof(gLast)];
+	char b[sizeof(gLast) + 40], line[sizeof(gLast)];
 	IORegistryEntry *o;
 	IOInterruptState is;
 
@@ -451,7 +459,7 @@ xg_trace_write(void)
 	IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
 	for (char *p = line; *p; p++)
 		if (*p == '\n' || *p == '\r')
-			*p = ' ';
+			*p = '|';
 	snprintf(b, sizeof(b), "s%d p%d %s", gRunning, xg_progress, line);
 	if ((o = IORegistryEntry::fromPath("/options", gIODTPlane)) == nullptr)
 		return;
@@ -553,9 +561,14 @@ xg_vprintf(const char *fmt, va_list ap)
 		memcpy(gLog + gLogLen, buf, l);
 		gLogLen += l;
 		if (l > 1) {
-			size_t c = MIN(l, sizeof(gLast) - 1);
-			memcpy(gLast, buf, c);
-			gLast[c] = 0;
+			size_t have = strlen(gLast), c = MIN(l, sizeof(gLast) - 1);
+			if (have + c >= sizeof(gLast)) {
+				size_t drop = have + c - (sizeof(gLast) - 1);
+				memmove(gLast, gLast + drop, have - drop + 1);
+				have -= drop;
+			}
+			memcpy(gLast + have, buf, c);
+			gLast[have + c] = 0;
 			gLastSeq++;
 		}
 		IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
