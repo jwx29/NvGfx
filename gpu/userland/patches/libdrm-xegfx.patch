@@ -12,7 +12,7 @@ index 5bc9388..0194cd1 100644
    ),
    config_file, format_mod_static_table
 diff --git a/xf86drm.c b/xf86drm.c
-index 73e4861..271692f 100644
+index 73e4861..d6303f5 100644
 --- a/xf86drm.c
 +++ b/xf86drm.c
 @@ -57,6 +57,7 @@
@@ -23,7 +23,7 @@ index 73e4861..271692f 100644
  #include "libdrm_macros.h"
  #include "drm_fourcc.h"
  
-@@ -107,25 +108,72 @@ static drmServerInfoPtr drm_server_info;
+@@ -107,30 +108,84 @@ static drmServerInfoPtr drm_server_info;
  
  static bool drmNodeIsDRM(int maj, int min);
  #ifdef __APPLE__
@@ -76,6 +76,10 @@ index 73e4861..271692f 100644
 +#undef minor
 +#define minor(d) drm_darwin_minor(d)
 +
++/* every open of a node has its own clone minor, so two device numbers name the same node when the slots match */
++#define DRM_SAME_RDEV(a, b) (major(a) == major(b) && \
++    DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(a)) == DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(b)))
++
  static bool drm_darwin_node_exists(int maj, int min)
  {
      DIR *dir = opendir(DRM_DIR_NAME);
@@ -102,7 +106,15 @@ index 73e4861..271692f 100644
      }
      closedir(dir);
      return found;
-@@ -699,6 +747,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
+ }
+ #endif
++#ifndef DRM_SAME_RDEV
++#define DRM_SAME_RDEV(a, b) ((a) == (b))
++#endif
+ static char *drmGetMinorNameForFD(int fd, int type);
+ 
+ #define DRM_MODIFIER(v, f, f_name) \
+@@ -699,6 +754,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
  {
      int ret;
  
@@ -114,6 +126,24 @@ index 73e4861..271692f 100644
      do {
          ret = ioctl(fd, request, arg);
      } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+@@ -3318,7 +3378,7 @@ drm_public char *drmGetDeviceNameFromFd(int fd)
+ 
+     for (i = 0; i < DRM_MAX_MINOR; i++) {
+         snprintf(name, sizeof name, DRM_DEV_NAME, DRM_DIR_NAME, i);
+-        if (stat(name, &sbuf) == 0 && sbuf.st_rdev == d)
++        if (stat(name, &sbuf) == 0 && DRM_SAME_RDEV(sbuf.st_rdev, d))
+             break;
+     }
+     if (i == DRM_MAX_MINOR)
+@@ -4627,7 +4687,7 @@ drm_device_has_rdev(drmDevicePtr device, dev_t find_rdev)
+     for (int i = 0; i < DRM_NODE_MAX; i++) {
+         if (device->available_nodes & 1 << i) {
+             if (stat(device->nodes[i], &sbuf) == 0 &&
+-                sbuf.st_rdev == find_rdev)
++                DRM_SAME_RDEV(sbuf.st_rdev, find_rdev))
+                 return true;
+         }
+     }
 diff --git a/xf86drm_xegfx.c b/xf86drm_xegfx.c
 new file mode 100644
 index 0000000..1ff2c60
