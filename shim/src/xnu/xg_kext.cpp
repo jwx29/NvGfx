@@ -32,7 +32,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.24", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.25", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -564,6 +564,17 @@ xegfx_fd_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 	xg_fd_diag(b, sizeof(b));
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
+extern "C" void xg_mem_diag(char *buf, unsigned long len);
+static int
+xegfx_mem_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	char b[192];
+
+	xg_mem_diag(b, sizeof(b));
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, xegfx_mem, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_mem_sysctl, "A",
+    "XeGfx M_NOWAIT reserve per size class and its misses");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_fd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_fd_sysctl, "A",
     "XeGfx node instances by state and the fd lock holder");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
@@ -578,7 +589,7 @@ SYSCTL_STRING(_debug, OID_AUTO, xegfx_env, CTLFLAG_RW | CTLFLAG_LOCKED, xg_env, 
     "tunables for the stages, name=value pairs");
 
 static struct sysctl_oid *const gOids[] = {
-	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_fd, &sysctl__debug_xegfx_running,
+	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_fd, &sysctl__debug_xegfx_mem, &sysctl__debug_xegfx_running,
 	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env, &sysctl__debug_xegfx_log,
 	&sysctl__debug_xegfx_hold,
 };
