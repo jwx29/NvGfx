@@ -1,7 +1,7 @@
 /*
  * XeGfx kext entry. The module loads idle on IOResources and does nothing until a stage is asked for:
  *   sysctl debug.xegfx_stage=N runs every stage up to N that has not run yet (1 shim, 2 read-only GPU probe,
- *   3 bus and DMA, 4 drm/i915 SYSINITs). debug.xegfx_env sets tunables for the stages (overrides boot-args).
+ *   3 bus and DMA, 4 drm/i915 SYSINITs and a GT health check, 5 one request on every engine). debug.xegfx_env sets tunables for the stages (overrides boot-args).
  * Nothing loads it at boot: its one personality waits for the XeGfxArm resource, which _start publishes after a
  * manual `kmutil load -b org.watchthelight.XeGfx`. There is no PCI personality: the shim finds the GPU in the registry. A stage that runs longer than
  * debug.xegfx_wdog seconds panics on purpose, so a stall becomes a panic report and an automatic reboot.
@@ -17,6 +17,7 @@
 #include <mach/kmod.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
+#include "xg_i915.h"
 
 extern "C" {
 void xg_start_stage(int stage);
@@ -26,9 +27,10 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.9", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.10", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
+extern unsigned int xg_pci_irqs;
 }
 
 class XeGfxResident : public IOService {
@@ -40,13 +42,13 @@ public:
 static XeGfxResident *gResident;
 static int gStage;	/* highest stage done */
 static int gRunning;	/* stage in progress, 0 when idle */
-static int gResult[5];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
+static int gResult[6];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
 static int gWdog = 60;
 static thread_call_t gWdogCall;
 static IOLock *gStageLock;
 static uint64_t gSurfPte;
 static bool gPipeLit;	/* pipe A was scanning out at probe time (Hybrid); in Discrete mode the NVIDIA GPU has the panel */
-static char gLog[64 * 1024];	/* last 64 KiB of the shim's console output, for sysctl debug.xegfx_log */
+static char gLog[256 * 1024];	/* last 256 KiB of the shim's console output, for sysctl debug.xegfx_log */
 static size_t gLogLen;
 static IOSimpleLock *gLogLock;
 static IOLock *gSnapLock;	/* GGTT entry behind PLANE_SURF_1_A at probe time, 0 if unknown */
@@ -223,6 +225,66 @@ xg_display_check(void)
 	return rc;
 }
 
+/* i915 probe succeeds even when GuC loading failed and the GT was wedged; fail stage 4 on that instead */
+static int
+xg_gt_check(void)
+{
+	struct xg_i915_state st;
+	OSDictionary *d = OSDictionary::withCapacity(10);
+	int rc = xg_i915_state(&st) == 0 ? 1 : -19;
+
+	if (rc == 1 && st.wedged)
+		rc = -5;
+	else if (rc == 1 && (st.guc_status != 10 || !st.guc_submission))
+		rc = -62;	/* 10 is INTEL_UC_FIRMWARE_RUNNING */
+	if (d) {
+		xg_put(d, "gts", st.gts, 8);
+		xg_put(d, "wedged", st.wedged, 8);
+		xg_put(d, "guc-fw-status", (uint32_t)st.guc_status);
+		xg_put(d, "guc-version", st.guc_ver);
+		xg_put(d, "guc-submission", st.guc_submission, 8);
+		xg_put(d, "huc-fw-status", (uint32_t)st.huc_status);
+		xg_put(d, "gsc-fw-status", (uint32_t)st.gsc_status);
+		xg_put(d, "engines", st.engines, 8);
+		xg_put(d, "render-minor", (uint32_t)st.render_minor);
+		xg_put(d, "result", (uint32_t)rc);
+		if (gResident)
+			gResident->setProperty("XeGfxGt", d);
+		d->release();
+	}
+	return rc;
+}
+
+/* stage 5: a kernel request per engine proves GuC submission, the MSI path and the breadcrumb wake together */
+static int
+xg_exec_check(void)
+{
+	static struct xg_i915_exec ex;
+	unsigned int irq0 = xg_pci_irqs;
+	OSDictionary *d = OSDictionary::withCapacity(XG_I915_MAX_ENGINES + 4);
+	int rc = xg_i915_exec(&ex, 2000) == 0 ? 1 : -19;
+
+	if (rc == 1 && (ex.engines == 0 || ex.done != ex.engines))
+		rc = -62;
+	if (d) {
+		for (int i = 0; i < ex.engines; i++) {
+			char k[24];
+			snprintf(k, sizeof(k), "%s-ns", ex.name[i]);
+			xg_put(d, k, (uint64_t)ex.ns[i], 64);
+			snprintf(k, sizeof(k), "%s-err", ex.name[i]);
+			xg_put(d, k, (uint32_t)ex.err[i]);
+		}
+		xg_put(d, "engines", ex.engines, 8);
+		xg_put(d, "done", ex.done, 8);
+		xg_put(d, "irqs", xg_pci_irqs - irq0);
+		xg_put(d, "result", (uint32_t)rc);
+		if (gResident)
+			gResident->setProperty("XeGfxExec", d);
+		d->release();
+	}
+	return rc;
+}
+
 static int
 xg_run_stage(int s)
 {
@@ -252,8 +314,12 @@ xg_run_stage(int s)
 			rc = xg_display_check();
 			if (rc == 1 && !xg_drm_attached())
 				rc = -19;	/* the init routines ran but no drm driver bound the GPU */
+			if (rc == 1)
+				rc = xg_gt_check();
 		}
 	}
+	if (s == 5)
+		rc = xg_exec_check();
 	if (gWdogCall)
 		thread_call_cancel(gWdogCall);
 	gRunning = 0;
@@ -267,7 +333,7 @@ xegfx_stage_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 
 	if (err || !req->newptr)
 		return err;
-	if (v < 0 || v > 4)
+	if (v < 0 || v > 5)
 		return EINVAL;
 	IOLockLock(gStageLock);
 	while (gStage < v) {
@@ -290,7 +356,7 @@ xegfx_results_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_stage_sysctl,
-    "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915)");
+    "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec)");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
     xegfx_results_sysctl, "S", "per-stage result: 0 not run, 1 pass, negative failure");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
@@ -298,7 +364,7 @@ SYSCTL_INT(_debug, OID_AUTO, xegfx_progress, CTLFLAG_RD | CTLFLAG_LOCKED, &xg_pr
 SYSCTL_INT(_debug, OID_AUTO, xegfx_wdog, CTLFLAG_RW | CTLFLAG_LOCKED, &gWdog, 0, "stage stall panic, seconds");
 static int xegfx_log_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_log, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_log_sysctl,
-    "S", "the shim's console output (last 64 KiB)");
+    "S", "the shim's console output (last 256 KiB)");
 SYSCTL_STRING(_debug, OID_AUTO, xegfx_env, CTLFLAG_RW | CTLFLAG_LOCKED, xg_env, sizeof(xg_env),
     "tunables for the stages, name=value pairs");
 

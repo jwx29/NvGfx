@@ -12,6 +12,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSIterator.h>
+#include <libkern/OSAtomic.h>
 #include <sys/errno.h>
 #include "xg_pci_xnu.h"
 
@@ -26,6 +27,7 @@ struct xg_pci_xnu {
 static xg_pci_xnu *gXgPciDevs;
 static IOLock *gXgPciLock;
 static bool gXgPciScanned;
+extern "C" { unsigned int xg_pci_irqs; }	/* every interrupt taken; stage 5 reports how many its requests raised */
 
 /* the owner of one interrupt source: it carries the FreeBSD filter/handler pair */
 class XgPciIntr : public OSObject {
@@ -168,7 +170,10 @@ static bool
 xg_pci_filter(OSObject *owner, IOFilterInterruptEventSource *src)
 {
 	XgPciIntr *o = (XgPciIntr *)owner;
-	int r = o->filter(o->arg);
+	int r;
+
+	OSIncrementAtomic((volatile SInt32 *)&xg_pci_irqs);
+	r = o->filter(o->arg);
 
 	return ((r & XG_PCI_FILTER_SCHEDULE) != 0 && o->handler != NULL);
 }
@@ -178,6 +183,8 @@ xg_pci_action(OSObject *owner, IOInterruptEventSource *src, int count)
 {
 	XgPciIntr *o = (XgPciIntr *)owner;
 
+	if (o->filter == NULL)
+		OSIncrementAtomic((volatile SInt32 *)&xg_pci_irqs);
 	if (o->handler != NULL)
 		o->handler(o->arg);
 }
