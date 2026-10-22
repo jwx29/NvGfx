@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 /*
  * XeGfx stages 4 and 5: after i915 attaches, report whether its GTs are usable (probe returns 0 even when GuC
- * loading failed and the GT was wedged), then run one kernel-context request on every uabi engine.
+ * loading failed and the GT was wedged), then run one kernel-context request on every uabi engine (stage 5), then
+ * have every engine write a dword the CPU can read back (stage 6).
  * <wtl> project: xegfx | author: watchthelight </wtl>
  */
 #include <linux/pci.h>
@@ -9,7 +10,10 @@
 
 #include "i915_drv.h"
 #include "i915_request.h"
+#include "gt/intel_engine.h"
 #include "gt/intel_engine_pm.h"
+#include "gt/intel_gpu_commands.h"
+#include "gt/intel_ring.h"
 #include "gt/intel_gt.h"
 #include "gt/uc/intel_uc.h"
 
@@ -96,6 +100,66 @@ xg_i915_exec(struct xg_i915_exec *ex, int timeout_ms)
 			ex->err[n] = (int)t;
 		else
 			ex->done++;
+	}
+	pci_dev_put(pdev);
+	return (0);
+}
+
+/* a slot past i915's own status page users (I915_GEM_HWS_SCRATCH is only written on gen2-6) */
+#define XG_HWS_SLOT	(I915_GEM_HWS_SCRATCH + 1)
+
+int
+xg_i915_store(struct xg_i915_store *sd, int timeout_ms)
+{
+	struct drm_i915_private *i915;
+	struct intel_engine_cs *engine;
+	struct i915_request *rq;
+	struct pci_dev *pdev;
+	u32 *cs, *slot;
+	long t;
+	int n;
+
+	memset(sd, 0, sizeof(*sd));
+	if ((i915 = xg_i915_find(&pdev)) == NULL)
+		return (-ENODEV);
+	for_each_uabi_engine(engine, i915) {
+		if (!intel_engine_can_store_dword(engine))
+			continue;
+		if ((n = sd->engines) >= XG_I915_MAX_ENGINES)
+			break;
+		sd->engines++;
+		strscpy(sd->name[n], engine->name, sizeof(sd->name[n]));
+		sd->want[n] = 0x58670000 | (n << 8) | engine->uabi_class;
+		slot = &engine->status_page.addr[XG_HWS_SLOT];
+		intel_write_status_page(engine, XG_HWS_SLOT, 0);
+		rq = intel_engine_create_kernel_request(engine);
+		if (IS_ERR(rq)) {
+			sd->err[n] = PTR_ERR(rq);
+			continue;
+		}
+		cs = intel_ring_begin(rq, 4);
+		if (IS_ERR(cs)) {
+			sd->err[n] = PTR_ERR(cs);
+			i915_request_add(rq);
+			continue;
+		}
+		*cs++ = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT;
+		*cs++ = i915_ggtt_offset(engine->status_page.vma) + XG_HWS_SLOT * sizeof(u32);
+		*cs++ = 0;
+		*cs++ = sd->want[n];
+		intel_ring_advance(rq, cs);
+		i915_request_get(rq);
+		i915_request_add(rq);
+		t = i915_request_wait(rq, 0, msecs_to_jiffies(timeout_ms));
+		i915_request_put(rq);
+		drm_clflush_virt_range(slot, sizeof(*slot));
+		sd->got[n] = intel_read_status_page(engine, XG_HWS_SLOT);
+		if (t < 0)
+			sd->err[n] = (int)t;
+		else if (sd->got[n] != sd->want[n])
+			sd->err[n] = -EIO;
+		else
+			sd->ok++;
 	}
 	pci_dev_put(pdev);
 	return (0);
