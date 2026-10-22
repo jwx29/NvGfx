@@ -1,9 +1,5 @@
 # XeGfx
 
-> **Heads up:** a good portion of this code is AI generated. I do understand how it works,
-> and I'm happy to explain any of it. If something looks wrong or you have a question,
-> open an issue or ping me on Discord (`watchthelight`).
-
 XeGfx is an attempt at hardware-accelerated graphics for Intel Xe GPUs on macOS. The goal is one driver for every Xe part (Tiger Lake through Arrow Lake, Arc A-series, then Lunar Lake, Battlemage and Panther Lake) on every macOS from Big Sur 11 to Tahoe 26.
 
 It does not write a GPU driver from scratch. FreeBSD's [drm-kmod](https://github.com/freebsd/drm-kmod) already runs the Linux i915 driver on a non-Linux kernel through LinuxKPI, a layer that implements the Linux kernel API on top of FreeBSD's. XeGfx puts a small FreeBSD-kernel-API layer for XNU underneath LinuxKPI, so drm core and i915 build as one kext. Userspace is planned as Mesa's ANV Vulkan driver under the Metal-to-Vulkan plugin of [NvGfx](https://github.com/watchthelight-labs/NvGfx), the same way that project runs NVIDIA GPUs.
