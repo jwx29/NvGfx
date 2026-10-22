@@ -7,3 +7,4 @@ drm_writeback.c               # GPL-2.0; writeback connectors, unused by i915
 drm_panel_backlight_quirks.c  # GPL-2.0; panel quirks for the display code
 intel_uncore_trace.c          # GPL-2.0; tracepoints, no-ops here
 linux_schedule.c              # FreeBSD BSD-2; replaced by src/lkpi/linux_schedule.c (woken_wake_function lost wakeup, found by VedCloud)
+intel_breadcrumbs.c           # MIT; replaced by src/i915/intel_breadcrumbs.c (signal_irq_work takes the next signaler before the last context put)

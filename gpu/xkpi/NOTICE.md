@@ -10,6 +10,8 @@ that are GPL-only, so the kext contains no GPL-only code (Legion I-097), and Lin
 | `include/drm/drm_format_helper.h` | written for this fork | MIT |
 | `exclude.txt` | written for this fork | MIT |
 | `src/lkpi/linux_schedule.c` | FreeBSD `sys/compat/linuxkpi/common/src/linux_schedule.c` (freebsd-src d2145e9) with one change: `woken_wake_function` sets `TASK_WAKING` under the channel lock, so a wake between a waiter's condition check and `schedule_timeout()` is not lost (GuC replies timed out). The bug and fix were found by [VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) (ROADMAP Phase 4, `override/src/linux_schedule.c`) | BSD-2-Clause, as the FreeBSD file |
+| `src/i915/intel_breadcrumbs.c` | drm-kmod `drivers/gpu/drm/i915/gt/intel_breadcrumbs.c` with two changes: its local includes say `gt/` because the file builds from here, and `signal_irq_work()` reads the next signaler before the loop body can drop the last reference to the current one. That is the upstream patch "drm/i915/gt: Fix ce use-after-free in signal_irq_work()" by Wentao Liang (linux-kernel, 2026-09-16), written with FreeBSD LinuxKPI's RCU list macros; [VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) hit this use-after-free on Meteor Lake | MIT, as the i915 file |
+| `src/i915/xg_i915_exec.c` | written for this fork: the XeGfx stage 4 GT check and the stage 5 per-engine request | MIT |
 
 # gpu/userland
 
