@@ -90,6 +90,50 @@ int main(void)
             printf("  after %s ms: %lu of %lu wrong\n", getenv("MTLPROBE_RECHECK_MS"), (unsigned long)bad2, (unsigned long)n);
         }
         printf("metal compute: %s\n", bad == 0 && cb.status == MTLCommandBufferStatusCompleted ? "OK" : "WRONG");
-        return bad == 0 ? 0 : 4;
+        if (bad) return 4;
+
+        // draw: red clear, a green triangle over the middle, blit to a shared buffer, check centre and corner
+        NSString *rsrc = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "vertex float4 vs(uint v [[vertex_id]]) { float2 p[3] = { float2(-0.5, -0.5), float2(0.5, -0.5), float2(0.0, 0.5) };"
+            " return float4(p[v], 0.0, 1.0); }\n"
+            "fragment half4 fs() { return half4(0.0, 1.0, 0.0, 1.0); }\n";
+        id<MTLLibrary> rl = [dev newLibraryWithSource:rsrc options:nil error:&err];
+        MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+        rpd.vertexFunction = [rl newFunctionWithName:@"vs"];
+        rpd.fragmentFunction = [rl newFunctionWithName:@"fs"];
+        rpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        id<MTLRenderPipelineState> rps = rl ? [dev newRenderPipelineStateWithDescriptor:rpd error:&err] : nil;
+        printf("  render pipeline: %s\n", rps ? "OK" : (err ? err.localizedDescription.UTF8String : "no library"));
+        if (!rps) return 5;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                      width:64 height:64 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+        id<MTLBuffer> rb = [dev newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = tex;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+        id<MTLCommandBuffer> cb2 = [q commandBuffer];
+        id<MTLRenderCommandEncoder> re = [cb2 renderCommandEncoderWithDescriptor:pass];
+        [re setRenderPipelineState:rps];
+        [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [re endEncoding];
+        id<MTLBlitCommandEncoder> be = [cb2 blitCommandEncoder];
+        [be copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1)
+                   toBuffer:rb destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:256 * 64];
+        [be endEncoding];
+        [cb2 commit];
+        [cb2 waitUntilCompleted];
+        const uint8_t *px = rb.contents, *c = px + (32 * 64 + 32) * 4, *k = px;
+        int green = 0;
+        for (int i = 0; i < 64 * 64; i++) green += px[i * 4] == 0 && px[i * 4 + 1] == 255;
+        printf("  draw: status %ld, centre %u %u %u %u, corner %u %u %u %u, %d green pixels (about 512 expected)\n",
+               (long)cb2.status, c[0], c[1], c[2], c[3], k[0], k[1], k[2], k[3], green);
+        int dok = c[1] == 255 && c[0] == 0 && k[0] == 255 && k[1] == 0 && green > 300 && green < 800;
+        printf("metal draw: %s\n", dok ? "OK" : "WRONG");
+        return dok ? 0 : 6;
     }
 }
