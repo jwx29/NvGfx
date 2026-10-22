@@ -1,9 +1,5 @@
 # Intel Xe on the NvGfx stack (branch `xe`)
 
-> **Heads up:** a good portion of the changes in this fork are AI generated. I do understand how they work,
-> and I'm happy to explain any of it. If something looks wrong or you have a question,
-> open an issue or ping me on Discord (`watchthelight`).
-
 This branch is where the Intel side of NvGfx comes together: a kernel driver for Intel Xe GPUs, the same Metal-to-Vulkan plugin that runs NVIDIA cards here, and Mesa's ANV Vulkan driver in between. The aim is one driver for every Xe part (Tiger Lake to Arrow Lake and Arc first, then Lunar Lake, Battlemage and Panther Lake) on macOS 11 to 26.
 
 Status on 2026-10-21: the kernel driver builds and links, its first hardware run is queued, and ANV builds for macOS and passes a simulated test on every Intel generation. Nothing has rendered on Intel hardware with this branch yet; [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) has, with a similar stack on macOS 15. Progress is tracked in [XeGfx's issues](https://github.com/watchthelight-labs/XeGfx/issues) and in [issue #12](https://github.com/watchthelight-labs/NvGfx/issues/12) here.
