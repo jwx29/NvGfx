@@ -490,8 +490,12 @@ static bool nvmtl_process_is_allowed(void)
     // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
-    { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+    // An Intel accelerator over XeGfx that owns the panel (BIOS Hybrid, NMIntelFB as its head) reports
+    // debug.nmxaccel_headless 0: WindowServer composites there. Any other AMD/Intel accelerator stays apps-only.
+    { int hv = 0, nx = 1; size_t hn = sizeof hv, nn = sizeof nx;
+      const int xe_owns_panel = nvmtl_vk_vendor() == 0x8086 &&
+                                sysctlbyname("debug.nmxaccel_headless", &nx, &nn, NULL, 0) == 0 && nx == 0;
+      if (!strcmp(me, "WindowServer") && !xe_owns_panel && (nvmtl_vk_vendor() != 0x10de ||
                                           (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;

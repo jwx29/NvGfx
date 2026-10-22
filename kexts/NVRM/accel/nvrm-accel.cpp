@@ -77,7 +77,11 @@ static unsigned gNvHeadsPiped = 0;
 // The Intel built-in panel (head 4) joins only when this is 1. Off by default while the path is proven: a write at run
 // time (then debug.nvaccelfb=3 and a WindowServer restart) can be undone by a reboot, so a hang never needs hands
 // (the first virtual-panel test froze the machine at boot and needed a power cycle).
+#ifdef NMX_XEGFX
+static int gNvIgpu = 1;   // over XeGfx the Intel panel (NMIntelFB, head 4) is the only display this GPU has
+#else
 static int gNvIgpu = 0;
+#endif
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_igpu, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvIgpu, 0,
            "1 = give an Intel built-in panel (NMIntelFB, head 4) a display pipe on this accelerator");
 
@@ -633,7 +637,18 @@ public:
             fRegLock = IOLockAlloc();
             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
-#ifdef NMX_ACCEL
+#if defined(NMX_XEGFX)
+            // over XeGfx the Intel GPU owns the built-in panel: NMIntelFB publishes it as head 4 and WindowServer
+            // composites here once debug.nvaccelfb=1 registered it; frames reach the panel through the CPU copy path
+            nvaccelInstallSysctl();
+            gNvHeadless = 0;
+            ALOG("Intel accelerator over XeGfx: watching for NMIntelFB (head 4); register with sysctl debug.nvaccelfb=1");
+            if (OSDictionary *im = serviceMatching("NMIntelFB")) {
+                fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
+                im->release();
+            }
+            OSDictionary *fbm = nullptr;
+#elif defined(NMX_ACCEL)
             // AMD/Intel: the Metal device is for apps; WindowServer draws into NMXGPU's framebuffer, and the plugin copies
             // finished frames into the IOSurfaces it reads (the headless path NVIDIA laptops use)
             nvaccelInstallSysctl();
@@ -1253,13 +1268,19 @@ static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
     if (gSysctlInstalled) return;
-#ifdef NMX_ACCEL
+#if defined(NMX_ACCEL) && !defined(NMX_XEGFX)
     // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
     sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
     gSysctlInstalled = true;
 #else
+#ifdef NMX_XEGFX
+    // over XeGfx (BIOS Hybrid): the NVIDIA GPU is off the bus, so NVAccel never starts and the names are free
+    sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
+#endif
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
+#ifndef NMX_ACCEL
     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+#endif
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_refused);
