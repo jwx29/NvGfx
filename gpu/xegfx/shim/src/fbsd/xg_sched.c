@@ -14,6 +14,7 @@
 #include <sys/mutex.h>
 #include <sys/sx.h>
 #include <sys/proc.h>
+#include <sys/sysent.h>
 #include <sys/sched.h>
 #include <sys/signalvar.h>
 #include <sys/rtprio.h>
@@ -174,6 +175,9 @@ xg_sched_identify(void)
 static struct { struct thread *lh_first; } xg_sched_tidhash[XG_TID_BUCKETS];
 static volatile u_int xg_sched_reg_lock;
 static volatile u_int xg_sched_state;		/* 0 cold, 1 initialising, 2 up */
+/* not SV_ABI_FREEBSD: linux_file_ioctl then uses the kernel copy XNU made instead of FreeBSD syscall args (N-229 read
+ * a NULL p_sysent there) */
+static struct sysentvec xg_sched_sysvec = { .sv_name = "xnu", .sv_flags = SV_LP64 };
 
 static void
 xg_sched_mtx_init(struct mtx *m, const char *name, int opts)
@@ -203,6 +207,7 @@ xg_sched_init(void)
 	if (proc0.p_threads.tqh_last == NULL)
 		TAILQ_INIT(&proc0.p_threads);
 	proc0.p_state = PRS_NORMAL;
+	proc0.p_sysent = &xg_sched_sysvec;
 	LIST_INSERT_HEAD(&allproc, &proc0, p_list);
 	atomic_store_rel_int(&xg_sched_state, 2);
 }
