@@ -4,19 +4,19 @@
 #
 # Upstream reads the RM -D set from NullMoth's private $OGKM/src/nvidia/_out/Darwin_x86_64/compile_cmds.sh (first line,
 # minus -DNVRM and -D_LANGUAGE_C). That file is not published. It is the command line the RM Makefile builds on Darwin,
-# so the set below is rebuilt from open-gpu-kernel-modules 610.57.04: src/nvidia/Makefile (the CFLAGS += -D lines) plus
+# so the set below is rebuilt from open-gpu-kernel-modules (610.57.04 first, 615.78.08 for 2.5.x): src/nvidia/Makefile (the CFLAGS += -D lines) plus
 # utils.mk (TARGET_ARCH x86_64 adds NV_X86_64 and NV_ARCH_BITS=64; TARGET_OS Darwin adds no OS define; release build,
 # so no DEBUG or DEVELOP). The first RM source (generated/g_access_cntr_buffer_nvoc.c) gets no per-file defines.
 # The kext sources use none of these directly; they reach only the NVIDIA headers the kexts include.
 # <wtl> fork: nvgfx | author: watchthelight </wtl>
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-OGKM=${OGKM:-$HOME/src/deps/open-gpu-610.57.04}
+OGKM=${OGKM:-$HOME/src/deps/open-gpu-${NVRM_TAG:-615.78.08}}
 OUTROOT=${OUTROOT:-$HOME/src/NvGfx-build/kexts}
 SDK=${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}   # SDKROOT pins the SDK (the docs say 15.5); CLT 26 made 26.5 the default
 KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 NV="$OGKM/src/nvidia"; KMS="$OGKM/src/nvidia-modeset"
-[ -d "$NV/generated" ] || { echo "OGKM=$OGKM is not an open-gpu-kernel-modules 610.57.04 tree"; exit 1; }
+[ -d "$NV/generated" ] || { echo "OGKM=$OGKM is not an open-gpu-kernel-modules tree"; exit 1; }
 
 RMINC=( -I"$NV/arch/nvalloc/unix/include" -I"$NV/arch/nvalloc/common/inc" -I"$NV/arch/nvalloc/common/inc/gsp"
   -I"$OGKM/src/common/sdk/nvidia/inc" -I"$OGKM/src/common/sdk/nvidia/inc/hw" -I"$OGKM/src/common/inc"
