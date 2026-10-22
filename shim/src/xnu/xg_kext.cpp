@@ -10,6 +10,7 @@
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IONVRAM.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <architecture/i386/pio.h>
 #include <kern/thread_call.h>
@@ -18,6 +19,7 @@
 #include <mach/kmod.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
+#include <string.h>
 #include "xg_i915.h"
 
 extern "C" {
@@ -28,7 +30,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.12", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.13", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -50,6 +52,28 @@ static int gWdog = 60;
 static thread_call_t gWdogCall;
 static thread_call_t gHoldCall;	/* armed around userspace checks: a GPU deadlock there panics too */
 static int gHold;
+/*
+ * NVRAM trace (I-104: a stage 4 hang left no log at all): with xegfx.nvram_trace=1 in debug.xegfx_env, every 250 ms
+ * while a stage runs, "xegfx-step" gets the stage, the breadcrumb and the newest console line, synced at once.
+ */
+static thread_call_t gTraceCall;
+static bool gTraceOn;
+static char gLast[200];
+static unsigned gLastSeq, gTraceSeq;
+static int gTraceProgress;
+static void xg_trace_write(void);
+
+/* strstr is not in the public kext KPIs */
+static bool
+xg_env_has(const char *kv)
+{
+	size_t n = strlen(kv);
+
+	for (const char *p = xg_env; *p; p++)
+		if (strncmp(p, kv, n) == 0)
+			return true;
+	return false;
+}
 static IOLock *gStageLock;
 static uint64_t gSurfPte;
 static bool gPipeLit;	/* pipe A was scanning out at probe time (Hybrid); in Discrete mode the NVIDIA GPU has the panel */
@@ -332,6 +356,11 @@ xg_run_stage(int s)
 
 	gRunning = s;
 	xg_progress = s * 10;
+	gTraceOn = xg_env_has("xegfx.nvram_trace=1");
+	if (gTraceOn) {
+		xg_trace_write();
+		thread_call_enter(gTraceCall);
+	}
 	if (gWdogCall && gWdog > 0) {
 		uint64_t dl;
 		clock_interval_to_deadline(gWdog, NSEC_PER_SEC, &dl);
@@ -366,6 +395,11 @@ xg_run_stage(int s)
 		rc = xg_store_check();
 	if (gWdogCall)
 		thread_call_cancel(gWdogCall);
+	if (gTraceOn) {
+		gTraceOn = false;
+		thread_call_cancel(gTraceCall);
+		xg_trace_write();	/* the stage's end state, s0 */
+	}
 	gRunning = 0;
 	return rc;
 }
@@ -397,6 +431,55 @@ static int
 xegfx_results_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
 	return SYSCTL_OUT(req, gResult, sizeof(gResult));
+}
+
+static void
+xg_trace_write(void)
+{
+	static bool kept;
+	char b[256], line[sizeof(gLast)];
+	IORegistryEntry *o;
+	IOInterruptState is;
+
+	is = IOSimpleLockLockDisableInterrupt(gLogLock);
+	memcpy(line, gLast, sizeof(line));
+	gTraceSeq = gLastSeq;
+	gTraceProgress = xg_progress;
+	IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
+	for (char *p = line; *p; p++)
+		if (*p == '\n' || *p == '\r')
+			*p = ' ';
+	snprintf(b, sizeof(b), "s%d p%d %s", gRunning, xg_progress, line);
+	if ((o = IORegistryEntry::fromPath("/options", gIODTPlane)) == nullptr)
+		return;
+	if (!kept) {
+		/* the last boot's trace survives one more boot, for whoever reads it after a recovery */
+		kept = true;
+		if (OSObject *old = o->copyProperty("xegfx-step")) {
+			o->setProperty("xegfx-step-prev", old);
+			old->release();
+		}
+	}
+	if (OSData *d = OSData::withBytes(b, (unsigned)strlen(b))) {
+		o->setProperty("xegfx-step", d);
+		d->release();
+	}
+	if (IODTNVRAM *nv = OSDynamicCast(IODTNVRAM, o))
+		nv->sync();
+	o->release();
+}
+
+static void
+xg_trace_fire(thread_call_param_t, thread_call_param_t)
+{
+	uint64_t dl;
+
+	if (!gTraceOn)
+		return;
+	if (gLastSeq != gTraceSeq || xg_progress != gTraceProgress)
+		xg_trace_write();
+	clock_interval_to_deadline(250, NSEC_PER_MSEC, &dl);
+	thread_call_enter_delayed(gTraceCall, dl);
 }
 
 static void
@@ -466,6 +549,12 @@ xg_vprintf(const char *fmt, va_list ap)
 		}
 		memcpy(gLog + gLogLen, buf, l);
 		gLogLen += l;
+		if (l > 1) {
+			size_t c = MIN(l, sizeof(gLast) - 1);
+			memcpy(gLast, buf, c);
+			gLast[c] = 0;
+			gLastSeq++;
+		}
 		IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
 	}
 	return vprintf(fmt, ap);
@@ -513,7 +602,8 @@ _start(kmod_info_t *, void *)
 	gSnapLock = IOLockAlloc();
 	gWdogCall = thread_call_allocate(xg_wdog_fire, nullptr);
 	gHoldCall = thread_call_allocate(xg_hold_fire, nullptr);
-	if (!gStageLock || !gWdogCall || !gHoldCall || !gLogLock || !gSnapLock)
+	gTraceCall = thread_call_allocate(xg_trace_fire, nullptr);
+	if (!gStageLock || !gWdogCall || !gHoldCall || !gTraceCall || !gLogLock || !gSnapLock)
 		return KERN_FAILURE;
 	/* i915 stays off the display until NMIntelFB owns it; the guard can override per experiment */
 	strlcpy(xg_env, "compat.linuxkpi.i915_disable_display=1", sizeof(xg_env));
@@ -533,6 +623,8 @@ _stop(kmod_info_t *, void *)
 	thread_call_free(gWdogCall);
 	thread_call_cancel(gHoldCall);
 	thread_call_free(gHoldCall);
+	thread_call_cancel(gTraceCall);
+	thread_call_free(gTraceCall);
 	IOLockFree(gStageLock);
 	IOSimpleLockFree(gLogLock);
 	IOLockFree(gSnapLock);
