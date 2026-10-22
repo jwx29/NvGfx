@@ -13,6 +13,7 @@ that are GPL-only, so the kext contains no GPL-only code (Legion I-097), and Lin
 | `src/i915/intel_breadcrumbs.c` | drm-kmod `drivers/gpu/drm/i915/gt/intel_breadcrumbs.c` with two changes: its local includes say `gt/` because the file builds from here, and `signal_irq_work()` reads the next signaler before the loop body can drop the last reference to the current one. That is the upstream patch "drm/i915/gt: Fix ce use-after-free in signal_irq_work()" by Wentao Liang (linux-kernel, 2026-09-16), written with FreeBSD LinuxKPI's RCU list macros; [VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) hit this use-after-free on Meteor Lake | MIT, as the i915 file |
 | `src/i915/xg_i915_exec.c` | written for this fork: the XeGfx stage 4 GT check, the stage 5 per-engine request and the stage 6 store-dword check | MIT |
 | `src/i915/xg_i915_map.c` | written for this fork: GEM mapping through ioctls, with the struct layout and ioctl numbers of NullMoth's Darwin libdrm patch so that patch works unchanged (an interface, no code taken) | MIT |
+| `src/i915/xg_drm_sync.c`, `xg_drm_sync.h` | written for this fork: a GEM object's implicit fences to and from a syncobj, following Linux's dma-buf sync_file export and import, and `DRM_IOCTL_GET_PCIINFO` | MIT |
 | `src/i915/i915_gem_stolen.c` | drm-kmod `drivers/gpu/drm/i915/gem/i915_gem_stolen.c` with its own header include written as `gem/`, and `xg_stolen_start()`: the stolen allocator starts after the firmware's console image when pipe A was lit at probe. The lesson came from VedCloud's port and kitsuneislife/nmx-intel | MIT, as the i915 file |
 
 # gpu/userland
@@ -21,5 +22,6 @@ that are GPL-only, so the kext contains no GPL-only code (Legion I-097), and Lin
 |---|---|---|
 | `patches/mesa-macos.patch`, `patches/libdrm-macos.patch`, `tools/vkprobe.c`, `drmlist.c`, `fill.comp` | NullMoth, nvidia-macos-driver commit bf2dee3, `gpu-port/` (audited) | PolyForm Noncommercial 1.0.0 |
 | `scripts/`, `BUILD.md`, `*.ini` | written for this fork | as the rest of this repository |
+| `patches/libdrm-xegfx.patch`, `patches/mesa-xegfx.patch` | written for this fork, applied after NullMoth's two patches: dma-buf and sync_file stand-ins in libdrm, Mesa ioctls and GEM mapping through libdrm | MIT |
 
 Upstream sources the scripts fetch: [Mesa](https://gitlab.freedesktop.org/mesa/mesa) bffd919 (MIT) and [libdrm](https://gitlab.freedesktop.org/mesa/drm) b97cbde (MIT).

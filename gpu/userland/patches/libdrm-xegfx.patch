@@ -1,0 +1,378 @@
+diff --git a/meson.build b/meson.build
+index 5bc9388..0194cd1 100644
+--- a/meson.build
++++ b/meson.build
+@@ -244,7 +244,7 @@ inc_root = include_directories('.')
+ inc_drm = include_directories('include/drm')
+ 
+ libdrm_files = [files(
+-   'xf86drm.c', 'xf86drmHash.c', 'xf86drmRandom.c', 'xf86drmSL.c',
++   'xf86drm.c', 'xf86drm_xegfx.c', 'xf86drmHash.c', 'xf86drmRandom.c', 'xf86drmSL.c',
+    'xf86drmMode.c'
+   ),
+   config_file, format_mod_static_table
+diff --git a/xf86drm.c b/xf86drm.c
+index 73e4861..783f0a7 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -57,6 +57,7 @@
+ #endif
+ 
+ #include "xf86drm.h"
++#include "xf86drm_xegfx.h"
+ #include "libdrm_macros.h"
+ #include "drm_fourcc.h"
+ 
+@@ -699,6 +700,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
+ {
+     int ret;
+ 
++#ifdef __APPLE__
++    /* descriptors a kext cannot create (dma-buf, sync_file) are made here */
++    if (drmXeGfxIoctl(fd, request, arg, &ret))
++        return ret;
++#endif
+     do {
+         ret = ioctl(fd, request, arg);
+     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+diff --git a/xf86drm_xegfx.c b/xf86drm_xegfx.c
+new file mode 100644
+index 0000000..1ff2c60
+--- /dev/null
++++ b/xf86drm_xegfx.c
+@@ -0,0 +1,317 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * XeGfx (Darwin): dma-buf and sync_file file descriptors in userspace. A kext cannot create file descriptors, so
++ * PRIME export, sync_file export and syncobj sync_file export cannot happen in the kernel. drmIoctl() answers them
++ * here instead, with stand-in descriptors: each is the read end of a pipe whose write end is closed, remembered
++ * with its inode so a recycled number is noticed. A dma-buf stands for (DRM file, GEM handle); a sync_file stands
++ * for a syncobj on that DRM file, filled and drained by the XeGfx ioctls 'N' 0x42/0x43 and SYNCOBJ_TRANSFER.
++ *
++ * Limits: a stand-in only works on the DRM file it came from; poll() on a sync_file stand-in always reports
++ * ready; opaque syncobj fds are snapshots, not shared syncobjs; SYNC_IOC_MERGE is not supported.
++ * <wtl> project: xegfx | author: watchthelight </wtl>
++ */
++#ifdef __APPLE__
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "xf86drm.h"
++#include "xf86drm_xegfx.h"
++
++/* include/uapi/linux/dma-buf.h */
++struct xg_dma_buf_sync_file {
++    uint32_t flags;
++    int32_t fd;
++};
++#define XG_DMA_BUF_SYNC_RW      3
++#define XG_DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR('b', 2, struct xg_dma_buf_sync_file)
++#define XG_DMA_BUF_IOCTL_IMPORT_SYNC_FILE _IOW('b', 3, struct xg_dma_buf_sync_file)
++
++/* the kext's gpu/xkpi/src/i915/xg_drm_sync.h */
++struct xg_drm_bo_fence {
++    uint32_t handle;
++    uint32_t flags;
++    uint32_t syncobj;
++    uint32_t pad;
++};
++#define XG_DRM_IOCTL_BO_EXPORT_FENCE _IOW('N', 0x42, struct xg_drm_bo_fence)
++#define XG_DRM_IOCTL_BO_IMPORT_FENCE _IOW('N', 0x43, struct xg_drm_bo_fence)
++
++enum { XG_DMABUF = 1, XG_SYNCFILE, XG_SYNCOBJ };
++
++struct xg_efd {
++    int fd;
++    dev_t dev;
++    ino_t ino;
++    int kind;
++    int drm_fd;
++    uint32_t handle;    /* GEM handle for a dma-buf, syncobj otherwise */
++};
++
++static struct xg_efd *xg_tab;
++static int xg_n, xg_cap;
++static pthread_mutex_t xg_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static int raw_ioctl(int fd, unsigned long request, void *arg)
++{
++    int ret;
++
++    do {
++        ret = ioctl(fd, request, arg);
++    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++    return ret;
++}
++
++static void syncobj_destroy(int drm_fd, uint32_t h)
++{
++    struct drm_syncobj_destroy d = { .handle = h };
++
++    raw_ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &d);
++}
++
++static int still_ours(const struct xg_efd *e)
++{
++    struct stat st;
++
++    return fstat(e->fd, &st) == 0 && S_ISFIFO(st.st_mode) && st.st_dev == e->dev && st.st_ino == e->ino;
++}
++
++/* with xg_lock held: forget entry i, and its syncobj */
++static void drop(int i)
++{
++    if (xg_tab[i].kind != XG_DMABUF)
++        syncobj_destroy(xg_tab[i].drm_fd, xg_tab[i].handle);
++    xg_tab[i] = xg_tab[--xg_n];
++}
++
++static int new_efd(int kind, int drm_fd, uint32_t handle)
++{
++    struct xg_efd e = { .kind = kind, .drm_fd = drm_fd, .handle = handle };
++    struct stat st;
++    int p[2], i;
++
++    if (pipe(p) != 0)
++        return -1;
++    close(p[1]);
++    fcntl(p[0], F_SETFD, FD_CLOEXEC);
++    if (fstat(p[0], &st) != 0) {
++        close(p[0]);
++        return -1;
++    }
++    e.fd = p[0];
++    e.dev = st.st_dev;
++    e.ino = st.st_ino;
++    pthread_mutex_lock(&xg_lock);
++    /* stand-ins the caller has closed since: their numbers now name something else, or nothing */
++    for (i = xg_n - 1; i >= 0; i--)
++        if (!still_ours(&xg_tab[i]))
++            drop(i);
++    if (xg_n == xg_cap) {
++        int cap = xg_cap ? 2 * xg_cap : 64;
++        struct xg_efd *t = realloc(xg_tab, cap * sizeof(*t));
++
++        if (t == NULL) {
++            pthread_mutex_unlock(&xg_lock);
++            close(p[0]);
++            errno = ENOMEM;
++            return -1;
++        }
++        xg_tab = t;
++        xg_cap = cap;
++    }
++    xg_tab[xg_n++] = e;
++    pthread_mutex_unlock(&xg_lock);
++    return e.fd;
++}
++
++/* a copy of fd's entry if fd is a live stand-in */
++static int lookup(int fd, struct xg_efd *out)
++{
++    int i, found = 0;
++
++    pthread_mutex_lock(&xg_lock);
++    for (i = 0; i < xg_n; i++)
++        if (xg_tab[i].fd == fd) {
++            if (still_ours(&xg_tab[i])) {
++                *out = xg_tab[i];
++                found = 1;
++            } else
++                drop(i);
++            break;
++        }
++    pthread_mutex_unlock(&xg_lock);
++    return found;
++}
++
++/* both descriptors are the same open of the same DRM node (each devfs clone open has its own minor) */
++static int same_file(int a, int b)
++{
++    struct stat sa, sb;
++
++    return a == b || (fstat(a, &sa) == 0 && fstat(b, &sb) == 0 && sa.st_rdev == sb.st_rdev);
++}
++
++static int syncobj_new(int drm_fd, uint32_t *h)
++{
++    struct drm_syncobj_create c = { 0 };
++
++    if (raw_ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_CREATE, &c) != 0)
++        return -1;
++    *h = c.handle;
++    return 0;
++}
++
++/* dst (binary) gets src's fence at src_point */
++static int syncobj_copy(int drm_fd, uint32_t src, uint64_t src_point, uint32_t dst, uint64_t dst_point)
++{
++    struct drm_syncobj_transfer t = {
++        .src_handle = src, .dst_handle = dst, .src_point = src_point, .dst_point = dst_point,
++    };
++
++    return raw_ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &t);
++}
++
++static int fail(int err)
++{
++    errno = err;
++    return -1;
++}
++
++/* ioctls on a stand-in descriptor */
++static int efd_ioctl(const struct xg_efd *e, unsigned long request, void *arg)
++{
++    struct xg_dma_buf_sync_file *a = arg;
++    struct xg_drm_bo_fence f = { .handle = e->handle };
++    struct xg_efd s;
++    uint32_t h;
++    int fd;
++
++    if (e->kind != XG_DMABUF)
++        return fail(ENOTTY);
++    if ((a->flags & ~XG_DMA_BUF_SYNC_RW) != 0 || (a->flags & XG_DMA_BUF_SYNC_RW) == 0)
++        return fail(EINVAL);
++    f.flags = a->flags;
++    if (request == XG_DMA_BUF_IOCTL_EXPORT_SYNC_FILE) {
++        if (syncobj_new(e->drm_fd, &h) != 0)
++            return -1;
++        f.syncobj = h;
++        if (raw_ioctl(e->drm_fd, XG_DRM_IOCTL_BO_EXPORT_FENCE, &f) != 0 ||
++            (fd = new_efd(XG_SYNCFILE, e->drm_fd, h)) < 0) {
++            int err = errno;
++
++            syncobj_destroy(e->drm_fd, h);
++            return fail(err);
++        }
++        a->fd = fd;
++        return 0;
++    }
++    if (request == XG_DMA_BUF_IOCTL_IMPORT_SYNC_FILE) {
++        if (!lookup(a->fd, &s) || s.kind == XG_DMABUF || !same_file(s.drm_fd, e->drm_fd))
++            return fail(EINVAL);
++        f.syncobj = s.handle;
++        return raw_ioctl(e->drm_fd, XG_DRM_IOCTL_BO_IMPORT_FENCE, &f);
++    }
++    return fail(ENOTTY);
++}
++
++/* ioctls on the DRM node that would make the kernel create a descriptor, or take one */
++static int drm_fd_ioctl(int fd, unsigned long request, void *arg, int *handled)
++{
++    struct xg_efd s;
++    uint32_t h;
++    int nfd;
++
++    *handled = 1;
++    if (request == DRM_IOCTL_PRIME_HANDLE_TO_FD) {
++        struct drm_prime_handle *p = arg;
++
++        if ((nfd = new_efd(XG_DMABUF, fd, p->handle)) < 0)
++            return -1;
++        p->fd = nfd;
++        return 0;
++    }
++    if (request == DRM_IOCTL_PRIME_FD_TO_HANDLE) {
++        struct drm_prime_handle *p = arg;
++
++        if (!lookup(p->fd, &s))
++            return fail(EBADF);
++        if (s.kind != XG_DMABUF || !same_file(s.drm_fd, fd))
++            return fail(EINVAL);
++        p->handle = s.handle;
++        return 0;
++    }
++    if (request == DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD) {
++        struct drm_syncobj_handle *a = arg;
++        int sync_file = (a->flags & DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE) != 0;
++
++        if (syncobj_new(fd, &h) != 0)
++            return -1;
++        if (syncobj_copy(fd, a->handle, a->point, h, 0) != 0 ||
++            (nfd = new_efd(sync_file ? XG_SYNCFILE : XG_SYNCOBJ, fd, h)) < 0) {
++            int err = errno;
++
++            syncobj_destroy(fd, h);
++            return fail(err);
++        }
++        a->fd = nfd;
++        return 0;
++    }
++    if (request == DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE) {
++        struct drm_syncobj_handle *a = arg;
++
++        if (!lookup(a->fd, &s))
++            return fail(EBADF);
++        if (s.kind == XG_DMABUF || !same_file(s.drm_fd, fd))
++            return fail(EINVAL);
++        if (a->flags & DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE)
++            return syncobj_copy(fd, s.handle, 0, a->handle, a->point);
++        if (syncobj_new(fd, &h) != 0)
++            return -1;
++        if (syncobj_copy(fd, s.handle, 0, h, 0) != 0) {
++            int err = errno;
++
++            syncobj_destroy(fd, h);
++            return fail(err);
++        }
++        a->handle = h;
++        return 0;
++    }
++    *handled = 0;
++    return 0;
++}
++
++/* an XeGfx node answers a fence export from GEM handle 0 with ENOENT; other nodes (drm-shim, NullMoth) with ENOTTY */
++static int is_xegfx(int fd)
++{
++    struct xg_drm_bo_fence f = { .flags = 1 };
++    int saved = errno, yes;
++
++    yes = raw_ioctl(fd, XG_DRM_IOCTL_BO_EXPORT_FENCE, &f) != 0 && errno == ENOENT;
++    errno = saved;
++    return yes;
++}
++
++int drmXeGfxIoctl(int fd, unsigned long request, void *arg, int *ret)
++{
++    struct xg_efd e;
++
++    if (lookup(fd, &e)) {
++        *ret = efd_ioctl(&e, request, arg);
++        return 1;
++    }
++    if ((request == DRM_IOCTL_PRIME_HANDLE_TO_FD || request == DRM_IOCTL_PRIME_FD_TO_HANDLE ||
++        request == DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD || request == DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE) && is_xegfx(fd)) {
++        int handled;
++
++        *ret = drm_fd_ioctl(fd, request, arg, &handled);
++        return handled;
++    }
++    return 0;
++}
++#endif
+diff --git a/xf86drm_xegfx.h b/xf86drm_xegfx.h
+new file mode 100644
+index 0000000..64a99e6
+--- /dev/null
++++ b/xf86drm_xegfx.h
+@@ -0,0 +1,12 @@
++/*
++ * SPDX-License-Identifier: MIT
++ * XeGfx (Darwin): drmIoctl() hands every request here first; nonzero means it was answered and *ret holds the
++ * result. See xf86drm_xegfx.c.
++ * <wtl> project: xegfx | author: watchthelight </wtl>
++ */
++#ifndef XF86DRM_XEGFX_H
++#define XF86DRM_XEGFX_H
++#ifdef __APPLE__
++int drmXeGfxIoctl(int fd, unsigned long request, void *arg, int *ret);
++#endif
++#endif

@@ -7,6 +7,7 @@
  * <wtl> project: xegfx | author: watchthelight </wtl>
  */
 #include <linux/list.h>
+#include <linux/pci.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -18,6 +19,7 @@
 #include "gem/i915_gem_mman.h"
 #include "gem/i915_gem_object.h"
 
+#include "xg_drm_sync.h"
 #include "xg_i915.h"
 #include "xg_vm_xnu.h"
 
@@ -222,6 +224,25 @@ xg_map_munmap(void *key, struct xg_drm_munmap *a)
 	return 0;
 }
 
+/* the PCI identity libdrm reads on the BSDs and Darwin to enumerate devices (drmParsePciBusInfo) */
+static int
+xg_pciinfo(struct file *filp, struct drm_pciinfo *pi)
+{
+	struct drm_file *priv = filp->private_data;
+	struct pci_dev *pdev = to_pci_dev(priv->minor->dev->dev);
+
+	pi->domain = pci_domain_nr(pdev->bus);
+	pi->bus = pdev->bus->number;
+	pi->dev = PCI_SLOT(pdev->devfn);
+	pi->func = PCI_FUNC(pdev->devfn);
+	pi->vendor_id = pdev->vendor;
+	pi->device_id = pdev->device;
+	pi->subvendor_id = pdev->subsystem_vendor;
+	pi->subdevice_id = pdev->subsystem_device;
+	pi->revision_id = pdev->revision;
+	return 0;
+}
+
 static int
 xg_map_ioctl(void *lfile, void *key, unsigned long cmd, void *data)
 {
@@ -231,6 +252,10 @@ xg_map_ioctl(void *lfile, void *key, unsigned long cmd, void *data)
 		err = xg_map_mmap(lfile, key, data);
 	else if (cmd == XG_DRM_IOCTL_MUNMAP)
 		err = xg_map_munmap(key, data);
+	else if (cmd == DRM_IOCTL_GET_PCIINFO)
+		err = xg_pciinfo(lfile, data);
+	else if (cmd == XG_DRM_IOCTL_BO_EXPORT_FENCE || cmd == XG_DRM_IOCTL_BO_IMPORT_FENCE)
+		err = xg_drm_bo_fence(((struct file *)lfile)->private_data, cmd == XG_DRM_IOCTL_BO_EXPORT_FENCE, data);
 	else
 		return ENOTTY;	/* not ours: the drm ioctl path gets it */
 	return -err;		/* the shim speaks FreeBSD errno */

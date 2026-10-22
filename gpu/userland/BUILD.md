@@ -120,3 +120,7 @@ Older chips also pass: SKL, BXT, KBL, GLK, CFL, WHL, CML, ICL, EHL, JSL. Total 2
 For 0x7D67 the compute shader really compiles to Xe ISA: `logs/arl-intel-debug-cs.txt` (`INTEL_DEBUG=cs`) shows "SIMD16 shader: 11 instructions ... 2 sends" with the `store.ugm.d32.a32` and EOT sends.
 
 Limits of this proof: the noop shim fakes the **i915** uAPI for every chip (it prints a few unknown query/getparam ids, which ANV tolerates), so LNL, BMG and PTL pass here through ANV's i915 path, while on real hardware they need the xe KMD path. Nothing is submitted to a GPU; this proves the driver loads, picks the device info, creates a device and runs the brw compiler on macOS. It does not exercise the xe uAPI, `drm_mmap` through `NMX_DRM_IOCTL_MMAP`, or a real `/dev/dri` node.
+
+## XeGfx patches (2026-10-22)
+
+On top of NullMoth's two patches, for real XeGfx hardware: `patches/libdrm-xegfx.patch` (adds `xf86drm_xegfx.c`, the dma-buf and sync_file stand-ins, called first from `drmIoctl()`) and `patches/mesa-xegfx.patch` (`intel_ioctl()` through `drmIoctl()`, i915 GEM mappings through `drmNmxMmap`/`drmNmxMunmap` with a fallback to mmap(2) for drm-shim). Apply with `git apply` in `drm/` and `mesa/` after the NullMoth patches, then rerun `build_libdrm.sh` and the Mesa build. The noop drm-shim matrix still passes 28 of 28 chips with both applied.

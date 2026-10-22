@@ -1,0 +1,94 @@
+diff --git a/src/intel/common/intel_gem.h b/src/intel/common/intel_gem.h
+index 5a85ef1..d5d7bed 100644
+--- a/src/intel/common/intel_gem.h
++++ b/src/intel/common/intel_gem.h
+@@ -75,6 +75,11 @@ intel_48b_address(uint64_t v)
+ extern int intel_virtio_ioctl(int fd, unsigned long request, void *arg);
+ #endif
+ 
++#ifdef __APPLE__
++/* libdrm makes the dma-buf and sync_file descriptors an XeGfx kext cannot (xf86drm_xegfx.c) */
++extern int drmIoctl(int fd, unsigned long request, void *arg);
++#endif
++
+ /**
+  * Call ioctl, restarting if it is interrupted
+  */
+@@ -86,6 +91,8 @@ intel_ioctl(int fd, unsigned long request, void *arg)
+     do {
+ #ifdef HAVE_INTEL_VIRTIO
+       ret = intel_virtio_ioctl(fd, request, arg);
++#elif defined(__APPLE__)
++      ret = drmIoctl(fd, request, arg);
+ #else
+       ret = ioctl(fd, request, arg);
+ #endif
+diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
+index ade4a8c..5d4fa12 100644
+--- a/src/intel/vulkan/anv_allocator.c
++++ b/src/intel/vulkan/anv_allocator.c
+@@ -1872,6 +1872,10 @@ anv_device_map_bo(struct anv_device *device,
+    return VK_SUCCESS;
+ }
+ 
++#ifdef __APPLE__
++extern int drmNmxMunmap(void *addr, size_t length);
++#endif
++
+ VkResult
+ anv_device_unmap_bo(struct anv_device *device,
+                     struct anv_bo *bo,
+@@ -1893,6 +1897,10 @@ anv_device_unmap_bo(struct anv_device *device,
+       assert(((uintptr_t)map & (page_size - 1)) == 0);
+    }
+ 
++#ifdef __APPLE__
++   /* the kernel made this mapping through the node's ioctl; let it take it down before anything goes over it */
++   drmNmxMunmap(map, map_size);
++#endif
+    if (replace) {
+       map = mmap(map, map_size, PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+@@ -1902,7 +1910,9 @@ anv_device_unmap_bo(struct anv_device *device,
+       }
+    } else {
+       VG(VALGRIND_FREELIKE_BLOCK(map, 0));
++#ifndef __APPLE__
+       munmap(map, map_size);
++#endif
+    }
+    return VK_SUCCESS;
+ }
+diff --git a/src/intel/vulkan/i915/anv_kmd_backend.c b/src/intel/vulkan/i915/anv_kmd_backend.c
+index d7e4e38..837922c 100644
+--- a/src/intel/vulkan/i915/anv_kmd_backend.c
++++ b/src/intel/vulkan/i915/anv_kmd_backend.c
+@@ -158,6 +158,10 @@ i915_gem_close(struct anv_device *device, struct anv_bo *bo)
+    intel_ioctl(device->fd, DRM_IOCTL_GEM_CLOSE, &close);
+ }
+ 
++#ifdef __APPLE__
++extern void *drmNmxMmap(size_t length, int prot, int flags, int fd, off_t offset);
++#endif
++
+ static void *
+ i915_gem_mmap_offset(struct anv_device *device, struct anv_bo *bo,
+                      uint64_t offset, uint64_t size, uint32_t flags,
+@@ -185,6 +189,17 @@ i915_gem_mmap_offset(struct anv_device *device, struct anv_bo *bo,
+     */
+    void *ptr;
+ 
++#ifdef __APPLE__
++   /* mapped through the node's ioctl (libdrm drmNmxMmap): exactly the range asked for, since part of a kernel-made
++    * mapping cannot be unmapped; placed mappings are not supported */
++   if (placed_addr != NULL)
++      return MAP_FAILED;
++   ptr = drmNmxMmap(align64(size, 4096), PROT_READ | PROT_WRITE, MAP_SHARED, device->fd, gem_mmap.offset + offset);
++   if (ptr == MAP_FAILED)   /* a node that maps with mmap(2), such as drm-shim */
++      ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, device->fd, gem_mmap.offset + offset);
++   return ptr;
++#endif
++
+    if (device->physical->info.is_virtio)
+       ptr = intel_virtio_bo_mmap(device->fd, bo->gem_handle,
+                                  offset + size, placed_addr);
