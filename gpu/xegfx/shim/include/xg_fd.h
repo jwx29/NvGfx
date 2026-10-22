@@ -55,6 +55,10 @@ void	xg_fd_selrecord(struct thread *td, struct selinfo *sip);
 void	xg_fd_selwakeup(struct selinfo *sip);
 #endif
 
+/* GEM map ioctls ('N' group) and their cleanup when a node closes; set by the drm glue, NULL until then */
+extern int (*xg_fd_map_ioctl)(void *lfile, void *key, unsigned long cmd, void *data);
+extern void (*xg_fd_map_close)(void *key);
+
 #ifdef __cplusplus
 }
 #endif

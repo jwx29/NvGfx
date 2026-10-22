@@ -15,7 +15,13 @@ if [ "$MODE" = install ]; then
   rm -rf "$EXT/XeGfx.kext.new"; ditto "$ROOT/out/XeGfx.kext" "$EXT/XeGfx.kext.new"
   chown -R root:wheel "$EXT/XeGfx.kext.new"; chmod -R 755 "$EXT/XeGfx.kext.new"
   rm -rf "$EXT/XeGfx.kext"; mv "$EXT/XeGfx.kext.new" "$EXT/XeGfx.kext"
+  # the userspace probe the guard runs after the stages
+  if [ -f "$ROOT/out/xgprobe" ]; then
+    mkdir -p /usr/local/bin; install -m 755 -o root -g wheel "$ROOT/out/xgprobe" /usr/local/bin/xgprobe.new
+    mv -f /usr/local/bin/xgprobe.new /usr/local/bin/xgprobe
+  fi
 else
+  rm -f /usr/local/bin/xgprobe
   rm -rf "$EXT/XeGfx.kext"
 fi
 NEW="$KC.xegfx-new"; rm -f "$NEW"
