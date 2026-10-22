@@ -21,6 +21,7 @@
 #include <sys/sysctl.h>
 #include <string.h>
 #include "xg_i915.h"
+#include "xg_vmap.h"
 
 extern "C" {
 void xg_start_stage(int stage);
@@ -30,7 +31,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.13", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.14", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -370,6 +371,8 @@ xg_run_stage(int s)
 		rc = xg_probe();
 	} else {
 		xg_start_stage(s);
+		if (s == 1 && xg_vm_vmap_selftest() != 0)
+			rc = -12;	/* the vmap path i915 needs from its first GGTT setup on (N-221) */
 		if (s == 3) {
 			/* every IOPCIDevice into newbus (config reads only), then vgapci on the Intel display function so
 			 * stage 4's drm drivers have a device to probe; the old PCI personality used to trigger this */
