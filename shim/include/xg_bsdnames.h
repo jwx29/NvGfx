@@ -57,4 +57,9 @@
 #define vprintf(...) xg_vprintf(__VA_ARGS__)
 int xg_printf(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
 int xg_vprintf(const char *, __builtin_va_list) __attribute__((__format__(__printf__, 1, 0)));
+/* the same formatter for strings, so Linux's %pV / %pe work everywhere drm formats text (N-226) */
+#define snprintf(...) xg_snprintf(__VA_ARGS__)
+#define vsnprintf(...) xg_vsnprintf(__VA_ARGS__)
+int xg_snprintf(char *, __SIZE_TYPE__, const char *, ...);
+int xg_vsnprintf(char *, __SIZE_TYPE__, const char *, __builtin_va_list);
 #endif
