@@ -16,7 +16,9 @@ On XNU every node is a devfs clone node of one BSD cdevsw (`cdevsw_add(-24, ...)
 `dri/renderD128`) is another devfs node with its parent's slot, so opening it opens the parent.
 
 Each lookup of a clone node calls the clone function, which reserves an instance and returns minor
-`XG_FD_INST_FLAG | instance`. `d_open` on that minor then does what FreeBSD's `devfs_open` does: `falloc_noinstall`,
+`XG_FD_INST_FLAG | instance << 10 | slot` (`XG_FD_INST_MINOR`). The slot stays in the low bits because a `stat` of
+the node and every `fstat` of an open fd report a clone minor, and libdrm on Darwin finds the node by its slot (the
+DRM minor: 0 for `card0`, 128 for `renderD128`). `d_open` on that minor then does what FreeBSD's `devfs_open` does: `falloc_noinstall`,
 set `f_flag` and `f_vnode`, call the cdevsw's `d_fdopen` (LinuxKPI's `linux_dev_fdopen`) or `d_open`. An `ENXIO`
 from `d_fdopen` after it replaced `f_ops` is success, as in `kern_openat`. So every open has its own `struct file`
 and its own `linux_file`, which is what DRM needs for per-open `drm_file` state. `d_close` of the instance drops

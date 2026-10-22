@@ -2,7 +2,7 @@
  * XeGfx kext entry. The module loads idle on IOResources and does nothing until a stage is asked for:
  *   sysctl debug.xegfx_stage=N runs every stage up to N that has not run yet (1 shim, 2 read-only GPU probe,
  *   3 bus and DMA, 4 drm/i915 SYSINITs and a GT health check, 5 one request on every engine,
- *   6 every engine writes a dword the CPU reads back). debug.xegfx_env sets tunables for the stages (overrides boot-args).
+ *   6 every engine writes a dword the CPU reads back, 7 set nmxgpu-claimed for the Metal accelerator). debug.xegfx_env sets tunables for the stages (overrides boot-args).
  * Nothing loads it at boot: its one personality waits for the XeGfxArm resource, which _start publishes after a
  * manual `kmutil load -b org.watchthelight.XeGfx`. There is no PCI personality: the shim finds the GPU in the registry. A stage that runs longer than
  * debug.xegfx_wdog seconds panics on purpose, so a stall becomes a panic report and an automatic reboot.
@@ -31,7 +31,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.22", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.23", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -48,7 +48,7 @@ public:
 static XeGfxResident *gResident;
 static int gStage;	/* highest stage done */
 static int gRunning;	/* stage in progress, 0 when idle */
-static int gResult[7];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
+static int gResult[8];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
 static int gWdog = 60;
 static thread_call_t gWdogCall;
 static thread_call_t gHoldCall;	/* armed around userspace checks: a GPU deadlock there panics too */
@@ -312,6 +312,24 @@ xg_gt_check(void)
 	return rc;
 }
 
+/*
+ * stage 7: hand the GPU to the Metal accelerator (XeGfxAccel, NMXAccel built over XeGfx). Its personality matches
+ * only an IOPCIDevice with nmxgpu-claimed, so nothing matched the live iGPU at boot; registerService re-runs matching
+ * on the nub, which adds the accelerator in its own match category and leaves every existing client alone.
+ */
+static int
+xg_accel_claim(void)
+{
+	IOPCIDevice *gpu = xg_find_pci(0x8086, 0x03, 0x00);
+
+	if (gpu == nullptr)
+		return -19;
+	gpu->setProperty("nmxgpu-claimed", kOSBooleanTrue);
+	gpu->registerService();
+	gpu->release();
+	return 1;
+}
+
 /* stage 5: a kernel request per engine proves GuC submission, the MSI path and the breadcrumb wake together */
 static int
 xg_exec_check(void)
@@ -416,6 +434,8 @@ xg_run_stage(int s)
 		rc = xg_exec_check();
 	if (s == 6)
 		rc = xg_store_check();
+	if (s == 7)
+		rc = xg_accel_claim();
 	if (gWdogCall)
 		thread_call_cancel(gWdogCall);
 	if (gTraceOn) {
@@ -434,7 +454,7 @@ xegfx_stage_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 
 	if (err || !req->newptr)
 		return err;
-	if (v < 0 || v > 6)
+	if (v < 0 || v > 7)
 		return EINVAL;
 	IOLockLock(gStageLock);
 	while (gStage < v) {
@@ -532,7 +552,7 @@ xegfx_hold_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_stage_sysctl,
-    "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec, 6 store)");
+    "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec, 6 store, 7 Metal accelerator)");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
     xegfx_results_sysctl, "S", "per-stage result: 0 not run, 1 pass, negative failure");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
