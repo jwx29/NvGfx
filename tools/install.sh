@@ -10,7 +10,7 @@ die() { echo "xegfx: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
 MODE=${XEGFX_MODE:-install}
 BK=/Library/XeGfx/backup-$(date +%Y%m%d-%H%M%S); mkdir -p "$BK"; [ -f "$KC" ] && cp -p "$KC" "$BK/"
-OLD=$(kmutil inspect -a x86_64 -A "$KC" 2>/dev/null | awk -F'\t' '$1 ~ /^[a-z]+\.[A-Za-z0-9.-]+$/ && $1 !~ /^com\.apple\./ && $1 != "org.watchthelight.XeGfx" && $1 != "org.watchthelight.XeGfxAccel" {print $1}' || true)
+OLD=$(kmutil inspect -a x86_64 -A "$KC" 2>/dev/null | awk -F'\t' '$1 ~ /^[a-z]+\.[A-Za-z0-9.-]+$/ && $1 !~ /^com\.apple\./ && $1 != "org.watchthelight.XeGfx" && $1 != "org.watchthelight.XeGfxAccel" && $1 != "com.nullmoth.NMIntelFB" {print $1}' || true)
 # the Metal accelerator over XeGfx (build/nvgfx/build_nvaccel.sh xegfxaccel) and ANV for the NvGfx plugin; both optional
 ACC=${XEGFX_ACCEL:-$HOME/src/NvGfx-build/kexts/XeGfxAccel/26/XeGfxAccel.kext}
 [ -n "${SUDO_USER:-}" ] && ACC=${XEGFX_ACCEL:-$(eval echo "~$SUDO_USER")/src/NvGfx-build/kexts/XeGfxAccel/26/XeGfxAccel.kext}
@@ -19,6 +19,13 @@ if [ "$MODE" = install ]; then
   rm -rf "$EXT/XeGfx.kext.new"; ditto "$ROOT/out/XeGfx.kext" "$EXT/XeGfx.kext.new"
   chown -R root:wheel "$EXT/XeGfx.kext.new"; chmod -R 755 "$EXT/XeGfx.kext.new"
   rm -rf "$EXT/XeGfx.kext"; mv "$EXT/XeGfx.kext.new" "$EXT/XeGfx.kext"
+  # NMIntelFB takes the built-in panel at boot so the accelerator above can drive it (X6); optional
+  IFB=${XEGFX_INTELFB:-$(dirname "$(dirname "$(dirname "$ACC")")")/NMIntelFB/NMIntelFB.kext}
+  if [ -d "$IFB" ]; then
+    rm -rf "$EXT/NMIntelFB.kext.new"; ditto "$IFB" "$EXT/NMIntelFB.kext.new"
+    chown -R root:wheel "$EXT/NMIntelFB.kext.new"; chmod -R 755 "$EXT/NMIntelFB.kext.new"
+    rm -rf "$EXT/NMIntelFB.kext"; mv "$EXT/NMIntelFB.kext.new" "$EXT/NMIntelFB.kext"
+  fi
   if [ -d "$ACC" ]; then
     rm -rf "$EXT/XeGfxAccel.kext.new"; ditto "$ACC" "$EXT/XeGfxAccel.kext.new"
     chown -R root:wheel "$EXT/XeGfxAccel.kext.new"; chmod -R 755 "$EXT/XeGfxAccel.kext.new"
@@ -42,7 +49,7 @@ if [ "$MODE" = install ]; then
   fi
 else
   rm -f /usr/local/bin/xgprobe "$GB/libvulkan_intel.dylib" "$GB/libdrm.2.dylib" "$GB/intel_icd.json"
-  rm -rf "$EXT/XeGfx.kext" "$EXT/XeGfxAccel.kext"
+  rm -rf "$EXT/XeGfx.kext" "$EXT/XeGfxAccel.kext" "$EXT/NMIntelFB.kext"
 fi
 NEW="$KC.xegfx-new"; rm -f "$NEW"
 kmutil create -n aux --volume-root / "${KARG[@]}" -B $KB -S $KS --repository "$EXT" -A "$NEW" -z > "$BK/kmutil.log" 2>&1 \
