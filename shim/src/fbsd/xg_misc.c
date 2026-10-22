@@ -1402,8 +1402,8 @@ firmware_get_flags(const char *imagename, uint32_t flags)
 	error = xg_misc_fw_request(imagename, &data, &len, XG_FW_TIMEOUT_MS);
 	if (error) {
 		sx_xunlock(&xg_fw_lock);
-		if ((flags & FIRMWARE_GET_NOWARN) == 0)
-			printf("xegfx: could not load firmware image %s, error %d\n", imagename, error);
+		/* LinuxKPI always asks with NOWARN, which hid N-228's failure; one line per name is cheap */
+		printf("xegfx: could not load firmware image %s, error %d\n", imagename, error);
 		return (NULL);
 	}
 	f = malloc(sizeof(*f) + strlen(imagename) + 1, M_XGMISC, M_WAITOK | M_ZERO);
