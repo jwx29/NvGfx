@@ -9,9 +9,18 @@
 #include <libkern/OSAtomic.h>
 #include <kern/clock.h>
 #include <sys/errno.h>
+#include <string.h>
 #include "xg_misc.h"
 
 #define XG_KEXT_ID	"org.watchthelight.XeGfx"
+
+/* images linked into the binary (tools/link.sh, xg_fwblob.S); OSKextRequestResource failed for an AuxKC kext (N-228) */
+struct xg_fw_blob {
+	const char	*name;
+	const void	*data;
+	uint64_t	len;
+};
+extern "C" const xg_fw_blob xg_fw_embedded[];
 
 /* shared by the waiter and the callback; whoever drops the last reference frees it, so a late callback after a
  * timeout never touches freed memory */
@@ -71,6 +80,15 @@ xg_misc_fw_request(const char *name, void **datap, unsigned long *lenp, unsigned
 
 	*datap = nullptr;
 	*lenp = 0;
+	for (const xg_fw_blob *b = xg_fw_embedded; b->name != nullptr; b++) {
+		if (strcmp(b->name, name) != 0)
+			continue;
+		if ((*datap = IOMalloc(b->len)) == nullptr)
+			return (ENOMEM);
+		memcpy(*datap, b->data, b->len);
+		*lenp = b->len;
+		return (0);
+	}
 	r = (xg_fw_req *)IOMallocZero(sizeof(*r));
 	if (r == nullptr)
 		return (ENOMEM);
