@@ -28,7 +28,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.11", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.12", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -48,6 +48,8 @@ static int gRunning;	/* stage in progress, 0 when idle */
 static int gResult[7];	/* per stage: 0 not run, 1 pass, negative errno-style failure */
 static int gWdog = 60;
 static thread_call_t gWdogCall;
+static thread_call_t gHoldCall;	/* armed around userspace checks: a GPU deadlock there panics too */
+static int gHold;
 static IOLock *gStageLock;
 static uint64_t gSurfPte;
 static bool gPipeLit;	/* pipe A was scanning out at probe time (Hybrid); in Discrete mode the NVIDIA GPU has the panel */
@@ -397,6 +399,32 @@ xegfx_results_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 	return SYSCTL_OUT(req, gResult, sizeof(gResult));
 }
 
+static void
+xg_hold_fire(thread_call_param_t, thread_call_param_t)
+{
+	panic("XeGfx: a userspace check did not finish in %d s", gHold);
+}
+
+/* write N > 0 to panic unless 0 is written within N seconds; the guard brackets its post command with it */
+static int
+xegfx_hold_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	int v = gHold, err = sysctl_handle_int(nullptr, &v, 0, req);
+
+	if (err || !req->newptr)
+		return err;
+	if (v < 0)
+		return EINVAL;
+	thread_call_cancel(gHoldCall);
+	gHold = v;
+	if (v > 0) {
+		uint64_t dl;
+		clock_interval_to_deadline((uint32_t)v, NSEC_PER_SEC, &dl);
+		thread_call_enter_delayed(gHoldCall, dl);
+	}
+	return 0;
+}
+
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_stage_sysctl,
     "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec, 6 store)");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
@@ -404,6 +432,8 @@ SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFL
 SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_progress, CTLFLAG_RD | CTLFLAG_LOCKED, &xg_progress, 0, "last breadcrumb");
 SYSCTL_INT(_debug, OID_AUTO, xegfx_wdog, CTLFLAG_RW | CTLFLAG_LOCKED, &gWdog, 0, "stage stall panic, seconds");
+SYSCTL_PROC(_debug, OID_AUTO, xegfx_hold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_hold_sysctl,
+    "I", "panic unless reset to 0 within this many seconds (0 disarms)");
 static int xegfx_log_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *);
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_log, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_log_sysctl,
     "S", "the shim's console output (last 256 KiB)");
@@ -413,6 +443,7 @@ SYSCTL_STRING(_debug, OID_AUTO, xegfx_env, CTLFLAG_RW | CTLFLAG_LOCKED, xg_env, 
 static struct sysctl_oid *const gOids[] = {
 	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_running,
 	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env, &sysctl__debug_xegfx_log,
+	&sysctl__debug_xegfx_hold,
 };
 
 extern "C" int
@@ -481,7 +512,8 @@ _start(kmod_info_t *, void *)
 	gLogLock = IOSimpleLockAlloc();
 	gSnapLock = IOLockAlloc();
 	gWdogCall = thread_call_allocate(xg_wdog_fire, nullptr);
-	if (!gStageLock || !gWdogCall || !gLogLock || !gSnapLock)
+	gHoldCall = thread_call_allocate(xg_hold_fire, nullptr);
+	if (!gStageLock || !gWdogCall || !gHoldCall || !gLogLock || !gSnapLock)
 		return KERN_FAILURE;
 	/* i915 stays off the display until NMIntelFB owns it; the guard can override per experiment */
 	strlcpy(xg_env, "compat.linuxkpi.i915_disable_display=1", sizeof(xg_env));
@@ -499,6 +531,8 @@ _stop(kmod_info_t *, void *)
 	for (auto *o : gOids)
 		sysctl_unregister_oid(o);
 	thread_call_free(gWdogCall);
+	thread_call_cancel(gHoldCall);
+	thread_call_free(gHoldCall);
 	IOLockFree(gStageLock);
 	IOSimpleLockFree(gLogLock);
 	IOLockFree(gSnapLock);

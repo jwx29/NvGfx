@@ -53,7 +53,15 @@ Stage 5 is the first time the GPU does work. For every engine i915 exposes, `xg_
 
 XNU does not let a kext implement mmap(2) on a device node. Userspace maps GEM objects through two ioctls on the DRM node instead, with the layout and numbers of NullMoth's Darwin libdrm patch, so that libdrm and Mesa work unchanged: `'N' 0x40` takes the fake offset from `DRM_IOCTL_I915_GEM_MMAP_OFFSET` and returns an address in the caller, and `'N' 0x41` removes the mapping. The shim's ioctl path hands group `'N'` to a hook (`xg_fd_map_ioctl`) that stage 4 installs; the i915 side (`gpu/xkpi/src/i915/xg_i915_map.c`) looks the offset up the way `i915_gem_mmap()` does, pins the object's pages and maps them into the calling task with `IOMemoryDescriptor` (`xg_vm_x_map_user`). The pin and an object reference are held until the mapping goes away, because nothing can revoke a mapping that IOKit made. WB, WC and UC work; the GTT type is refused. One difference from mmap(2): closing the node removes its mappings.
 
+Around a userspace check, `debug.xegfx_hold=N` arms a second watchdog that panics unless it is reset to 0 within N seconds, so a GPU deadlock in a test program also ends as a panic report and a reboot.
+
 `tools/xgprobe.c` is the first client: it opens the render node, reads the DRM version and i915 params, queries the engines, creates a context and, on every legacy ring, runs a softpinned batch that stores a dword into a second buffer, both mapped through the ioctl. i915 refuses pread, pwrite and relocations after Tiger Lake, so the mapping is the only way to get a batch to the GPU.
+
+## Fences without file descriptors
+
+Mesa ANV will not start unless the kernel can export a buffer as a dma-buf and move fences in and out of it as sync_file descriptors, and Vulkan semaphores are passed around as sync_file descriptors too. A kext cannot create file descriptors. So the descriptors are made in userspace, inside libdrm's `drmIoctl()` (`gpu/userland/patches/libdrm-xegfx.patch` in NvGfx): a stand-in is the read end of a pipe, remembered with its inode so a recycled number is noticed. A dma-buf stands for a GEM handle on its DRM file; a sync_file stands for a syncobj. Two more node ioctls do the kernel half: `'N' 0x42` replaces a syncobj's fence with the buffer's pending fences, `'N' 0x43` adds a syncobj's fence to the buffer, with the same rules as Linux's `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and `IMPORT_SYNC_FILE` (`gpu/xkpi/src/i915/xg_drm_sync.c`). Syncobj to sync_file and back is a `SYNCOBJ_TRANSFER` into a fresh syncobj. The layer only takes over a node that answers `'N' 0x42` the XeGfx way, so drm-shim and other nodes behave as before. What it cannot do yet: share a stand-in between DRM files or processes, make `poll()` wait on a sync_file, or merge sync_files.
+
+The node also answers `DRM_IOCTL_GET_PCIINFO`, which libdrm uses on the BSDs and Darwin to enumerate devices; drm-kmod declares it but leaves it out. Mesa's own changes (`mesa-xegfx.patch`) route `intel_ioctl()` through `drmIoctl()` and map buffers through the node's ioctl instead of mmap(2).
 
 ## The firmware's console image
 
