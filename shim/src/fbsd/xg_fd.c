@@ -872,9 +872,42 @@ struct xg_fd_inst {
 	int		xi_pid;		/* opener, owner of the private table */
 	struct xg_fd_cdev *xi_cdev;
 	struct file	*xi_fp;
+	int		xi_stamp;	/* ticks when a lookup reserved it */
+	u_int		xi_orphans;	/* recycled lookups whose devfs FREE has not come yet */
 };
 static struct xg_fd_inst xg_fd_insts[XG_FD_NINST];
 static int xg_fd_inst_next;
+
+/*
+ * Every lookup of a clone node (stat as well as open) reserves an instance, and devfs gives it back only when the
+ * vnode is reclaimed, which can take hours: N-238 held 662 after 25 minutes, and N-236's /dev/dri hang followed the
+ * old 512 running out. open() opens the node its own lookup just made, so a reservation that has waited 5 s will
+ * never be opened: when free instances run low, those go back to the pool. Called with the lock held.
+ */
+static u_int xg_fd_inst_allocs, xg_fd_inst_recycled;
+
+static void
+xg_fd_inst_recycle(void)
+{
+	int i, nfree = 0;
+
+	for (i = 0; i < XG_FD_NINST; i++)
+		nfree += xg_fd_insts[i].xi_state == XI_FREE;
+	if (nfree >= XG_FD_NINST / 4)
+		return;
+	for (i = 0; i < XG_FD_NINST; i++) {
+		struct xg_fd_inst *xi = &xg_fd_insts[i];
+
+		/* the last reference of a cdev being destroyed is freed outside the lock, by the normal path */
+		if (xi->xi_state != XI_LOOKUP || ticks - xi->xi_stamp < 5 * hz || xi->xi_cdev->xc_refs <= 1)
+			continue;
+		xi->xi_state = XI_FREE;
+		xi->xi_orphans++;
+		xi->xi_cdev->xc_refs--;
+		xi->xi_cdev = NULL;
+		xg_fd_inst_recycled++;
+	}
+}
 
 int
 xg_fd_inst_alloc(int slot)
@@ -895,13 +928,23 @@ xg_fd_inst_alloc(int slot)
 		if (xg_fd_insts[i].xi_state == XI_FREE)
 			break;
 	}
+	if (n == XG_FD_NINST || ++xg_fd_inst_allocs % 256 == 0)
+		xg_fd_inst_recycle();
 	if (n == XG_FD_NINST) {
-		xg_fd_unlock();
-		return (-1);
+		for (n = 0; n < XG_FD_NINST; n++) {
+			i = (xg_fd_inst_next + n) % XG_FD_NINST;
+			if (xg_fd_insts[i].xi_state == XI_FREE)
+				break;
+		}
+		if (n == XG_FD_NINST) {
+			xg_fd_unlock();
+			return (-1);
+		}
 	}
 	xg_fd_inst_next = (i + 1) % XG_FD_NINST;
 	xg_fd_insts[i].xi_state = XI_LOOKUP;
 	xg_fd_insts[i].xi_cdev = xc;
+	xg_fd_insts[i].xi_stamp = ticks;
 	xc->xc_refs++;
 	xg_fd_unlock();
 	return (i);
@@ -920,8 +963,8 @@ xg_fd_diag(char *buf, unsigned long len)
 	used = XG_FD_NINST - st[XI_FREE];
 	if (used > (int)xg_fd_lock_peak)
 		xg_fd_lock_peak = used;
-	snprintf(buf, len, "free %d lookup %d opening %d open %d peak %u of %d; lock %s%s%s %lld ticks",
-	    st[XI_FREE], st[XI_LOOKUP], st[XI_OPENING], st[XI_OPEN], xg_fd_lock_peak, XG_FD_NINST,
+	snprintf(buf, len, "free %d lookup %d opening %d open %d peak %u of %d recycled %u; lock %s%s%s %lld ticks",
+	    st[XI_FREE], st[XI_LOOKUP], st[XI_OPENING], st[XI_OPEN], xg_fd_lock_peak, XG_FD_NINST, xg_fd_inst_recycled,
 	    owner ? "held at " : "free", owner && where ? where : "", owner ? " for" : "",
 	    owner ? (long long)(ticks - xg_fd_lock_since) : 0LL);
 }
@@ -936,6 +979,12 @@ xg_fd_inst_free(int inst)
 		return;
 	xi = &xg_fd_insts[inst];
 	xg_fd_lock();
+	/* devfs's FREE for a reservation already recycled: the instance may belong to someone else now */
+	if (xi->xi_orphans > 0) {
+		xi->xi_orphans--;
+		xg_fd_unlock();
+		return;
+	}
 	/* only a lookup that was never opened; an open instance is freed by its close */
 	if (xi->xi_state == XI_LOOKUP) {
 		xc = xi->xi_cdev;

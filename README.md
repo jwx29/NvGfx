@@ -40,7 +40,7 @@ XeGfx is built on other people's work. Thanks to all of them.
 
 ## Status (2026-10-22)
 
-Work in progress. The Intel GPU runs real work for the kernel and for user processes, and Vulkan draws offscreen, but nothing is on screen yet: WindowServer still composites on the NVIDIA GPU, and there is no Metal on the Intel GPU so far.
+Work in progress. The Intel GPU runs real work for the kernel and for user processes, Vulkan draws offscreen, and Metal now runs on it too: apps get a Metal device on the Intel GPU, and Metal compute and Metal drawing come back correct. Nothing is on screen through it yet. In Hybrid mode WindowServer still draws the desktop without acceleration into the firmware framebuffer.
 
 Everything below was proven on one machine: a Lenovo Legion 5 15IAX10 with an Intel Core Ultra 9 275HX (Arrow Lake-HX). Its integrated graphics are Xe-LPG, PCI ID `8086:7D67` (GMD_ID graphics 12.70, display 14), which i915 treats as part of the Meteor Lake family. It runs macOS Tahoe 26.7.1 (25G241) with the BIOS in Hybrid graphics mode. The boot IDs (N-xx) are test boots on that laptop.
 
@@ -51,6 +51,7 @@ Everything below was proven on one machine: a Lenovo Legion 5 15IAX10 with an In
 | X3 loads | loads next to the firmware framebuffer and probes the GPU | done, N-219 |
 | X4 GT up | GuC loaded, a request completes, render node exists | done, N-229 |
 | X5 ANV | a Vulkan device, a compute pipeline and an offscreen draw | done, N-234 (2026-10-22) |
+| X5b Metal | apps get a Metal device on the Intel GPU; compute and a draw come back right | done, N-235 to N-238 (2026-10-22) |
 | X6 desktop | WindowServer composites on the Intel GPU and the Intel GPU shows it | not yet |
 | X7 other laptops | builds and boots on other Xe machines, with docs | testers wanted |
 
@@ -61,7 +62,9 @@ What each step showed on the 7D67:
 - **libdrm (N-233).** `drmGetDevices2` lists the GPU as `0000:00:02.0 8086:7d67`, driver i915 1.6.0.
 - **Vulkan through Mesa ANV (N-234).** ANV creates a Vulkan 1.4 device (API 1.4.363), "Intel(R) Graphics (ARL)", and a compute pipeline on it. Right after that boot, a draw test (`tools/vkdraw` on NvGfx `xe`, commit `9c9cbc3`) cleared a 64x64 image to red in a render pass, drew a green triangle into it (exactly 512 green pixels), copied the image to a host buffer, and the CPU read back the right pixels.
 
-Next is Metal on the Intel GPU: an IOAccelerator over XeGfx in the style of NMXAccel, then the NvGfx Metal plugin on ANV. After that comes the desktop.
+- **Metal (N-235 to N-238).** XeGfx's stage 7 hands the GPU to XeGfxAccel, the NMXAccel accelerator from NvGfx built over XeGfx (`build/nvgfx/build_nvaccel.sh xegfxaccel` on NvGfx `xe`). The NvGfx Metal plugin then runs on ANV. Metal shows one device, "Intel(R) Graphics (ARL)". An MSL compute kernel fills 1024 values correctly, and a render pipeline draws a green triangle on red that reads back exactly. Getting there took three fixes. Render nodes are world-accessible, as on Linux. GFP_ATOMIC allocations get a reserve, because i915 allocates under spinlocks. Host-visible BOs use the GPU's snooping write-back PAT, because XNU keeps RAM write-back whatever cache mode an IOKit mapping asks for, and write-combining BOs lost cache lines to CPU write-backs.
+
+Next is the desktop: WindowServer compositing on the Intel GPU through this Metal device and the panel scanned out from it.
 
 The current build is the [v0.0.22 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.22) (XeGfx commit `dac3979`, with the libdrm patch `gpu/userland/patches/libdrm-xegfx.patch` from NvGfx `xe` commit `b020742`). It is a test build for people who want to help, not something to install on a machine you depend on.
 
