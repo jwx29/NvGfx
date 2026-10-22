@@ -38,17 +38,22 @@ XeGfx is built on other people's work. Thanks to all of them.
 | [openbsd/src](https://github.com/openbsd/src) inteldrm | attaching i915 in stages and deferring the heavy probe |
 | [acidanthera/WhateverGreen](https://github.com/acidanthera/WhateverGreen) and [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | the Intel framebuffer background every Hackintosh graphics project builds on |
 
-## Status (2026-10-21)
+## Status (2026-10-22)
 
-Work in progress. XeGfx has not driven a GPU yet. The approach itself is proven on real hardware: [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) runs an i915-derived driver on XNU with Metal and Vulkan working on a Dell Latitude 5350 under macOS 15. XeGfx targets Tahoe with its own LinuxKPI shim, so treat every milestone below as open until a boot proves it here.
+Work in progress, but the GPU runs work now. On the Legion's Arc iGPU (`8086:7D67`) under macOS Tahoe 26.7.1, XeGfx
+0.0.22 loads the GuC (70.53.0), submits through it on every engine, serves a render node to user processes, and
+Mesa's ANV driver creates a Vulkan 1.4 device and a compute pipeline on it (boot N-234, 2026-10-22). Nothing is drawn
+yet and WindowServer still composites on the NVIDIA GPU. [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics)
+runs an i915-derived driver on XNU with Metal and Vulkan on a Dell Latitude 5350 under macOS 15; XeGfx does the same
+on Tahoe with its own LinuxKPI shim.
 
 | M | Done when | State |
 |---|---|---|
 | X1 compiles | every drm core and i915 source compiles for the kernel target | done (418 of 418) |
 | X2 links | one kext links against public KPIs only, no stubs on reachable paths | done |
-| X3 loads | loads next to the firmware framebuffer and probes the GPU read-only | built, first hardware test queued |
-| X4 GT up | GuC loaded, a request completes, render node exists | next |
-| X5 ANV | Vulkan device enumerates, compute and an offscreen draw pass | ANV builds; needs X4 |
+| X3 loads | loads next to the firmware framebuffer and probes the GPU read-only | done (N-219) |
+| X4 GT up | GuC loaded, a request completes, render node exists | done (N-229: GuC 70.53, rcs0/bcs0/ccs0 execute and store) |
+| X5 ANV | Vulkan device enumerates, compute and an offscreen draw pass | device and compute pipeline done (N-234); draw next |
 | X6 desktop | WindowServer composites on the Intel GPU and flips through PLANE_SURF | |
 | X7 others | builds and boots on other Xe laptops, with docs | testers wanted |
 
