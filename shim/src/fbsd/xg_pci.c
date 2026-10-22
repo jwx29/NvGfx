@@ -3237,7 +3237,8 @@ xg_newbus_dump(void)
 	}
 }
 
-/* 1 when a drm driver (i915kms or xe) is attached to some device; stage 4 fails without one */
+/* 1 when a drm driver is attached to some device; stage 4 fails without one. drm-kmod's i915 and xe attach as the
+ * newbus driver "drmn" under vgapci (N-225 was a false -19), older builds used their own names */
 int
 xg_drm_attached(void)
 {
@@ -3245,7 +3246,8 @@ xg_drm_attached(void)
 
 	TAILQ_FOREACH(d, &xg_pci_devices, devlink)
 		if (d->state == DS_ATTACHED && d->driver != NULL &&
-		    (strncmp(d->driver->name, "i915", 4) == 0 || strncmp(d->driver->name, "xe", 2) == 0))
+		    (strcmp(d->driver->name, "drmn") == 0 || strncmp(d->driver->name, "i915", 4) == 0 ||
+		    strncmp(d->driver->name, "xe", 2) == 0))
 			return (1);
 	return (0);
 }

@@ -31,7 +31,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.16", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.17", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -65,6 +65,18 @@ static int gTraceProgress;
 static void xg_trace_write(void);
 
 /* strstr is not in the public kext KPIs */
+/* strstr is not in the public kext KPIs */
+static const char *
+strstr_kpi(const char *h, const char *n)
+{
+	size_t l = strlen(n);
+
+	for (; *h; h++)
+		if (strncmp(h, n, l) == 0)
+			return h;
+	return nullptr;
+}
+
 static bool
 xg_env_has(const char *kv)
 {
@@ -540,6 +552,78 @@ static struct sysctl_oid *const gOids[] = {
 	&sysctl__debug_xegfx_hold,
 };
 
+/* Linux's struct va_format, the argument of "%pV" */
+struct xg_va_format {
+	const char	*fmt;
+	va_list		*va;
+};
+
+/*
+ * vsnprintf that also expands Linux's "%pV" (a nested format and its va_list), which neither XNU's nor FreeBSD's
+ * printf knows; drm prints most of its messages through it (N-225 logged "MCR Steering: 0x...V"). Every other
+ * conversion goes to vsnprintf one at a time with its argument taken at the right width.
+ */
+static int
+xg_fmt(char *out, size_t len, const char *fmt, va_list *ap)
+{
+	size_t o = 0;
+
+	if (!strstr_kpi(fmt, "%pV"))
+		return vsnprintf(out, len, fmt, *ap);
+	for (const char *p = fmt; *p && o + 1 < len; ) {
+		if (*p != '%') {
+			out[o++] = *p++;
+			continue;
+		}
+		const char *q = p + 1;
+		char spec[32];
+		int lng = 0, n = 0;
+
+		while (*q && strchr("-+ #0", *q))
+			q++;
+		while (*q == '*' || (*q >= '0' && *q <= '9') || *q == '.')
+			q++;
+		while (*q && strchr("hlqjzt", *q)) {
+			if (*q == 'l' || *q == 'q' || *q == 'j' || *q == 'z' || *q == 't')
+				lng++;
+			q++;
+		}
+		if (!*q)
+			break;
+		if (q[0] == 'p' && q[1] == 'V') {
+			struct xg_va_format *vf = va_arg(*ap, struct xg_va_format *);
+			va_list inner;
+			va_copy(inner, *vf->va);
+			n = xg_fmt(out + o, len - o, vf->fmt, &inner);
+			va_end(inner);
+			p = q + 2;
+		} else {
+			size_t sl = MIN((size_t)(q - p + 1), sizeof(spec) - 1);
+			memcpy(spec, p, sl);
+			spec[sl] = 0;
+			if (strchr(spec, '*'))	/* width or precision from the arguments: rare in drm, print it plainly */
+				n = snprintf(out + o, len - o, "%s", spec);
+			else if (*q == '%')
+				n = snprintf(out + o, len - o, "%%");
+			else if (*q == 's')
+				n = snprintf(out + o, len - o, spec, va_arg(*ap, const char *));
+			else if (*q == 'p')
+				n = snprintf(out + o, len - o, spec, va_arg(*ap, void *));
+			else if (*q == 'c')
+				n = snprintf(out + o, len - o, spec, va_arg(*ap, int));
+			else if (lng)
+				n = snprintf(out + o, len - o, spec, va_arg(*ap, long long));
+			else
+				n = snprintf(out + o, len - o, spec, va_arg(*ap, int));
+			p = q + 1;
+		}
+		if (n > 0)
+			o = MIN(o + (size_t)n, len - 1);
+	}
+	out[o] = 0;
+	return (int)o;
+}
+
 extern "C" int
 xg_vprintf(const char *fmt, va_list ap)
 {
@@ -548,7 +632,7 @@ xg_vprintf(const char *fmt, va_list ap)
 	int n;
 
 	va_copy(aq, ap);
-	n = vsnprintf(buf, sizeof(buf), fmt, aq);
+	n = xg_fmt(buf, sizeof(buf), fmt, &aq);
 	va_end(aq);
 	if (gLogLock && n > 0) {
 		size_t l = MIN((size_t)n, sizeof(buf) - 1);
@@ -573,7 +657,7 @@ xg_vprintf(const char *fmt, va_list ap)
 		}
 		IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
 	}
-	return vprintf(fmt, ap);
+	return printf("%s", buf);
 }
 
 extern "C" int
