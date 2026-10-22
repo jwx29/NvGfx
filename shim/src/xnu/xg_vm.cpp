@@ -93,9 +93,33 @@ xg_vm_x_map_phys(unsigned long long pa, unsigned long long size, int cache, void
 	return xg_vm_xnew(md, map);
 }
 
+static xg_vm_xmem_t
+xg_vm_map_ranges(task_t task, const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache,
+    int writable, unsigned long long *addr);
+
 extern "C" xg_vm_xmem_t
 xg_vm_x_map_user(const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache, int writable,
     unsigned long long *uaddr)
+{
+	/* the ioctl runs on the caller's thread, so current_task() is the process that asked */
+	return xg_vm_map_ranges(current_task(), pa, len, n, cache, writable, uaddr);
+}
+
+/* a kernel mapping at an address IOKit picks; overlaying a reserved range (xg_vm_x_map_at) fails inside the pageable
+ * submaps that back kva_alloc (N-221) */
+extern "C" xg_vm_xmem_t
+xg_vm_x_map_kernel(const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache, void **kva)
+{
+	unsigned long long a;
+	xg_vm_xmem_t xm = xg_vm_map_ranges(kernel_task, pa, len, n, cache, 1, &a);
+
+	*kva = xm ? (void *)a : nullptr;
+	return xm;
+}
+
+static xg_vm_xmem_t
+xg_vm_map_ranges(task_t task, const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache,
+    int writable, unsigned long long *addr)
 {
 	IOAddressRange *r;
 	IOMemoryDescriptor *md;
@@ -114,14 +138,13 @@ xg_vm_x_map_user(const unsigned long long *pa, const unsigned long long *len, un
 	IOFree(r, n * sizeof(*r));
 	if (md == nullptr)
 		return nullptr;
-	/* the ioctl runs on the caller's thread, so current_task() is the process that asked */
-	map = md->createMappingInTask(current_task(), 0, kIOMapAnywhere | xg_vm_cacheopt(cache) |
-	    (writable ? 0 : kIOMapReadOnly), 0, size);
+	map = md->createMappingInTask(task, 0, kIOMapAnywhere | xg_vm_cacheopt(cache) | (writable ? 0 : kIOMapReadOnly),
+	    0, size);
 	if (map == nullptr) {
 		md->release();
 		return nullptr;
 	}
-	*uaddr = map->getAddress();
+	*addr = map->getAddress();
 	return xg_vm_xnew(md, map);
 }
 
