@@ -59,6 +59,25 @@ index ade4a8c..5d4fa12 100644
     }
     return VK_SUCCESS;
  }
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index 0addc9c..72f43b7 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -2572,6 +2572,14 @@ anv_device_get_pat_entry(struct anv_device *device,
+    if (alloc_flags & ANV_BO_ALLOC_IMPORTED)
+       return &device->info->pat.cached_coherent;
+ 
++#ifdef __APPLE__
++   /* XeGfx maps BOs into processes through IOKit, and XNU keeps ordinary RAM write-back whatever cache mode the
++    * mapping asks for: a write-combining BO is then cached by the CPU while the GPU writes around it, and dirty
++    * lines land on top of GPU results (XeGfx N-238, vkcoh: 20-33% of 64-byte lines lost). The snooping write-back
++    * entry keeps every host-visible BO coherent instead. Nothing scans out from ANV memory on macOS yet. */
++   if (!anv_physical_device_has_vram(device->physical))
++      return &device->info->pat.cached_coherent;
++#endif
+    if (alloc_flags & (ANV_BO_ALLOC_EXTERNAL | ANV_BO_ALLOC_SCANOUT))
+       return &device->info->pat.scanout;
+ 
 diff --git a/src/intel/vulkan/i915/anv_kmd_backend.c b/src/intel/vulkan/i915/anv_kmd_backend.c
 index d7e4e38..837922c 100644
 --- a/src/intel/vulkan/i915/anv_kmd_backend.c
@@ -92,3 +111,29 @@ index d7e4e38..837922c 100644
     if (device->physical->info.is_virtio)
        ptr = intel_virtio_bo_mmap(device->fd, bo->gem_handle,
                                   offset + size, placed_addr);
+diff --git a/src/util/anon_file.c b/src/util/anon_file.c
+index 0cb6cfa..319e36a 100644
+--- a/src/util/anon_file.c
++++ b/src/util/anon_file.c
+@@ -203,6 +203,21 @@ os_create_anonymous_file(int64_t size, const char *debug_name)
+    fd = shm_mkstemp(template);
+    if (fd != -1)
+       shm_unlink(template);
++#elif defined(__APPLE__)
++   /* the per-user temp dir, not /tmp/xdg-runtime-mesa-<uid>: processes of several users (and set-uid ones) share
++    * /tmp, and a directory one of them made refuses the others (XeGfx N-238); shm_open objects can be sized once
++    * only, and ANV grows its state table with ftruncate, so this stays a real, already unlinked file */
++   {
++      char dir[PATH_MAX - 32];
++      size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
++      char *name = NULL;
++
++      if (n > 0 && n < sizeof(dir) &&
++          asprintf(&name, "%smesa-shared-%s-XXXXXX", dir, debug_name ? debug_name : "anon") > 0 && name) {
++         fd = create_tmpfile_cloexec(name);
++         free(name);
++      }
++   }
+ #endif
+ 
+     /*
