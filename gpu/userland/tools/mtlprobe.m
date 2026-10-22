@@ -57,6 +57,15 @@ int main(void)
             bad += v[i] != i * 3u + 0x58670000u;
         printf("  values: [0]=0x%08x [1023]=0x%08x, %lu of %lu wrong\n", v[0], v[n - 1], (unsigned long)bad,
                (unsigned long)n);
+        // wrong runs: a 16-value (64-byte) granularity points at CPU cache lines, not at missing threads
+        for (NSUInteger i = 0, shown = 0; i < n && shown < 12; i++) {
+            if (v[i] == i * 3u + 0x58670000u) continue;
+            NSUInteger j = i;
+            while (j + 1 < n && v[j + 1] != (j + 1) * 3u + 0x58670000u) j++;
+            printf("    wrong [%lu..%lu] (%lu values, byte offset 0x%lx): first 0x%08x\n", (unsigned long)i,
+                   (unsigned long)j, (unsigned long)(j - i + 1), (unsigned long)(i * 4), v[i]);
+            i = j; shown++;
+        }
         printf("metal compute: %s\n", bad == 0 && cb.status == MTLCommandBufferStatusCompleted ? "OK" : "WRONG");
         return bad == 0 ? 0 : 4;
     }
