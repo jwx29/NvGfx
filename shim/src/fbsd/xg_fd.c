@@ -51,8 +51,15 @@ static struct mtx xg_fd_mtx;
 static volatile u_int xg_fd_mtx_state;
 static volatile u_int xg_fd_openfiles;
 
+/* who holds xg_fd_mtx, for debug.xegfx_fd when something blocks under a /dev/dri lookup (N-236) */
+static void *volatile xg_fd_lock_owner;
+static const char *volatile xg_fd_lock_where;
+static volatile uint64_t xg_fd_lock_since;
+static volatile u_int xg_fd_lock_peak;
+
+#define	xg_fd_lock()	xg_fd_lock_at(__func__)
 static void
-xg_fd_lock(void)
+xg_fd_lock_at(const char *where)
 {
 	/* lazy init: make_dev can run before any SYSINIT */
 	if (__predict_false(atomic_load_acq_int(&xg_fd_mtx_state) != 2)) {
@@ -65,11 +72,15 @@ xg_fd_lock(void)
 		}
 	}
 	mtx_lock(&xg_fd_mtx);
+	xg_fd_lock_owner = curthread;
+	xg_fd_lock_where = where;
+	xg_fd_lock_since = ticks;
 }
 
 static void
 xg_fd_unlock(void)
 {
+	xg_fd_lock_owner = NULL;
 	mtx_unlock(&xg_fd_mtx);
 }
 
@@ -675,8 +686,9 @@ make_dev_alias_p(int flags, struct cdev **cdev, struct cdev *pdev, const char *f
 	dev->si_flags = SI_ALIAS | SI_NAMED;
 	/* the alias node opens its parent: same XNU minor */
 	xc->xc_slot = px->xc_slot;
-	error = xg_fd_xnu_node_create(xc->xc_slot, pdev->si_uid, pdev->si_gid, pdev->si_mode, dev->si_name,
-	    &xc->xc_node);
+	/* render nodes are DRM's unprivileged interface (Linux makes them 0666); apps reach the GPU through them */
+	error = xg_fd_xnu_node_create(xc->xc_slot, pdev->si_uid, pdev->si_gid,
+	    strncmp(dev->si_name, "dri/renderD", 11) == 0 ? 0666 : pdev->si_mode, dev->si_name, &xc->xc_node);
 	if (error != 0) {
 		xg_fd_cdev_unname(xc);
 		return (error);
@@ -893,6 +905,25 @@ xg_fd_inst_alloc(int slot)
 	xc->xc_refs++;
 	xg_fd_unlock();
 	return (i);
+}
+
+void
+xg_fd_diag(char *buf, unsigned long len)
+{
+	int st[4] = { 0 }, i, used;
+	void *owner = xg_fd_lock_owner;
+	const char *where = xg_fd_lock_where;
+
+	/* lock-free on purpose: this runs while the lock may be stuck */
+	for (i = 0; i < XG_FD_NINST; i++)
+		st[xg_fd_insts[i].xi_state & 3]++;
+	used = XG_FD_NINST - st[XI_FREE];
+	if (used > (int)xg_fd_lock_peak)
+		xg_fd_lock_peak = used;
+	snprintf(buf, len, "free %d lookup %d opening %d open %d peak %u of %d; lock %s%s%s %lld ticks",
+	    st[XI_FREE], st[XI_LOOKUP], st[XI_OPENING], st[XI_OPEN], xg_fd_lock_peak, XG_FD_NINST,
+	    owner ? "held at " : "free", owner && where ? where : "", owner ? " for" : "",
+	    owner ? (long long)(ticks - xg_fd_lock_since) : 0LL);
 }
 
 void
