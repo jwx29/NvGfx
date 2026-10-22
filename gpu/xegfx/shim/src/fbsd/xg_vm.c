@@ -50,6 +50,7 @@ static inline void smr_exit(smr_t smr) { }
 #include <vm/uma.h>
 #include <dev/vt/vt.h>
 #include "xg_vm_xnu.h"
+#include "xg_vmap.h"
 
 static MALLOC_DEFINE(M_XGVM, "xgvm", "XeGfx VM shim");
 
@@ -1468,6 +1469,101 @@ xg_vm_kva_range(void *va, int count, const char *who)
 	if (k == NULL || k->kind != XG_KM_KVA || (vm_offset_t)va + ptoa(count) > k->kva + k->size)
 		panic("xegfx: vm: %s(%p, %d) outside any kva_alloc range", who, va, count);
 	return (k);
+}
+
+/*
+ * vmap() without kva_alloc: the pages go to an address IOKit picks. Overlaying a kva_alloc reservation with
+ * kIOMapOverwrite fails on Tahoe (N-221: pmap_qenter panicked on i915's first vmap, its scratch page).
+ */
+struct xg_vm_vmap {
+	LIST_ENTRY(xg_vm_vmap)	link;
+	void			*va;
+	xg_vm_xmem_t		xm;
+};
+static LIST_HEAD(, xg_vm_vmap) xg_vm_vmaps = LIST_HEAD_INITIALIZER(xg_vm_vmaps);
+
+void *
+xg_vm_vmap_pa(const unsigned long long *pa, unsigned int n, int memattr)
+{
+	unsigned long long *rp, *rl;
+	struct xg_vm_vmap *v;
+	unsigned int i, nr = 0;
+	void *va = NULL;
+
+	if (n == 0)
+		return (NULL);
+	rp = malloc(n * sizeof(*rp), M_XGVM, M_WAITOK);
+	rl = malloc(n * sizeof(*rl), M_XGVM, M_WAITOK);
+	for (i = 0; i < n; i++) {
+		if (nr > 0 && rp[nr - 1] + rl[nr - 1] == pa[i]) {
+			rl[nr - 1] += PAGE_SIZE;
+			continue;
+		}
+		rp[nr] = pa[i];
+		rl[nr++] = PAGE_SIZE;
+	}
+	v = malloc(sizeof(*v), M_XGVM, M_WAITOK | M_ZERO);
+	v->xm = xg_vm_x_map_kernel(rp, rl, nr, xg_vm_cache((vm_memattr_t)memattr), &va);
+	free(rp, M_XGVM);
+	free(rl, M_XGVM);
+	if (v->xm == NULL) {
+		free(v, M_XGVM);
+		return (NULL);
+	}
+	v->va = va;
+	mtx_lock(&xg_vm_mtx);
+	LIST_INSERT_HEAD(&xg_vm_vmaps, v, link);
+	mtx_unlock(&xg_vm_mtx);
+	return (va);
+}
+
+int
+xg_vm_vunmap(void *va)
+{
+	struct xg_vm_vmap *v;
+
+	mtx_lock(&xg_vm_mtx);
+	LIST_FOREACH(v, &xg_vm_vmaps, link)
+		if (v->va == va) {
+			LIST_REMOVE(v, link);
+			break;
+		}
+	mtx_unlock(&xg_vm_mtx);
+	if (v == NULL)
+		return (-1);
+	xg_vm_x_release(v->xm);
+	free(v, M_XGVM);
+	return (0);
+}
+
+/* stage 1 runs this before any GPU work: 0, or the negative step that failed (no panic) */
+int
+xg_vm_vmap_selftest(void)
+{
+	unsigned long long pa[2];
+	volatile uint32_t *a, *b;
+	int rc = 0, i;
+
+	a = contigmalloc(2 * PAGE_SIZE, M_XGVM, M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	if (a == NULL)
+		return (-1);
+	for (i = 0; i < 2; i++)
+		pa[i] = pmap_kextract((vm_offset_t)a + ptoa(i));
+	if (pa[0] == 0 || pa[1] == 0)
+		rc = -2;
+	else if ((b = xg_vm_vmap_pa(pa, 2, VM_MEMATTR_WRITE_BACK)) == NULL)
+		rc = -3;
+	else {
+		b[0] = 0x58670001;
+		b[PAGE_SIZE / 4 + 5] = 0x58670002;
+		if (a[0] != 0x58670001 || a[PAGE_SIZE / 4 + 5] != 0x58670002)
+			rc = -4;
+		if (xg_vm_vunmap((void *)(uintptr_t)b) != 0)
+			rc = rc ? rc : -5;
+	}
+	contigfree((void *)(uintptr_t)a, 2 * PAGE_SIZE, M_XGVM);
+	printf("xegfx: vm: vmap selftest %d\n", rc);
+	return (rc);
 }
 
 /* maps each group of pages with the same memattr in one IOKit mapping over the reserved VA; may block */
