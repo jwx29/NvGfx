@@ -16,7 +16,7 @@ extern "C" {
  * the low bits so fstat on an open fd still names its node (libdrm maps it to card%d/renderD%d through /dev/dri).
  */
 #define XG_FD_NCDEV		1024
-#define XG_FD_NINST		512
+#define XG_FD_NINST		8192	/* 13 instance bits; every stat of a node holds one until devfs reclaims it */
 #define XG_FD_INST_FLAG		0x800000
 #define XG_FD_SLOT_BITS		10
 #define XG_FD_INST_MINOR(inst, slot)	(XG_FD_INST_FLAG | (inst) << XG_FD_SLOT_BITS | (slot))
@@ -27,6 +27,8 @@ extern "C" {
 
 /* FreeBSD side, called from the XNU cdevsw and the devfs clone function */
 int	xg_fd_inst_alloc(int slot);
+/* "free F lookup L opening O open P max M; lock held by T at FUNC for N ms" for debug.xegfx_fd */
+void	xg_fd_diag(char *buf, unsigned long len);
 void	xg_fd_inst_free(int inst);
 int	xg_fd_dev_open(int inst, int fflags);
 int	xg_fd_dev_close(int inst);
