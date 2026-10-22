@@ -1,7 +1,7 @@
 # gpu/xkpi
 
 Overlay for the XeGfx build (`XEGFX_OVERLAY`, see `gpu/xegfx/harness/score.py`): replacements for drm-kmod files
-that are GPL-only, so the kext contains no GPL-only code (Legion I-097).
+that are GPL-only, so the kext contains no GPL-only code (Legion I-097), and LinuxKPI fixes not yet in FreeBSD.
 
 | Path | Origin | Licence |
 |---|---|---|
@@ -9,6 +9,7 @@ that are GPL-only, so the kext contains no GPL-only code (Legion I-097).
 | `include/uapi/linux/sync_file.h` | Linux v6.14 | GPL-1.0+ WITH Linux-syscall-note (interface header) |
 | `include/drm/drm_format_helper.h` | written for this fork | MIT |
 | `exclude.txt` | written for this fork | MIT |
+| `src/lkpi/linux_schedule.c` | FreeBSD `sys/compat/linuxkpi/common/src/linux_schedule.c` (freebsd-src d2145e9) with one change: `woken_wake_function` sets `TASK_WAKING` under the channel lock, so a wake between a waiter's condition check and `schedule_timeout()` is not lost (GuC replies timed out). The bug and fix were found by [VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) (ROADMAP Phase 4, `override/src/linux_schedule.c`) | BSD-2-Clause, as the FreeBSD file |
 
 # gpu/userland
 
