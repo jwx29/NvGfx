@@ -18,8 +18,146 @@ MALLOC_DEFINE(M_DEVBUF, "devbuf", "device driver memory");
 
 #define XG_HDR		16
 #define XG_MAGIC	0x5867414cu	/* "XgAL" */
-struct xg_hdr { size_t size; uint32_t magic; uint32_t pad; };
+/* pool: 0 for an IOMalloc block, else 1 + the reserve class it came from */
+struct xg_hdr { size_t size; uint32_t magic; uint32_t pool; };
 size_t malloc_usable_size(const void *addr);
+
+/*
+ * M_NOWAIT reserve. Linux GFP_ATOMIC callers allocate under spinlocks (i915_active_add_request in execbuffer), and
+ * IOMalloc may block for a zone refill there: N-237 panicked "blocking while holding a spinlock". So M_NOWAIT takes
+ * a preallocated block of its size class under a spin word and never enters the allocator; a thread call tops the
+ * classes up from a context that may sleep.
+ */
+#define XG_NW_CLASSES	7		/* 64 .. 4096 bytes including the header */
+#define XG_NW_CAP	512
+#define XG_NW_LOW	128
+struct xg_nw_class {
+	volatile u_int	lock;
+	int		count;
+	void		*items[XG_NW_CAP];
+};
+static struct xg_nw_class xg_nw[XG_NW_CLASSES];
+static xg_call_t xg_nw_call;
+static volatile u_int xg_nw_state;	/* 0 cold, 1 starting, 2 up */
+static volatile u_int xg_nw_pending, xg_nw_misses;
+
+static size_t
+xg_nw_size(int c)
+{
+	return ((size_t)64 << c);
+}
+
+static int
+xg_nw_class_of(size_t total)
+{
+	for (int c = 0; c < XG_NW_CLASSES; c++)
+		if (total <= xg_nw_size(c))
+			return (c);
+	return (-1);
+}
+
+static void
+xg_nw_lock(struct xg_nw_class *k)
+{
+	while (!atomic_cmpset_acq_int(&k->lock, 0, 1))
+		cpu_spinwait();
+}
+
+static void
+xg_nw_unlock(struct xg_nw_class *k)
+{
+	atomic_store_rel_int(&k->lock, 0);
+}
+
+static void
+xg_nw_refill(void *p0, void *p1)
+{
+	for (int c = 0; c < XG_NW_CLASSES; c++) {
+		struct xg_nw_class *k = &xg_nw[c];
+
+		for (;;) {
+			void *b;
+
+			xg_nw_lock(k);
+			if (k->count >= XG_NW_CAP / 2) {
+				xg_nw_unlock(k);
+				break;
+			}
+			xg_nw_unlock(k);
+			if ((b = IOMalloc(xg_nw_size(c))) == NULL)
+				break;
+			xg_nw_lock(k);
+			if (k->count < XG_NW_CAP) {
+				k->items[k->count++] = b;
+				b = NULL;
+			}
+			xg_nw_unlock(k);
+			if (b != NULL)
+				IOFree(b, xg_nw_size(c));
+		}
+	}
+	atomic_store_rel_int(&xg_nw_pending, 0);
+}
+
+static void
+xg_nw_kick(void)
+{
+	if (xg_nw_call != NULL && atomic_cmpset_int(&xg_nw_pending, 0, 1))
+		thread_call_enter1_delayed(xg_nw_call, NULL, 0);
+}
+
+/* from the first M_WAITOK allocation: that context may sleep, so the reserve is filled there once */
+static void
+xg_nw_start(void)
+{
+	if (!atomic_cmpset_int(&xg_nw_state, 0, 1))
+		return;
+	xg_nw_call = thread_call_allocate_with_options(xg_nw_refill, NULL, XG_TC_PRIORITY_KERNEL, 0);
+	xg_nw_refill(NULL, NULL);
+	atomic_store_rel_int(&xg_nw_state, 2);
+}
+
+static struct xg_hdr *
+xg_nw_take(size_t total)
+{
+	int c = xg_nw_class_of(total);
+	struct xg_nw_class *k;
+	struct xg_hdr *h = NULL;
+	int left = 0;
+
+	if (c < 0)
+		return (NULL);
+	k = &xg_nw[c];
+	xg_nw_lock(k);
+	if (k->count > 0) {
+		h = k->items[--k->count];
+		left = k->count;
+	}
+	xg_nw_unlock(k);
+	if (h == NULL)
+		atomic_add_int(&xg_nw_misses, 1);
+	if (left < XG_NW_LOW)
+		xg_nw_kick();
+	if (h != NULL)
+		h->pool = (uint32_t)c + 1;
+	return (h);
+}
+
+/* true when the block went back to its class; a full class leaves it to the caller's IOFree */
+static bool
+xg_nw_give(struct xg_hdr *h)
+{
+	struct xg_nw_class *k = &xg_nw[h->pool - 1];
+	bool kept = false;
+
+	xg_nw_lock(k);
+	if (k->count < XG_NW_CAP) {
+		k->items[k->count++] = h;
+		kept = true;
+	}
+	xg_nw_unlock(k);
+	return (kept);
+}
 
 void
 malloc_init(void *data)
@@ -38,11 +176,22 @@ void *
 
 	if (size > SIZE_MAX - XG_HDR)
 		return (NULL);
-	h = (flags & M_ZERO) ? IOMallocZero(size + XG_HDR) : IOMalloc(size + XG_HDR);
-	if (h == NULL) {
-		if (flags & M_WAITOK)
-			panic("xegfx: malloc(%zu, %s) failed with M_WAITOK", size, type ? type->ks_shortdesc : "?");
-		return (NULL);
+	if ((flags & M_NOWAIT) && atomic_load_acq_int(&xg_nw_state) == 2 &&
+	    (h = xg_nw_take(size + XG_HDR)) != NULL) {
+		if (flags & M_ZERO)
+			memset(h, 0, size + XG_HDR);
+		h->pool = (uint32_t)xg_nw_class_of(size + XG_HDR) + 1;
+	} else {
+		if ((flags & M_NOWAIT) == 0 && xg_nw_state == 0)
+			xg_nw_start();
+		/* still IOMalloc for M_NOWAIT before the reserve exists and above 4 KiB */
+		h = (flags & M_ZERO) ? IOMallocZero(size + XG_HDR) : IOMalloc(size + XG_HDR);
+		if (h == NULL) {
+			if (flags & M_WAITOK)
+				panic("xegfx: malloc(%zu, %s) failed with M_WAITOK", size, type ? type->ks_shortdesc : "?");
+			return (NULL);
+		}
+		h->pool = 0;
 	}
 	h->size = size;
 	h->magic = XG_MAGIC;
@@ -127,7 +276,24 @@ free(void *addr, struct malloc_type *type)
 	}
 	h = xg_hdr_of(addr);
 	h->magic = 0;
+	if (h->pool != 0) {
+		if (!xg_nw_give(h))
+			IOFree(h, xg_nw_size((int)h->pool - 1));
+		return;
+	}
 	IOFree(h, h->size + XG_HDR);
+}
+
+/* for debug.xegfx_mem: the reserve's fill per class and how often M_NOWAIT found it empty */
+void
+xg_mem_diag(char *buf, unsigned long len)
+{
+	int n = snprintf(buf, len, "nowait reserve");
+
+	for (int c = 0; c < XG_NW_CLASSES && n > 0 && (unsigned long)n < len; c++)
+		n += snprintf(buf + n, len - n, " %zu:%d", xg_nw_size(c), xg_nw[c].count);
+	if (n > 0 && (unsigned long)n < len)
+		snprintf(buf + n, len - n, ", misses %u", xg_nw_misses);
 }
 
 void
