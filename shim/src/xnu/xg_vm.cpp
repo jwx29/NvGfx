@@ -94,6 +94,38 @@ xg_vm_x_map_phys(unsigned long long pa, unsigned long long size, int cache, void
 }
 
 extern "C" xg_vm_xmem_t
+xg_vm_x_map_user(const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache, int writable,
+    unsigned long long *uaddr)
+{
+	IOAddressRange *r;
+	IOMemoryDescriptor *md;
+	IOMemoryMap *map;
+	mach_vm_size_t size = 0;
+
+	if (n == 0 || (r = (IOAddressRange *)IOMallocZero(n * sizeof(*r))) == nullptr)
+		return nullptr;
+	for (unsigned int i = 0; i < n; i++) {
+		r[i].address = pa[i];
+		r[i].length = len[i];
+		size += len[i];
+	}
+	md = IOMemoryDescriptor::withAddressRanges(r, n, kIODirectionInOut | kIOMemoryTypePhysical64 |
+	    kIOMemoryMapperNone, nullptr);
+	IOFree(r, n * sizeof(*r));
+	if (md == nullptr)
+		return nullptr;
+	/* the ioctl runs on the caller's thread, so current_task() is the process that asked */
+	map = md->createMappingInTask(current_task(), 0, kIOMapAnywhere | xg_vm_cacheopt(cache) |
+	    (writable ? 0 : kIOMapReadOnly), 0, size);
+	if (map == nullptr) {
+		md->release();
+		return nullptr;
+	}
+	*uaddr = map->getAddress();
+	return xg_vm_xnew(md, map);
+}
+
+extern "C" xg_vm_xmem_t
 xg_vm_x_reserve(unsigned long long size, void **kva)
 {
 	IOBufferMemoryDescriptor *bmd;

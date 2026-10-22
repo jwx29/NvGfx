@@ -44,3 +44,9 @@ for kc in "$HOME"/abi-src/*/kc/BootKernelExtensions.kc; do
   python3 "$ROOT/tools/shadow_check.py" "$ROOT/out/XeGfx.kext" --kc "$kc" | tail -1 | grep -q "ok" || {
     python3 "$ROOT/tools/shadow_check.py" "$ROOT/out/XeGfx.kext" --kc "$kc"; exit 1; }
 done
+# the userspace probe the guard runs after the stages; needs libdrm's uapi headers (XEGFX_DRM_INC)
+INC=${XEGFX_DRM_INC:-$HOME/src/xe-userland/drm/include/drm}
+if [ -f "$INC/i915_drm.h" ]; then
+  xcrun clang -O2 -Wall -Wextra -Werror -mmacosx-version-min=11.0 -I "$INC" -o "$ROOT/out/xgprobe" "$ROOT/tools/xgprobe.c" || exit 1
+  echo "xgprobe $(stat -f %z "$ROOT/out/xgprobe") B"
+fi
