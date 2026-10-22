@@ -12,7 +12,7 @@ index 5bc9388..0194cd1 100644
    ),
    config_file, format_mod_static_table
 diff --git a/xf86drm.c b/xf86drm.c
-index 73e4861..783f0a7 100644
+index 73e4861..e18b5ab 100644
 --- a/xf86drm.c
 +++ b/xf86drm.c
 @@ -57,6 +57,7 @@
@@ -23,7 +23,84 @@ index 73e4861..783f0a7 100644
  #include "libdrm_macros.h"
  #include "drm_fourcc.h"
  
-@@ -699,6 +700,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
+@@ -107,25 +108,70 @@ static drmServerInfoPtr drm_server_info;
+ 
+ static bool drmNodeIsDRM(int maj, int min);
+ #ifdef __APPLE__
+-/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev, so a DRM
+- * node is recognised by finding its device number among the entries of /dev/dri. */
++/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev. XeGfx's devfs
++ * minor is its node slot, and an open descriptor's minor adds instance bits above a 10-bit slot, so neither is the
++ * DRM minor: the number in card%d/renderD%d comes from the /dev/dri entry with the same major and slot. */
++#define DRM_DARWIN_RAW_MINOR(d)	((int)((uint32_t)(d) & 0xffffff))
++#define DRM_DARWIN_INST_FLAG	0x800000
++#define DRM_DARWIN_SLOT_MASK	0x3ff
++
++static int drm_darwin_name_minor(const char *name)
++{
++    int id;
++
++    if (sscanf(name, "card%d", &id) == 1 || sscanf(name, "renderD%d", &id) == 1)
++        return id;
++    return -1;
++}
++
++/* the DRM minor of a device number from stat or fstat, or -1 when no /dev/dri entry carries it */
++static int drm_darwin_minor(dev_t rdev)
++{
++    int raw = DRM_DARWIN_RAW_MINOR(rdev), slot, id = -1;
++    DIR *dir = opendir(DRM_DIR_NAME);
++    struct dirent *ent;
++
++    slot = (raw & DRM_DARWIN_INST_FLAG) ? (raw & DRM_DARWIN_SLOT_MASK) : raw;
++    if (!dir)
++        return -1;
++    while (id < 0 && (ent = readdir(dir)) != NULL) {
++        char path[PATH_MAX];
++        struct stat sbuf;
++
++        if (ent->d_name[0] == '.')
++            continue;
++        snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
++        if (stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) && major(sbuf.st_rdev) == major(rdev) &&
++            DRM_DARWIN_RAW_MINOR(sbuf.st_rdev) == slot)
++            id = drm_darwin_name_minor(ent->d_name);
++    }
++    closedir(dir);
++    return id;
++}
++
++/* every minor(st_rdev) below then yields the DRM minor, which is what the node names and drmOpenMinor use */
++#undef minor
++#define minor(d) drm_darwin_minor(d)
++
+ static bool drm_darwin_node_exists(int maj, int min)
+ {
+     DIR *dir = opendir(DRM_DIR_NAME);
+     struct dirent *ent;
+     bool found = false;
+ 
+-    if (!dir)
++    if (!dir || min < 0) {
++        if (dir)
++            closedir(dir);
+         return false;
++    }
+     while (!found && (ent = readdir(dir)) != NULL) {
+         char path[PATH_MAX];
+         struct stat sbuf;
+ 
+-        if (ent->d_name[0] == '.')
++        if (ent->d_name[0] == '.' || drm_darwin_name_minor(ent->d_name) != min)
+             continue;
+         snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
+-        found = stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) &&
+-                (int)major(sbuf.st_rdev) == maj && (int)minor(sbuf.st_rdev) == min;
++        found = stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) && (int)major(sbuf.st_rdev) == maj;
+     }
+     closedir(dir);
+     return found;
+@@ -699,6 +745,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
  {
      int ret;
  
