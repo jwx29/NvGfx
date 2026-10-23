@@ -133,7 +133,29 @@
                                   offset + size, placed_addr);
 --- a/src/util/anon_file.c
 +++ b/src/util/anon_file.c
-@@ -203,6 +203,21 @@
+@@ -114,7 +114,12 @@
+     const char* env;
+     char* buf;
+     struct stat st;
++#ifdef __APPLE__
++    /* WindowServer runs with real uid 0 and effective uid 88; the directory it can own is the effective one's */
++    int uid = geteuid();
++#else
+     int uid = getuid();
++#endif
+     int n;
+ 
+     env = os_get_option("XDG_RUNTIME_DIR");
+@@ -125,7 +130,7 @@
+         return buf;
+     }
+ 
+-    n = asprintf(&buf, "/tmp/xdg-runtime-mesa-%ld", (long)getuid());
++    n = asprintf(&buf, "/tmp/xdg-runtime-mesa-%ld", (long)uid);
+     if (n < 0)
+        return NULL;
+     mesa_logd("%s: XDG_RUNTIME_DIR not set; falling back to temp dir %s",
+@@ -203,6 +208,21 @@
     fd = shm_mkstemp(template);
     if (fd != -1)
        shm_unlink(template);
