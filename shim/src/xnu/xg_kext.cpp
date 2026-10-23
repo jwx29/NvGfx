@@ -32,7 +32,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.29", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.30", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -449,8 +449,9 @@ xg_run_stage(int s)
 				int err = xg_i915_reserve_bootfb(gBootSurf, xg_boot_fb_size);
 
 				IOLog("XeGfx: boot surface GGTT 0x%x + %llu reserved: %d\n", gBootSurf, xg_boot_fb_size, err);
-				if (err == -28)
-					rc = -28;	/* something already sits there: compositing into it would overwrite it */
+				/* -ENOSPC at or above GUC_GGTT_TOP is i915's own GuC-top reservation, which keeps it free (N-256) */
+				if (err == -28 && gBootSurf < 0xfee00000u)
+					rc = -28;	/* something else sits there: compositing into it would overwrite it */
 			}
 		}
 	}
@@ -575,6 +576,26 @@ xegfx_hold_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 	return 0;
 }
 
+/* 1 = keep the NVRAM trace running outside the stages too (the guard's WindowServer step: N-251/N-255 froze there) */
+static int
+xegfx_trace_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	int v = gTraceOn ? 1 : 0, err = sysctl_handle_int(nullptr, &v, 0, req);
+
+	if (err || !req->newptr)
+		return err;
+	if (v && !gTraceOn && gTraceCall) {
+		gTraceOn = true;
+		xg_trace_write();
+		thread_call_enter(gTraceCall);
+	} else if (!v && gTraceOn) {
+		gTraceOn = false;
+		thread_call_cancel(gTraceCall);
+	}
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, xegfx_trace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_trace_sysctl,
+    "I", "1 = write the newest console line to NVRAM xegfx-step whenever it changes, outside the stages too");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_stage_sysctl,
     "I", "highest XeGfx stage done; write N to run stages up to N (1 shim, 2 probe, 3 bus, 4 drm/i915, 5 exec, 6 store, 7 Metal accelerator)");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_results, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
@@ -615,6 +636,7 @@ static struct sysctl_oid *const gOids[] = {
 	&sysctl__debug_xegfx_stage, &sysctl__debug_xegfx_results, &sysctl__debug_xegfx_fd, &sysctl__debug_xegfx_mem, &sysctl__debug_xegfx_running,
 	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env, &sysctl__debug_xegfx_log,
 	&sysctl__debug_xegfx_hold,
+	&sysctl__debug_xegfx_trace,
 };
 
 /* Linux's struct va_format, the argument of "%pV" */
