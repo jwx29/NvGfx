@@ -12,6 +12,9 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#ifdef NMX_XEGFX
+#include <IOKit/graphics/IOFramebuffer.h>   // the boot framebuffer's aperture and mode
+#endif
 #include <pexpert/pexpert.h>
 #include <libkern/OSKextLib.h>
 #include <mach/kmod.h>
@@ -258,6 +261,7 @@ public:
     IOPCIDevice *fPCI = nullptr;
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
+    IONotifier *fBootNote = nullptr;   // NMX_XEGFX: Apple's boot framebuffer on the iGPU
     static NVAccel *gAccel;
     IOService *fFB = nullptr;
     IOService *volatile fFBs[kNvMaxFB] = {};
@@ -271,6 +275,15 @@ public:
         unsigned idx = 0;
         OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
         if (num) idx = num->unsigned32BitValue();
+#ifdef NMX_XEGFX
+        // the Intel panel is head 4 here, the slot the NVIDIA build gives another GPU's panel (the copy path); a boot
+        // framebuffer on any other device is not ours
+        if (me->fPCI && newService->getProvider() != me->fPCI) {
+            ALOG("%s is on another device -- not ours", newService->getName());
+            return true;
+        }
+        idx = 4;
+#endif
         const char *what = "kept";
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
         else {
@@ -473,8 +486,40 @@ public:
         if (!fb) fb = fFB;
         if (!fb) return kIOReturnNotAttached;
         if (!fSymScanout) fSymScanout = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_SCANOUT);
-        return fb->callPlatformFunction(fSymScanout, false, r, nullptr, nullptr, nullptr);
+        IOReturn ret = fb->callPlatformFunction(fSymScanout, false, r, nullptr, nullptr, nullptr);
+#ifdef NMX_XEGFX
+        // Apple's boot framebuffer on our iGPU does not speak the VRAM ABI: describe its scan-out from its own aperture
+        // and current mode, a CPU mapping only, so frames take the copy path (NMIntelFB at boot left the panel on text)
+        if (ret != kIOReturnSuccess)
+            if (IOFramebuffer *ifb = OSDynamicCast(IOFramebuffer, fb)) ret = describeBootFramebuffer(ifb, r);
+#endif
+        return ret;
     }
+#ifdef NMX_XEGFX
+    IOMemoryMap *fBootFBMap = nullptr;
+    IOReturn describeBootFramebuffer(IOFramebuffer *ifb, struct NVRMVramRequest *r) {
+        IODisplayModeID mode = 0; IOIndex depth = 0; IOPixelInformation pi = {};
+        if (ifb->getCurrentDisplayMode(&mode, &depth) != kIOReturnSuccess ||
+            ifb->getPixelInformation(mode, depth, kIOFBSystemAperture, &pi) != kIOReturnSuccess) {
+            ALOG("boot framebuffer %s: no current mode / pixel information", ifb->getName());
+            return kIOReturnNotReady;
+        }
+        if (!fBootFBMap) {
+            IODeviceMemory *mem = ifb->getApertureRange(kIOFBSystemAperture);
+            if (!mem) { ALOG("boot framebuffer %s: no system aperture", ifb->getName()); return kIOReturnNoMemory; }
+            fBootFBMap = mem->map(kIOMapWriteCombineCache);
+            mem->release();
+            if (!fBootFBMap) { ALOG("boot framebuffer %s: aperture map failed", ifb->getName()); return kIOReturnNoMemory; }
+        }
+        r->kva = (void *)fBootFBMap->getVirtualAddress();
+        r->phys = 0;
+        r->width = pi.activeWidth; r->height = pi.activeHeight; r->pitch = pi.bytesPerRow;
+        r->actualSize = fBootFBMap->getLength(); r->size = r->actualSize;
+        ALOG("boot framebuffer %s: %u x %u pitch %u, %llu bytes at %p (CPU copy target)", ifb->getName(), r->width,
+             r->height, r->pitch, (unsigned long long)r->actualSize, r->kva);
+        return kIOReturnSuccess;
+    }
+#endif
     const OSSymbol *fSymScanout = nullptr;
     IOService *pipeFramebuffer(const void *pipe, unsigned *idx) {
         if (!pipe) return nullptr;
@@ -646,6 +691,11 @@ public:
             if (OSDictionary *im = serviceMatching("NMIntelFB")) {
                 fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
                 im->release();
+            }
+            // without NMIntelFB the panel stays on Apple's boot framebuffer (IONDRVFramebuffer) on this same iGPU
+            if (OSDictionary *bm = serviceMatching("IONDRVFramebuffer")) {
+                fBootNote = addMatchingNotification(gIOFirstPublishNotification, bm, &NVAccel::fbPublished, this, nullptr, 0);
+                bm->release();
             }
             OSDictionary *fbm = nullptr;
 #elif defined(NMX_ACCEL)
