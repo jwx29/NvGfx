@@ -62,10 +62,10 @@ NEW="$KC.xegfx-new"; rm -f "$NEW"
 kmutil create -n aux --volume-root / "${KARG[@]}" -B $KB -S $KS --repository "$EXT" -A "$NEW" -z > "$BK/kmutil.log" 2>&1 \
   || die "collection build failed (log $BK/kmutil.log; old collection kept)"
 INS=$(kmutil inspect -a x86_64 -A "$NEW" 2>/dev/null) || die "cannot inspect the new collection"
-if [ "$MODE" = install ]; then printf '%s\n' "$INS" | grep -q 'org.watchthelight.XeGfx' || die "XeGfx missing from the new collection"
+if [ "$MODE" = install ]; then printf '%s\n' "$INS" | grep -q '^org.watchthelight.XeGfx[[:space:]]' || die "XeGfx missing from the new collection"
   [ -d "$EXT/XeGfxAccel.kext" ] && { printf '%s\n' "$INS" | grep -q 'org.watchthelight.XeGfxAccel' || die "XeGfxAccel missing from the new collection"; }
   [ -d "$EXT/XeGfxAGDC.kext" ] && { printf '%s\n' "$INS" | grep -q 'org.watchthelight.XeGfxAGDC' || die "XeGfxAGDC missing from the new collection"; }
-else printf '%s\n' "$INS" | grep -q 'org.watchthelight.XeGfx' && die "XeGfx still in the new collection"; fi
+else printf '%s\n' "$INS" | grep -q '^org.watchthelight.XeGfx[[:space:]]' && die "XeGfx still in the new collection"; fi
 for b in $OLD; do printf '%s\n' "$INS" | grep -q "^$b[[:space:]]" || die "$b was in the old collection but is missing from the new one"; done
 mv -f "$NEW" "$KC"
 echo "xegfx: $MODE done (backup $BK, kept: $(echo $OLD | wc -w | tr -d ' ') kexts); reboot to apply"
