@@ -131,6 +131,11 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(NVDisplayMachine, IOAccelLegacyDisplayMachine)
+#ifdef NMX_XEGFX
+static volatile SInt64 gXeFakePhys = 0x400000000000ll;   // names of system-memory "VRAM", never real addresses
+static IORangeAllocator *gXeVa;                          // GPU addresses the family wants; the Intel GPU never uses them
+static IOLock *gXeVaLock;
+#endif
 #define NV_PRIVATE_VA_BASE  0x800000000000ull
 #define NV_PRIVATE_VA_SIZE  0x000010000000ull
 class NVTask : public IOAccelTask {
@@ -507,6 +512,23 @@ public:
     }
     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
     IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
+#ifdef NMX_XEGFX
+        // the Intel GPU has no VRAM: "vidmem" is wired system memory with a CPU mapping. phys is a made-up, never
+        // reused address that only names the allocation (the family wants one); nothing maps it, see the aperture
+        if (alloc) {
+            IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+                kIODirectionInOut | kIOMemoryKernelUserShared, r->size, 4096);
+            if (!b) return kIOReturnNoMemory;
+            if (b->prepare() != kIOReturnSuccess) { b->release(); return kIOReturnNoMemory; }
+            r->handle = b; r->kva = b->getBytesNoCopy(); r->actualSize = b->getLength();
+            r->phys = OSAddAtomic64((SInt64)((r->actualSize + 0x1fffff) & ~0x1fffffull), &gXeFakePhys);
+            return kIOReturnSuccess;
+        }
+        if (IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, (OSObject *)r->handle)) {
+            b->complete(); b->release();
+        }
+        return kIOReturnSuccess;
+#endif
         if (!fFB) return kIOReturnNotAttached;
         if (!fSymAlloc) fSymAlloc = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
         if (!fSymFree)  fSymFree  = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
@@ -874,6 +896,13 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
             ALOG("NVResource::getApertureMemoryDescriptor: no BAR1-backed vidmem at +0x88 (mem %p)", m); }
         return nullptr;
     }
+#ifdef NMX_XEGFX
+    // system memory: the buffer itself, never a device range over the made-up phys
+    if (IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, (OSObject *)m->fRmHandle)) {
+        b->retain(); fApDesc = b; return fApDesc;
+    }
+    return nullptr;
+#endif
     IODeviceMemory *d = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
     if (!d) { ALOG("NVResource::getApertureMemoryDescriptor: IODeviceMemory::withRange(0x%llx, %llu) FAILED",
                    m->fPhys, m->fBytes); return nullptr; }
@@ -2141,6 +2170,21 @@ static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
     NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
     if (!mm || !len) return 0;
     if (mm->fGpuVa) return mm->fGpuVa;
+#ifdef NMX_XEGFX
+    {
+        if (!gXeVaLock) gXeVaLock = IOLockAlloc();
+        if (!gXeVaLock) return 0;
+        IOLockLock(gXeVaLock);
+        if (!gXeVa) gXeVa = IORangeAllocator::withRange(0x10000000000ull, 0, 0, IORangeAllocator::kLocking);
+        IORangeScalar va = 0;
+        const unsigned long long a = align > 4096 ? align : 4096, l = (len + 4095) & ~4095ull;
+        bool ok = gXeVa && gXeVa->allocate(l, &va, a);
+        IOLockUnlock(gXeVaLock);
+        if (!ok) return 0;
+        mm->fHVirt = 1; mm->fGpuVa = 0x100000000ull + va; mm->fVaLen = l;
+        return mm->fGpuVa;
+    }
+#endif
 
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return 0;
@@ -2165,6 +2209,12 @@ static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
 {
     NVMemoryMap *mm = OSDynamicCast(NVMemoryMap, map);
     if (!mm || !mm->fHVirt) return;
+#ifdef NMX_XEGFX
+    if (gXeVa && mm->fGpuVa) gXeVa->deallocate(mm->fGpuVa - 0x100000000ull, mm->fVaLen);
+    OSAddAtomic64(1, &gCntMapFree);
+    mm->fHVirt = 0; mm->fGpuVa = 0; mm->fVaLen = 0; mm->fMapped = false;
+    return;
+#endif
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return;
     struct NVRMGpuVaRequest g;
@@ -2181,6 +2231,11 @@ static void nvAccelGpuVaFree(IOAccelMemoryMap *map)
 bool NVMemoryMap::commitIntoGPUPageTable()
 {
     if (fMapped) return true;
+#ifdef NMX_XEGFX
+    // no GPU page table to fill: ANV renders through its own GEM objects, these addresses are bookkeeping only
+    fMapped = true; OSAddAtomic64(1, &gCntMapCommit);
+    return true;
+#endif
     NVVidMemory *vm = OSDynamicCast(NVVidMemory, fMem);
     void *kapiMem = vm ? vm->fRmHandle : nullptr;
     unsigned long long len = fVaLen ? fVaLen : getLength();
@@ -2216,6 +2271,10 @@ bool NVMemoryMap::commitIntoGPUPageTable()
 void NVMemoryMap::releaseFromGPUPageTable()
 {
     if (!fMapped || !fHVirt) return;
+#ifdef NMX_XEGFX
+    fMapped = false; OSAddAtomic64(1, &gCntMapRelease);
+    return;
+#endif
     struct NVRMRmHandles h;
     if (!nvAccelRmHandles(&h)) return;
     struct NVRMGpuVaRequest g;
