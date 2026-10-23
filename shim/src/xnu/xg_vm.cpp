@@ -14,6 +14,7 @@
 struct xg_vm_xmem {
 	IOMemoryDescriptor *md;
 	IOMemoryMap *map;
+	bool prepared;		/* md is wired (a user page hold): complete() before the release */
 };
 
 static IOOptionBits
@@ -230,9 +231,54 @@ xg_vm_x_release(xg_vm_xmem_t xm)
 		return;
 	if (xm->map)
 		xm->map->release();
-	if (xm->md)
+	if (xm->md) {
+		if (xm->prepared)
+			xm->md->complete();
 		xm->md->release();
+	}
 	IOFree(xm, sizeof(*xm));
+}
+
+/*
+ * X5 user page holds (userptr, get_user_pages): wire npages of the calling process from uaddr and return each page's
+ * physical address. The ioctl runs on the caller's thread, so current_task() is the process whose pointer this is;
+ * a kernel thread has no user range to wire and gets nothing.
+ */
+extern "C" xg_vm_xmem_t
+xg_vm_x_hold_user(unsigned long long uaddr, unsigned int npages, int writable, unsigned long long *pa)
+{
+	task_t task = current_task();
+	IOMemoryDescriptor *md;
+	xg_vm_xmem_t xm;
+
+	if (task == kernel_task || npages == 0 || (uaddr & PAGE_MASK) != 0)
+		return nullptr;
+	md = IOMemoryDescriptor::withAddressRange(uaddr, (mach_vm_size_t)npages * PAGE_SIZE,
+	    writable ? kIODirectionInOut : kIODirectionOut, task);
+	if (md == nullptr)
+		return nullptr;
+	if (md->prepare() != kIOReturnSuccess) {
+		md->release();
+		return nullptr;
+	}
+	for (unsigned int i = 0; i < npages; i++) {
+		IOByteCount seg = 0;
+
+		pa[i] = md->getPhysicalSegment((IOByteCount)i * PAGE_SIZE, &seg, kIOMemoryMapperNone);
+		if (pa[i] == 0 || (pa[i] & PAGE_MASK) != 0) {
+			md->complete();
+			md->release();
+			return nullptr;
+		}
+	}
+	if ((xm = (xg_vm_xmem_t)IOMallocZero(sizeof(*xm))) == nullptr) {
+		md->complete();
+		md->release();
+		return nullptr;
+	}
+	xm->md = md;
+	xm->prepared = true;
+	return xm;
 }
 
 extern "C" unsigned long long

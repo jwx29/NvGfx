@@ -30,6 +30,8 @@ xg_vm_xmem_t xg_vm_x_map_at(xg_vm_xmem_t resv, void *va, const unsigned long lon
 /* put the reservation's own backing back over [va, va + size) */
 int xg_vm_x_unmap_at(xg_vm_xmem_t resv, void *va, unsigned long long size);
 void xg_vm_x_release(xg_vm_xmem_t xm);
+/* wire npages of the calling process from uaddr (page aligned); pa[] gets each page; released by xg_vm_x_release */
+xg_vm_xmem_t xg_vm_x_hold_user(unsigned long long uaddr, unsigned int npages, int writable, unsigned long long *pa);
 /* map n physical ranges, in order, into the kernel at an address IOKit picks; *kva gets it */
 xg_vm_xmem_t xg_vm_x_map_kernel(const unsigned long long *pa, const unsigned long long *len, unsigned int n, int cache,
     void **kva);
