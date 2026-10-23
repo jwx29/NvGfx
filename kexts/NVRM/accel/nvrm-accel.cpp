@@ -305,7 +305,13 @@ public:
             }
         // only head 0 may become the primary framebuffer: an Intel panel (index 4) publishing first became fFB (10-10 log:
         // "head 0 displaced NMIntelFB, which published first"), and on a laptop with nothing on the NVIDIA ports it stays
+#ifdef NMX_XEGFX
+        // over XeGfx there is no NVIDIA head 0: the Intel panel (head 4) is the primary framebuffer (N-243: register
+        // and the copy path both stopped at "no framebuffer" with it only slotted)
+        } else if (idx != 4 || !OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFB)) newService->release();
+#else
         } else if (idx != 0 || !OSCompareAndSwapPtr(nullptr, newService, (void *volatile *)&me->fFB)) newService->release();
+#endif
         unsigned before = me->fDM ? me->fDM->getFramebufferCount() : 0xFFFFFFFFu;
         ALOG("%s published -- display machine framebuffer count = %u (index %u %s)", newService->getName(), before, idx, what);
         if (gNvAccelArmed)
