@@ -26,6 +26,7 @@ memmove
 memset
 microtime
 ml_at_interrupt_context
+ml_get_interrupts_enabled
 ml_set_interrupts_enabled
 nanoseconds_to_absolutetime
 nanotime
