@@ -1,8 +1,67 @@
-# XeGfx
+# XeGfx: Intel Xe graphics acceleration for macOS (Hackintosh)
 
-XeGfx is an open source Intel graphics driver for macOS: a kext that runs the Linux i915 driver on XNU, so that Hackintosh machines with Intel Xe graphics (Iris Xe, Intel Arc and the Core Ultra iGPUs) can get hardware acceleration instead of a plain framebuffer. On top of it, Mesa's ANV driver already gives a working Vulkan device on an Arrow Lake iGPU under macOS Tahoe 26.7.1. The goal is one driver for every Xe part (Tiger Lake through Meteor Lake and Arrow Lake, Arc A-series, then Lunar Lake, Battlemage and Panther Lake) on every macOS from Big Sur 11 to Tahoe 26.
+XeGfx is an open source Intel graphics driver for macOS. It runs the Linux i915 driver inside the macOS kernel, so a Hackintosh with Intel Xe graphics (Iris Xe, Intel Arc, and the integrated GPUs of Core Ultra Meteor Lake and Arrow Lake) can get Metal and Vulkan on its own GPU instead of an unaccelerated framebuffer. Apple's own drivers stop at Ice Lake, and WhateverGreen can't help on Xe parts, so on these machines macOS normally draws everything on the CPU.
 
-It is not a GPU driver written from scratch. FreeBSD's [drm-kmod](https://github.com/freebsd/drm-kmod) already runs i915 on a non-Linux kernel through LinuxKPI, a layer that implements the Linux kernel API on top of FreeBSD's. XeGfx adds a small FreeBSD-kernel-API layer for XNU underneath LinuxKPI, so drm core and i915 build as one kext with their sources almost untouched. In userspace, Mesa's ANV Vulkan driver talks to it through a patched libdrm, and the next step is to run the Metal-to-Vulkan plugin of [NvGfx](https://github.com/watchthelight-labs/NvGfx) (branch `xe`) on ANV, the same way that project gives Metal to NVIDIA GPUs.
+On an Arrow Lake laptop (Intel Core Ultra 9 275HX, iGPU `8086:7D67`) under macOS Tahoe 26.7.1, XeGfx already gives apps a Metal device and a Vulkan 1.4 device on the Intel GPU, and WindowServer has composited the desktop on it and put it on the built-in panel. That desktop is not stable yet (see [Status](#status-2026-10-23)). The goal is one driver for every Xe generation, Tiger Lake through Lunar Lake plus Arc discrete cards, on every macOS from Big Sur 11 to Tahoe 26.
+
+It is a test driver for people who want to help, not something to install on a Mac you depend on. Downloads are on the [releases page](https://github.com/watchthelight-labs/XeGfx/releases), and the project page is [labs.watchthelight.org/XeGfx](https://labs.watchthelight.org/XeGfx/).
+
+## Does it work on my machine?
+
+Find your GPU's PCI ID with `ioreg -l | grep -i '"device-id"'` on macOS or `lspci -nn | grep VGA` on Linux. Only one machine has run XeGfx so far, so everything except the first row is untested. A report from your machine, working or not, is the most useful thing you can send ([issue #3](https://github.com/watchthelight-labs/XeGfx/issues/3)).
+
+| Family | Example PCI IDs (8086:) | Graphics | State |
+|---|---|---|---|
+| Arrow Lake-S / HX (Core Ultra 200S, 200HX) | 7D67 | Xe-LPG | runs: Metal, Vulkan, desktop composited (unstable) |
+| Arrow Lake-H / U (Core Ultra 200H, 200U) | 7D51, 7DD1, 7D41 | Xe-LPG(+) | untested; same GuC firmware as 7D67, so the closest match |
+| Meteor Lake (Core Ultra 100H, 100U) | 7D55, 7DD5, 7D45, 7D40 | Xe-LPG | untested; same GuC firmware |
+| Tiger Lake (11th gen Core) | 9A49, 9A40, 9A78 | Xe-LP (Iris Xe, UHD) | untested; needs its own GuC firmware linked in |
+| Alder Lake, Raptor Lake (12th to 14th gen mobile) | 46A6, 46A8, A7A0, A7A8 | Xe-LP (Iris Xe, UHD) | untested; needs its own GuC firmware |
+| Intel Arc A-series (Alchemist) | 56A0, 56A1, 5690 | Xe-HPG | untested |
+| Lunar Lake, Battlemage, Panther Lake | 64A0, E20B, E20C | Xe2 and later | needs the xe driver, not i915 ([issue #8](https://github.com/watchthelight-labs/XeGfx/issues/8)) |
+
+If your Tiger Lake, Alder Lake or Raptor Lake laptop only needs its panel to work, look at [WhateverXe](https://github.com/b00t0x/WhateverXe) and [NootedGreen](https://github.com/sgiammori/NootedGreen) first. They run Apple's own Tiger Lake driver on your GPU and are further along on those chips. XeGfx exists because that route does not reach Meteor Lake, Arrow Lake or Arc, and because a driver built from i915 can follow Intel's Linux support to new chips.
+
+## How it works
+
+XeGfx is not a GPU driver written from scratch. FreeBSD's [drm-kmod](https://github.com/freebsd/drm-kmod) already runs i915 on a non-Linux kernel through LinuxKPI, a layer that implements the Linux kernel API on top of FreeBSD's. XeGfx adds a small FreeBSD-kernel-API layer for XNU underneath LinuxKPI, so drm core and i915 build as one kext with their sources almost untouched. In userspace, Mesa's ANV Vulkan driver talks to it through a patched libdrm, and the Metal-to-Vulkan plugin of [NvGfx](https://github.com/watchthelight-labs/NvGfx) (branch `xe`) runs on ANV, the same way that project gives Metal to NVIDIA GPUs. [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) walks through each layer.
+
+## Status (2026-10-23)
+
+Work in progress. On the test laptop the Intel GPU runs real work for the kernel and for user processes, Vulkan and Metal both draw correctly, and WindowServer has run on the Intel GPU with the desktop showing on the built-in panel. Getting that desktop stable is the current work.
+
+Everything below was proven on one machine: a Lenovo Legion 5 15IAX10 with an Intel Core Ultra 9 275HX (Arrow Lake-HX). Its integrated graphics are Xe-LPG, PCI ID `8086:7D67` (GMD_ID graphics 12.70, display 14), which i915 treats as part of the Meteor Lake family. It runs macOS Tahoe 26.7.1 (25G241) with the BIOS in Hybrid graphics mode, so the built-in panel is wired to the Intel GPU. The boot IDs (N-xx) are test boots on that laptop.
+
+| Milestone | Done when | State |
+|---|---|---|
+| X1 compiles | every drm core and i915 source compiles for the kernel target | done, all 418 sources |
+| X2 links | one kext links against public KPIs only, no stubs on reachable paths | done |
+| X3 loads | loads next to the firmware framebuffer and probes the GPU | done, N-219 |
+| X4 GT up | GuC loaded, a request completes, render node exists | done, N-229 |
+| X5 ANV | a Vulkan device, a compute pipeline and an offscreen draw | done, N-234 (2026-10-22) |
+| X5b Metal | apps get a Metal device on the Intel GPU; compute and a draw come back right | done, N-235 to N-238 (2026-10-22) |
+| X6 desktop | WindowServer composites on the Intel GPU and the panel shows it | first light, N-258 (2026-10-22); not stable yet |
+| X7 other laptops | builds and boots on other Xe machines, with docs | testers wanted |
+
+What each step showed on the 7D67:
+
+- **GT up (N-229).** The GuC firmware `mtl_guc_70.bin` (version 70.53.0) loads, with GuC submission, SLPC and RC enabled. A kernel request completed on each of the render, copy and compute engines (rcs0, bcs0, ccs0), and each one wrote a dword that the CPU read back.
+- **Userspace (N-230).** A user process opened `/dev/dri/renderD128`, created a context, mapped buffers and ran execbuffer on the render and copy engines, and the results read back correctly.
+- **libdrm (N-233).** `drmGetDevices2` lists the GPU as `0000:00:02.0 8086:7d67`, driver i915 1.6.0.
+- **Vulkan through Mesa ANV (N-234).** ANV creates a Vulkan 1.4 device (API 1.4.363), "Intel(R) Graphics (ARL)", and a compute pipeline on it. A draw test (`tools/vkdraw` on NvGfx `xe`, commit `9c9cbc3`) cleared a 64x64 image to red in a render pass, drew a green triangle into it (exactly 512 green pixels), copied the image to a host buffer, and the CPU read back the right pixels.
+- **Metal (N-235 to N-238).** XeGfx's stage 7 hands the GPU to XeGfxAccel, the NMXAccel accelerator from NvGfx built over XeGfx (`build/nvgfx/build_nvaccel.sh xegfxaccel` on NvGfx `xe`). The NvGfx Metal plugin then runs on ANV. Metal shows one device, "Intel(R) Graphics (ARL)". An MSL compute kernel fills 1024 values correctly, and a render pipeline draws a green triangle on red that reads back exactly. Getting there took three fixes. Render nodes are world-accessible, as on Linux. GFP_ATOMIC allocations get a reserve, because i915 allocates under spinlocks. Host-visible BOs use the GPU's snooping write-back PAT, because XNU keeps RAM write-back whatever cache mode an IOKit mapping asks for, and write-combining BOs lost cache lines to CPU write-backs.
+- **Desktop (N-245 to N-260).** WindowServer can't open `/dev/dri` from inside its sandbox, so libdrm now sends its ioctls through the accelerator's IOKit user client when the node is refused (0.0.28). With that, a restarted WindowServer composites on the Intel GPU through Metal. On N-258 it stayed up through the settle, put 425 frames on the panel and kept the desktop for two hours before a kernel panic (one CPU stopped answering). On N-260 the machine froze about 20 s in, with no panic report. Frames reach the panel through a copy into the firmware's framebuffer, because macOS does not yet send display-pipe transactions to this GPU, so the desktop is slow even when it runs. The open problems are tracked in [NvGfx #12](https://github.com/watchthelight-labs/NvGfx/issues/12) and [#18](https://github.com/watchthelight-labs/NvGfx/issues/18).
+
+The source is at 0.0.30; the newest test build is the [v0.0.27 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.27) (Vulkan and Metal on Arrow Lake). Desktop runs need the NvGfx `xe` build of the accelerator and plugin as well.
+
+[VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) got to a GPU-composited desktop first: it runs an i915-derived driver with Metal and Vulkan on a Dell Latitude 5350 under macOS 15. XeGfx takes a different road (unchanged drm-kmod sources over its own shim) and targets Tahoe as well.
+
+### Problems worth knowing about
+
+- drm-kmod never turns the GuC on in FreeBSD builds, and Meteor Lake and Arrow Lake cannot submit work without it, so XeGfx sets `enable_guc=3` by default.
+- `OSKextRequestResource` does not serve the `Resources` of a kext that lives in the auxiliary kernel collection, so the GuC firmware is linked into the kext binary. That is also why other generations need their own firmware linked in before they can be tried.
+- XNU devfs clone nodes give every `stat` and `open` its own minor number, so libdrm could not match an open file to its `/dev/dri` node. The patched libdrm matches nodes by slot instead.
+- WindowServer's sandbox refuses `/dev/dri`, which is why the desktop path goes through IOKit instead.
 
 ## Built on, and learned from
 
@@ -37,44 +96,6 @@ XeGfx is built on other people's work. Thanks to all of them.
 | [drm-kmod #315](https://github.com/freebsd/drm-kmod/issues/315), [#418](https://github.com/freebsd/drm-kmod/pull/418), [#468](https://github.com/freebsd/drm-kmod/pull/468) | LinuxKPI bugs FreeBSD already fixed for Meteor Lake and Arc, to carry over |
 | [openbsd/src](https://github.com/openbsd/src) inteldrm | attaching i915 in stages and deferring the heavy probe |
 | [acidanthera/WhateverGreen](https://github.com/acidanthera/WhateverGreen) and [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg) | the Intel framebuffer background every Hackintosh graphics project builds on |
-
-## Status (2026-10-22)
-
-Work in progress. The Intel GPU runs real work for the kernel and for user processes, Vulkan draws offscreen, and Metal now runs on it too: apps get a Metal device on the Intel GPU, and Metal compute and Metal drawing come back correct. Nothing is on screen through it yet. In Hybrid mode WindowServer still draws the desktop without acceleration into the firmware framebuffer.
-
-Everything below was proven on one machine: a Lenovo Legion 5 15IAX10 with an Intel Core Ultra 9 275HX (Arrow Lake-HX). Its integrated graphics are Xe-LPG, PCI ID `8086:7D67` (GMD_ID graphics 12.70, display 14), which i915 treats as part of the Meteor Lake family. It runs macOS Tahoe 26.7.1 (25G241) with the BIOS in Hybrid graphics mode. The boot IDs (N-xx) are test boots on that laptop.
-
-| Milestone | Done when | State |
-|---|---|---|
-| X1 compiles | every drm core and i915 source compiles for the kernel target | done, all 418 sources |
-| X2 links | one kext links against public KPIs only, no stubs on reachable paths | done |
-| X3 loads | loads next to the firmware framebuffer and probes the GPU | done, N-219 |
-| X4 GT up | GuC loaded, a request completes, render node exists | done, N-229 |
-| X5 ANV | a Vulkan device, a compute pipeline and an offscreen draw | done, N-234 (2026-10-22) |
-| X5b Metal | apps get a Metal device on the Intel GPU; compute and a draw come back right | done, N-235 to N-238 (2026-10-22) |
-| X6 desktop | WindowServer composites on the Intel GPU and the Intel GPU shows it | not yet |
-| X7 other laptops | builds and boots on other Xe machines, with docs | testers wanted |
-
-What each step showed on the 7D67:
-
-- **GT up (N-229).** The GuC firmware `mtl_guc_70.bin` (version 70.53.0) loads, with GuC submission, SLPC and RC enabled. A kernel request completed on each of the render, copy and compute engines (rcs0, bcs0, ccs0), and each one wrote a dword that the CPU read back.
-- **Userspace (N-230).** A user process opened `/dev/dri/renderD128`, created a context, mapped buffers and ran execbuffer on the render and copy engines, and the results read back correctly.
-- **libdrm (N-233).** `drmGetDevices2` lists the GPU as `0000:00:02.0 8086:7d67`, driver i915 1.6.0.
-- **Vulkan through Mesa ANV (N-234).** ANV creates a Vulkan 1.4 device (API 1.4.363), "Intel(R) Graphics (ARL)", and a compute pipeline on it. Right after that boot, a draw test (`tools/vkdraw` on NvGfx `xe`, commit `9c9cbc3`) cleared a 64x64 image to red in a render pass, drew a green triangle into it (exactly 512 green pixels), copied the image to a host buffer, and the CPU read back the right pixels.
-
-- **Metal (N-235 to N-238).** XeGfx's stage 7 hands the GPU to XeGfxAccel, the NMXAccel accelerator from NvGfx built over XeGfx (`build/nvgfx/build_nvaccel.sh xegfxaccel` on NvGfx `xe`). The NvGfx Metal plugin then runs on ANV. Metal shows one device, "Intel(R) Graphics (ARL)". An MSL compute kernel fills 1024 values correctly, and a render pipeline draws a green triangle on red that reads back exactly. Getting there took three fixes. Render nodes are world-accessible, as on Linux. GFP_ATOMIC allocations get a reserve, because i915 allocates under spinlocks. Host-visible BOs use the GPU's snooping write-back PAT, because XNU keeps RAM write-back whatever cache mode an IOKit mapping asks for, and write-combining BOs lost cache lines to CPU write-backs.
-
-Next is the desktop: WindowServer compositing on the Intel GPU through this Metal device and the panel scanned out from it.
-
-The current build is the [v0.0.22 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.22) (XeGfx commit `dac3979`, with the libdrm patch `gpu/userland/patches/libdrm-xegfx.patch` from NvGfx `xe` commit `b020742`). It is a test build for people who want to help, not something to install on a machine you depend on.
-
-[VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) got there first: it ran an i915-derived driver with Metal and Vulkan on a Dell Latitude 5350 under macOS 15. XeGfx takes a different road (unchanged drm-kmod sources over its own shim) and targets Tahoe as well.
-
-### Problems worth knowing about
-
-- drm-kmod never turns the GuC on in FreeBSD builds, and Meteor Lake and Arrow Lake cannot submit work without it, so XeGfx sets `enable_guc=3` by default.
-- `OSKextRequestResource` does not serve the `Resources` of a kext that lives in the auxiliary kernel collection, so the GuC firmware is linked into the kext binary.
-- XNU devfs clone nodes give every `stat` and `open` its own minor number, so libdrm could not match an open file to its `/dev/dri` node. The patched libdrm matches nodes by slot instead.
 
 ## How it stays safe to test
 
