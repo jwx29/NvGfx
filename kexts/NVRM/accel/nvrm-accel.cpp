@@ -552,7 +552,17 @@ public:
 #ifdef NMX_XEGFX
     IOMemoryMap *fBootFBMap = nullptr;
     IOPhysicalAddress fBootFBPhys = 0;
+    // asked on every copied frame: filled once, then served from here. Each ask used to call into IONDRV outside its
+    // gate ("_doStatus not gated"); the desktop ran two hours on the Intel GPU and then one CPU stopped answering
+    // right after such a call (N-258, panic 00:17). The boot mode never changes under us.
+    struct NVRMVramRequest fBootDesc = {};
+    bool fBootDescOK = false;
     IOReturn describeBootFramebuffer(IOFramebuffer *ifb, struct NVRMVramRequest *r) {
+        if (fBootDescOK) {
+            r->kva = fBootDesc.kva; r->phys = fBootDesc.phys; r->width = fBootDesc.width; r->height = fBootDesc.height;
+            r->pitch = fBootDesc.pitch; r->actualSize = fBootDesc.actualSize; r->size = fBootDesc.size;
+            return kIOReturnSuccess;
+        }
         IODisplayModeID mode = 0; IOIndex depth = 0; IOPixelInformation pi = {};
         if (ifb->getCurrentDisplayMode(&mode, &depth) != kIOReturnSuccess ||
             ifb->getPixelInformation(mode, depth, kIOFBSystemAperture, &pi) != kIOReturnSuccess) {
@@ -575,6 +585,9 @@ public:
         r->actualSize = fBootFBMap->getLength(); r->size = r->actualSize;
         ALOG("boot framebuffer %s: %u x %u pitch %u, %llu bytes at %p (CPU copy target)", ifb->getName(), r->width,
              r->height, r->pitch, (unsigned long long)r->actualSize, r->kva);
+        fBootDesc.kva = r->kva; fBootDesc.phys = r->phys; fBootDesc.width = r->width; fBootDesc.height = r->height;
+        fBootDesc.pitch = r->pitch; fBootDesc.actualSize = r->actualSize; fBootDesc.size = r->size;
+        fBootDescOK = r->kva && r->pitch && r->height;
         return kIOReturnSuccess;
     }
 #endif
