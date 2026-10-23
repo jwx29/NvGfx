@@ -6296,6 +6296,62 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
     return 0;
 }
 
+// <wtl>
+// Surface-in/out on an Intel or AMD GPU staged each frame through a write-combining buffer that the CPU then copied:
+// about 8 ms per 2560x1600 surface (N-266, I-108). The surface's own pages, imported once as a host pointer, let the
+// GPU copy straight into or out of them.
+int nvmtl_vk_surface_host_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_NO_SURFACE_HOST");
+        on = !nvmtl_vk_init() && g_host_import && g_host_align && nvmtl_vk_vendor() != 0x10de && !(e && e[0] == '1');
+        nvlog("vk: IOSurface copies %s (host import %s, NVMTL_NO_SURFACE_HOST=%s)", on ? "go straight to the surface's pages"
+              : "stage through a buffer", g_host_import ? "present" : "ABSENT", e ? e : "unset");
+    }
+    return on;
+}
+int nvmtl_vk_surface_host_import(void *base, size_t alloc, nvk_buffer *out)
+{
+    memset(out, 0, sizeof *out);
+    if (!nvmtl_vk_surface_host_on() || !base) return -1;
+    return nvmtl_vk_buffer_import_host(base, alloc & ~(g_host_align - 1), out);
+}
+// to_image: buffer -> image (surface-in), else image -> buffer (surface-out); off/row_bytes locate the plane in hb
+int nvmtl_vk_image_xfer_host(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t off, size_t row_bytes, int to_image)
+{
+    const size_t bpp = img->bpp ? img->bpp : 4;
+    if (!hb->buf || img->bw > 1 || img->bh > 1 || (img->layers ? img->layers : 1) != 1 || !img->w || !img->h
+        || row_bytes % bpp || row_bytes < (size_t)img->w * bpp
+        || off + row_bytes * (img->h - 1) + (size_t)img->w * bpp > hb->size) return -1;
+    nvmtl_vk_image_upload_barrier(img);
+    nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
+    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
+    VkBufferImageCopy bic = { off, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
+    if (to_image) {
+        VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+        pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb->buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
+        img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+        VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT, (VkImageLayout)img->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toSrc);
+        img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        pvkCmdCopyImageToBuffer(c.cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkBuffer)hb->buf, 1, &bic);
+        VkBufferMemoryBarrier toHost = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkBuffer)hb->buf, 0, VK_WHOLE_SIZE };
+        pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &toHost, 0, NULL);
+    }
+    return nvmtl_vk_submit_wait_at(&c, to_image ? "surface upload (host)" : "surface readback (host)");
+}
+// </wtl>
+
 static void img_to(nvk_cmdbuf *c, nvk_image *img, VkImageLayout to,
                    VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS)
 {

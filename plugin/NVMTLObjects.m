@@ -1167,6 +1167,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
+    if (!_parent && _hostState > 0) { nvmtl_vk_buffer_destroy(&_hostBuf); _hostState = 0; }
     if (_surfOwned && _surf) CFRelease(_surf);
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
@@ -1215,6 +1216,24 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         return monitor;
     }
 }
+// <wtl>
+// Intel/AMD: the GPU copies straight between the image and the surface's own pages (imported once per texture);
+// -1 falls back to the staged copy. Called with the surface locked.
+static int nvmtl_surface_host_xfer(NVMTLTexture *r, size_t row, int to_image) {
+    if (r->_hostState < 0 || !nvmtl_vk_surface_host_on() || IOSurfaceGetPlaneCount(r->_surf) > 1) return -1;
+    void *b0 = IOSurfaceGetBaseAddress(r->_surf);
+    if (!r->_hostState) {
+        if (nvmtl_vk_surface_host_import(b0, IOSurfaceGetAllocSize(r->_surf), &r->_hostBuf)) {
+            r->_hostState = -1; static unsigned nr; if (nr++ < 6) nvlog("surface host import refused (%ux%u surface %u) - staged copies", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf));
+            return -1; }
+        r->_hostState = 1;
+    }
+    const size_t off = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane) - (uintptr_t)b0;
+    const int rc = nvmtl_vk_image_xfer_host(r->_q, &r->_i, &r->_hostBuf, off, row, to_image);
+    static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("surface %s through host import #%u: %ux%u surface %u rc %d", to_image ? "in" : "out", n, r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), rc);
+    return rc;
+}
+// </wtl>
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
@@ -1231,7 +1250,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
+    int rc = !(base && row) ? -1 : !nvmtl_surface_host_xfer(r, row, 1) ? 0 : nvmtl_vk_image_write(r->_q, &r->_i, base, row);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
@@ -1292,7 +1311,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (IOSurfaceLock(r->_surf, lockopt, NULL) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = (base && row) ? nvmtl_vk_image_read(r->_q, &r->_i, base, row) : -1;
+    int rc = !(base && row) ? -1 : !nvmtl_surface_host_xfer(r, row, 0) ? 0 : nvmtl_vk_image_read(r->_q, &r->_i, base, row);
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
