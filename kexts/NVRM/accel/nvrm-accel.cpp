@@ -61,6 +61,10 @@ void proc_selfname(char *buf, int size);
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
 static void nvaccelInstallSysctl(void);
+#ifdef NMX_XEGFX
+extern SInt64 gCntPipeInit;
+static void nvXeTraceStart(void);
+#endif
 static int gNvAccelArmed = 0;
 // 1 once the headless check restored the plugin name without arming (no NVIDIA display head). The Metal plugin reads it:
 // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
@@ -826,6 +830,9 @@ NVAccel *NVAccel::gAccel = nullptr;
 
 IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
 {
+#ifdef NMX_XEGFX
+    OSIncrementAtomic64(&gCntPipeInit);
+#endif
     if (!gNvScanout) {
         ALOG("NVDisplayPipe::initFramebufferResource(index %u): scanout gate CLOSED -- returning NULL, "
              "which is the family's own default (sysctl debug.nvaccelfb=3 opens it)", index);
@@ -1115,14 +1122,22 @@ const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, un
     return (const void *)m->getVirtualAddress();
 }
 
+#ifdef NMX_XEGFX
+extern SInt64 gCntPipeInit, gCntPipeValidate, gCntPipeComplete, gCntPipePerform;
+#define NVPIPE_CNT(v) OSIncrementAtomic64(&(v))
+#else
+#define NVPIPE_CNT(v) do { } while (0)
+#endif
 IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
+    NVPIPE_CNT(gCntPipeValidate);
     return kIOReturnSuccess;
 }
 
 static bool nvAccelIopAsyncBusy(const void *pipe);
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
+    NVPIPE_CNT(gCntPipeComplete);
     return gNvIop != 0 && !nvAccelIopAsyncBusy(this);
 }
 
@@ -1133,6 +1148,7 @@ static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
+    NVPIPE_CNT(gCntPipePerform);
     if (!gNvIop) return (IOReturn)0xe00002c7;
     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
     NVAccel *a = NVAccel::gAccel;
@@ -1465,6 +1481,11 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
 #ifdef NMX_XEGFX
     { extern struct sysctl_oid sysctl__debug_nvaccel_scanout_copies; sysctl_register_oid(&sysctl__debug_nvaccel_scanout_copies); }
+    { extern struct sysctl_oid sysctl__debug_nvaccel_pipe_init, sysctl__debug_nvaccel_pipe_validate,
+          sysctl__debug_nvaccel_pipe_complete, sysctl__debug_nvaccel_pipe_perform;
+      sysctl_register_oid(&sysctl__debug_nvaccel_pipe_init);     sysctl_register_oid(&sysctl__debug_nvaccel_pipe_validate);
+      sysctl_register_oid(&sysctl__debug_nvaccel_pipe_complete); sysctl_register_oid(&sysctl__debug_nvaccel_pipe_perform); }
+    nvXeTraceStart();
 #endif
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
@@ -2422,7 +2443,50 @@ static unsigned nvScanoutCopies = 0;
 static SInt64 gCntScanoutCopies;
 SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_copies, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntScanoutCopies,
             "composited frames copied onto the boot framebuffer by the swap path");
+// how far CoreDisplay gets with the display pipe (thanhnndev: it submits transactions only after AGDC 0x2001 is accepted)
+SInt64 gCntPipeInit, gCntPipeValidate, gCntPipeComplete, gCntPipePerform;
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_init, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipeInit, "NVDisplayPipe::initFramebufferResource calls");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_validate, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipeValidate, "validateTransaction calls");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_complete, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipeComplete, "isTransactionComplete calls");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_perform, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipePerform, "performTransaction calls");
 #endif
+#ifdef NMX_XEGFX
+// Every 5 s the counters go to XeGfx's NVRAM trace (xegfx-accel) when they changed: N-258 and N-260 froze with the
+// unified log lost, so the last line in NVRAM dates the freeze against the frames WindowServer had sent
+static struct thread_call *gXeTraceCall;
+static IOService *gXeResident;
+static void nvXeTraceFire(void *, void *)
+{
+    static char last[96];
+    char b[96];
+    snprintf(b, sizeof(b), "copies %lld pipe %lld/%lld/%lld/%lld iop4 %lld vm %lld", (long long)gCntScanoutCopies,
+             (long long)gCntPipeInit, (long long)gCntPipeValidate, (long long)gCntPipeComplete, (long long)gCntPipePerform,
+             (long long)gCntIopOkHead[4], (long long)gCntVmAlloc);
+    if (strcmp(b, last) != 0) {
+        if (!gXeResident)
+            if (OSDictionary *m = IOService::serviceMatching("XeGfxResident")) {
+                gXeResident = IOService::copyMatchingService(m);   // kept for the boot: the accelerator never unloads
+                m->release();
+            }
+        if (gXeResident) {
+            const OSSymbol *fn = OSSymbol::withCStringNoCopy("xgTrace");
+            if (fn && gXeResident->callPlatformFunction(fn, false, b, nullptr, nullptr, nullptr) == kIOReturnSuccess)
+                strlcpy(last, b, sizeof(last));
+            if (fn) fn->release();
+        }
+    }
+    uint64_t dl;
+    clock_interval_to_deadline(5, 1000000000u, &dl);
+    thread_call_enter_delayed(gXeTraceCall, dl);
+}
+static void nvXeTraceStart(void)
+{
+    if (gXeTraceCall) return;
+    gXeTraceCall = thread_call_allocate(&nvXeTraceFire, nullptr);
+    if (gXeTraceCall) nvXeTraceFire(nullptr, nullptr);
+}
+#endif
+
 static bool nvAccelCopyToScanout(IOAccelResource2 *res)
 {
 #ifndef NMX_XEGFX
