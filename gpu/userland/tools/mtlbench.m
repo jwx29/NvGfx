@@ -68,14 +68,11 @@ static int pitch_case(id<MTLDevice> dev, id<MTLCommandQueue> q, const char *name
     IOSurfaceRef ss = NULL, ds = NULL;
     id<MTLTexture> src = surface_texture(dev, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, w, h, bpe, want_row, fourcc, mf, &ss);
     id<MTLTexture> dst = surface_texture(dev, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, w, h, bpe, want_row, fourcc, mf, &ds);
-    if (!src || !dst) { printf("%s: no IOSurface texture
-", name); if (ss) CFRelease(ss); if (ds) CFRelease(ds); return 3; }
+    if (!src || !dst) { printf("%s: no IOSurface texture\n", name); if (ss) CFRelease(ss); if (ds) CFRelease(ds); return 3; }
     size_t row = IOSurfaceGetBytesPerRow(ss), drow = IOSurfaceGetBytesPerRow(ds), act = (size_t)w * bpe;
-    printf("%s: %lux%lu bpe %lu  bytesPerRow asked %lu got %zu (dst %zu)  row %% 32 = %zu
-", name, (unsigned long)w,
+    printf("%s: %lux%lu bpe %lu  bytesPerRow asked %lu got %zu (dst %zu)  row %% 32 = %zu\n", name, (unsigned long)w,
            (unsigned long)h, (unsigned long)bpe, (unsigned long)want_row, row, drow, row % 32);
-    if (row != want_row) printf("%s: pitch-rounded, IOSurface changed the row from %lu to %zu; testing with %zu
-", name,
+    if (row != want_row) printf("%s: pitch-rounded, IOSurface changed the row from %lu to %zu; testing with %zu\n", name,
                                 (unsigned long)want_row, row, row);
 
     IOSurfaceLock(ss, 0, NULL);
@@ -98,8 +95,7 @@ static int pitch_case(id<MTLDevice> dev, id<MTLCommandQueue> q, const char *name
     double el = now_ms() - t0;
     int fails = cb.status != MTLCommandBufferStatusCompleted;
     report(name, &el, 1, fails);
-    if (fails) printf("%s: command buffer status %ld%s%s
-", name, (long)cb.status, cb.error ? " " : "",
+    if (fails) printf("%s: command buffer status %ld%s%s\n", name, (long)cb.status, cb.error ? " " : "",
                       cb.error ? cb.error.localizedDescription.UTF8String : "");
 
     unsigned badrows = 0; long fx = -1, fy = -1;
@@ -115,11 +111,9 @@ static int pitch_case(id<MTLDevice> dev, id<MTLCommandQueue> q, const char *name
         badrows += rowbad;
     }
     IOSurfaceUnlock(ds, kIOSurfaceLockReadOnly, NULL);
-    if (badrows) printf("%s: %u of %lu rows wrong, first at byte x %ld (element %ld) y %ld
-", name, badrows, (unsigned long)h,
+    if (badrows) printf("%s: %u of %lu rows wrong, first at byte x %ld (element %ld) y %ld\n", name, badrows, (unsigned long)h,
                         fx, fx / (long)bpe, fy);
-    else if (!fails) printf("%s: all %lu rows match
-", name, (unsigned long)h);
+    else if (!fails) printf("%s: all %lu rows match\n", name, (unsigned long)h);
     CFRelease(ss); CFRelease(ds);
     return fails ? 5 : badrows ? 6 : 0;
 }
@@ -149,8 +143,7 @@ int main(void)
         if (getenv("MTLBENCH_PITCH") && getenv("MTLBENCH_PITCH")[0] == '1') {
             int rc = pitch_case(dev, q, "pitch-wide", 5632, 64, 8, 45056, (uint32_t)'RGhA', MTLPixelFormatRGBA16Float, 0x21);
             int r2 = pitch_case(dev, q, "pitch-odd", 642, 64, 1, 656, (uint32_t)'L008', MTLPixelFormatR8Unorm, 0x5c);
-            printf("metal bench pitch: %s
-", rc == 5 || r2 == 5 ? "INCOMPLETE" : rc || r2 ? "WRONG PIXELS" : "OK");
+            printf("metal bench pitch: %s\n", rc == 5 || r2 == 5 ? "INCOMPLETE" : rc || r2 ? "WRONG PIXELS" : "OK");
             free(t);
             return rc == 5 || r2 == 5 ? 5 : rc || r2 ? 6 : 0;   // a failed setup (3) counts as wrong too
         }
