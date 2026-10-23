@@ -14,7 +14,52 @@
 #define FBLOG(fmt, ...) IOLog("NVRM-agdc: " fmt "\n", ##__VA_ARGS__)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
+#ifdef NMX_XEGFX
+// the same AGDC for the Intel GPU over XeGfx (branch xe): IOPresentment pairs a framebuffer with its display pipe only
+// through an AGDC service on the GPU, so without one WindowServer finds no pipe for the boot framebuffer (N-249).
+// Own class, bundle and sysctl names, because NVRMAGDC loads on the same machine.
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxAGDC, "0.1", _start, _stop) }
+#define NVDADeviceControl XeGfxDeviceControl
+#define NVDAGDCLoader     XeGfxAGDCLoader
+#define AGDC_FB_CLASS     "IONDRVFramebuffer"
+#define AGDC_VENDOR       "Intel"
+#define AGDC_VENDOR_ID    0x8086
+#define nvrmfb_agdc xegfx_agdc
+#define sysctl__debug_nvrmfb_agdc sysctl__debug_xegfx_agdc
+#define nvrmfb_agdc_cmds xegfx_agdc_cmds
+#define sysctl__debug_nvrmfb_agdc_cmds sysctl__debug_xegfx_agdc_cmds
+#define nvrmfb_agdc_refused xegfx_agdc_refused
+#define sysctl__debug_nvrmfb_agdc_refused sysctl__debug_xegfx_agdc_refused
+#define nvrmfb_agdc_last_refused xegfx_agdc_last_refused
+#define sysctl__debug_nvrmfb_agdc_last_refused sysctl__debug_xegfx_agdc_last_refused
+#define nvrmfb_agdc_k5 xegfx_agdc_k5
+#define sysctl__debug_nvrmfb_agdc_k5 sysctl__debug_xegfx_agdc_k5
+#define nvrmfb_agdc_k5_link xegfx_agdc_k5_link
+#define sysctl__debug_nvrmfb_agdc_k5_link sysctl__debug_xegfx_agdc_k5_link
+#define nvrmfb_agdc_k5_caps xegfx_agdc_k5_caps
+#define sysctl__debug_nvrmfb_agdc_k5_caps sysctl__debug_xegfx_agdc_k5_caps
+#define nvrmfb_agdc_k5_why xegfx_agdc_k5_why
+#define sysctl__debug_nvrmfb_agdc_k5_why sysctl__debug_xegfx_agdc_k5_why
+#define nvrmfb_agdc_fbmap xegfx_agdc_fbmap
+#define sysctl__debug_nvrmfb_agdc_fbmap sysctl__debug_xegfx_agdc_fbmap
+#define nvrmfb_agdc_rescans xegfx_agdc_rescans
+#define sysctl__debug_nvrmfb_agdc_rescans sysctl__debug_xegfx_agdc_rescans
+#define nvrmfb_agdc_maxfb xegfx_agdc_maxfb
+#define sysctl__debug_nvrmfb_agdc_maxfb sysctl__debug_xegfx_agdc_maxfb
+#define nvrmfb_agdc_k5_asked xegfx_agdc_k5_asked
+#define sysctl__debug_nvrmfb_agdc_k5_asked sysctl__debug_xegfx_agdc_k5_asked
+#define nvrmfb_agdc_k5_link_mask xegfx_agdc_k5_link_mask
+#define sysctl__debug_nvrmfb_agdc_k5_link_mask sysctl__debug_xegfx_agdc_k5_link_mask
+#define nvrmfb_agdc_k5_caps_mask xegfx_agdc_k5_caps_mask
+#define sysctl__debug_nvrmfb_agdc_k5_caps_mask sysctl__debug_xegfx_agdc_k5_caps_mask
+#define nvrmfb_agdc_k5_last_refused_idx xegfx_agdc_k5_last_refused_idx
+#define sysctl__debug_nvrmfb_agdc_k5_last_refused_idx sysctl__debug_xegfx_agdc_k5_last_refused_idx
+#else
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "0.1", _start, _stop) }
+#define AGDC_FB_CLASS     "NVRMNVDAFramebuffer"
+#define AGDC_VENDOR       "NVIDIA"
+#define AGDC_VENDOR_ID    0x10de
+#endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 #include "AppleGraphicsDeviceControl_re.h"
@@ -124,7 +169,7 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
     if (cmd == 1) {
         if (!out || !outSize || *outSize != sizeof(NVAGDCVendorInfo)) return kIOReturnBadArgument;
         NVAGDCVendorInfo *v = (NVAGDCVendorInfo *)out; bzero(v, sizeof *v);
-        v->version = 0x30000; strlcpy(v->vendor, "NVIDIA", sizeof v->vendor); v->vendorID = 0x10de; v->vendorClass = 2;
+        v->version = 0x30000; strlcpy(v->vendor, AGDC_VENDOR, sizeof v->vendor); v->vendorID = AGDC_VENDOR_ID; v->vendorClass = 2;
         return kIOReturnSuccess;
     }
     if (cmd == 0x980) {
@@ -166,11 +211,15 @@ static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgd
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
 {
     *pci = nullptr; *fb = nullptr;
-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer"); if (!m) return;
+    OSDictionary *m = IOService::serviceMatching(AGDC_FB_CLASS); if (!m) return;
     IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
     IOService *p = f->getProvider(); int hops = 0;
     while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
     if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }
+#ifdef NMX_XEGFX
+    { OSData *v = OSDynamicCast(OSData, p->getProperty("vendor-id"));
+      if (!v || v->getLength() < 2 || *(const uint16_t *)v->getBytesNoCopy() != AGDC_VENDOR_ID) { f->release(); return; } }
+#endif
     gAgdcFBRef = f; *fb = f; *pci = p;
 }
 
@@ -180,7 +229,7 @@ static void nvdaAgdcScan(IOService *pci)
 {
     nvdaAgdcDropTable(); gAgdcScanLogged = 0;
     IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
-    OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
+    OSDictionary *m = IOService::serviceMatching(AGDC_FB_CLASS);
     OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
     if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
     OSObject *o;
@@ -245,6 +294,10 @@ static int nvrmfb_agdc_sysctl SYSCTL_HANDLER_ARGS
     int v = gAgdcState; int err = sysctl_handle_int(oidp, &v, 0, req);
     if (err || !req->newptr) return err;
     if (v != 0 && v != 1) return EINVAL;
+#ifdef NMX_XEGFX
+    // a terminated client on the live iGPU is the FLR risk the XeGfx notes warn about: up only, a reboot takes it down
+    if (v == 0) return EPERM;
+#endif
     gAgdcWant = v;
     if (!gAgdcCall) gAgdcCall = thread_call_allocate(nvdaAgdcWork, nullptr);
     if (!gAgdcCall) return ENOMEM;
@@ -298,9 +351,11 @@ public:
 OSDefineMetaClassAndStructors(NVDAGDCLoader, IOService)
 bool NVDAGDCLoader::start(IOService *provider)
 {
+#ifndef NMX_XEGFX
     { if (nvrm_driver_off()) return false; }
+#endif
     if (!IOService::start(provider)) return false;
-    nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.nvrmfb_agdc=1`"); return true;
+    nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.%s=1`", sysctl__debug_nvrmfb_agdc.oid_name); return true;
 }
 void NVDAGDCLoader::stop(IOService *provider)
 {
