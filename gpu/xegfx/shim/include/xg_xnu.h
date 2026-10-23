@@ -52,6 +52,12 @@ extern void kprintf(const char *fmt, ...);
 extern int PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
 extern int PE_parse_boot_arg_str(const char *arg_string, char *arg_ptr, int size);
 extern void panic(const char *fmt, ...) __attribute__((__noreturn__));
+/* bounded spins (xg_lock.c): a spin past its limit panics and names the lock, so a hang leaves a report (I-109) */
+struct xg_spin { unsigned long long t0; unsigned int n, counted; };
+extern int xg_spin_panic;
+extern unsigned long long xg_spin_max_us;
+extern unsigned int xg_spin_long;
+void xg_spin_note(struct xg_spin *s, const char *kind, const char *name, const char *file, int line, unsigned long owner);
 #define XG_TC_PRIORITY_KERNEL	1
 #define XG_TC_OPTIONS_ONCE	0x1
 extern xg_call_t thread_call_allocate_with_options(void (*func)(void *, void *), void *param0, int pri, unsigned int options);

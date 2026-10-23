@@ -33,6 +33,42 @@ sbintime_t xg_sbinuptime(void);
 #define XG_LC_RW	(4 << LO_CLASSSHIFT)
 #define XG_SPIN_TRIES	256
 
+/*
+ * Every spin below should last microseconds. Before 0.0.31 they had no bound and N-258 / N-260 ended in a CPU
+ * rendezvous panic and a silent freeze: a spinner with interrupts off stops answering IPIs. xg_spin_note samples
+ * the clock every 64 turns and panics past 150 ms with interrupts off (under the rendezvous timeout) or 2 s with
+ * them on. xegfx.spin_panic=0 in debug.xegfx_env only counts.
+ */
+int xg_spin_panic = 1;
+unsigned long long xg_spin_max_us;	/* the longest spin seen */
+unsigned int xg_spin_long;		/* spins over 10 ms */
+
+void
+xg_spin_note(struct xg_spin *s, const char *kind, const char *name, const char *file, int line, unsigned long owner)
+{
+	unsigned long long now, ns, us;
+
+	if ((s->n++ & 63) != 0)
+		return;
+	now = mach_absolute_time();
+	if (s->t0 == 0) {
+		s->t0 = now;
+		return;
+	}
+	absolutetime_to_nanoseconds(now - s->t0, &ns);
+	us = ns / 1000;
+	if (us > xg_spin_max_us)
+		xg_spin_max_us = us;
+	if (us >= 10000 && !s->counted) {
+		s->counted = 1;
+		xg_spin_long++;
+	}
+	if (xg_spin_panic && us > (ml_get_interrupts_enabled() ? 2000000ull : 150000ull))
+		panic("xegfx: %s %s spun %llu ms at %s:%d, owner %#lx, critnest %d, spinlock count %d, cpu %d",
+		    kind, name ? name : "?", us / 1000, file ? file : "?", line, owner, curthread->td_critnest,
+		    curthread->td_md.md_spinlock_count, cpu_number());
+}
+
 /* wait-channel chains: a spin lock per bucket, held inside a critical section */
 #define XG_SQ_BUCKETS 512
 static struct { volatile u_int lock; char pad[CACHE_LINE_SIZE - sizeof(u_int)]; } xg_sq[XG_SQ_BUCKETS];
@@ -47,11 +83,14 @@ static void
 xg_sq_lock(const volatile void *w)
 {
 	volatile u_int *l = &xg_sq[xg_sq_hash(w)].lock;
+	struct xg_spin s = { 0, 0, 0 };
 
 	critical_enter();
 	while (!atomic_cmpset_acq_int(l, 0, 1))
-		while (*l != 0)
+		while (*l != 0) {
 			cpu_spinwait();
+			xg_spin_note(&s, "sleepq bucket", NULL, NULL, (int)xg_sq_hash(w), 0);
+		}
 }
 
 static void
@@ -138,6 +177,7 @@ __mtx_lock_flags(volatile uintptr_t *c, int opts, const char *file, int line)
 {
 	struct mtx *m = mtxlock2mtx(c);
 	uintptr_t tid = (uintptr_t)curthread, v;
+	struct xg_spin s = { 0, 0, 0 };
 
 	if (atomic_cmpset_acq_ptr(c, MTX_UNOWNED, tid))
 		return;
@@ -159,8 +199,10 @@ __mtx_lock_flags(volatile uintptr_t *c, int opts, const char *file, int line)
 		 * Linux nests spinlocks freely: a second, contended one must spin as on Linux, because blocking with
 		 * preemption off panics (N-239: guc ct send lock, then uncore->lock in fwtable_write32)
 		 */
-		if (curthread->td_critnest != 0)
+		if (curthread->td_critnest != 0) {
+			xg_spin_note(&s, "mtx (critical section)", m->lock_object.lo_name, file, line, *c & ~MTX_FLAGMASK);
 			continue;
+		}
 		xg_sq_lock(c);
 		v = *c;
 		if (v == MTX_UNOWNED || (!(v & MTX_WAITERS) && !atomic_cmpset_ptr(c, v, v | MTX_WAITERS))) {
@@ -217,9 +259,12 @@ __mtx_lock_spin_flags(volatile uintptr_t *c, int opts, const char *file, int lin
 		m->mtx_recurse++;
 		return;
 	}
+	struct xg_spin s = { 0, 0, 0 };
 	while (!atomic_cmpset_acq_ptr(c, MTX_UNOWNED, tid))
-		while (*c != MTX_UNOWNED)
+		while (*c != MTX_UNOWNED) {
 			cpu_spinwait();
+			xg_spin_note(&s, "spin mtx", m->lock_object.lo_name, file, line, *c & ~MTX_FLAGMASK);
+		}
 }
 
 int

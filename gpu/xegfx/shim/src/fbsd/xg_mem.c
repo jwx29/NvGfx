@@ -59,8 +59,12 @@ xg_nw_class_of(size_t total)
 static void
 xg_nw_lock(struct xg_nw_class *k)
 {
-	while (!atomic_cmpset_acq_int(&k->lock, 0, 1))
+	struct xg_spin s = { 0, 0, 0 };
+
+	while (!atomic_cmpset_acq_int(&k->lock, 0, 1)) {
 		cpu_spinwait();
+		xg_spin_note(&s, "nowait reserve", NULL, __FILE__, __LINE__, 0);
+	}
 }
 
 static void
@@ -217,8 +221,12 @@ xg_contig_bucket(const void *p)
 static void
 xg_contig_lock_acquire(void)
 {
-	while (!atomic_cmpset_acq_int(&xg_contig_lock, 0, 1))
+	struct xg_spin s = { 0, 0, 0 };
+
+	while (!atomic_cmpset_acq_int(&xg_contig_lock, 0, 1)) {
 		cpu_spinwait();
+		xg_spin_note(&s, "contig table", NULL, __FILE__, __LINE__, 0);
+	}
 }
 
 static void
