@@ -32,7 +32,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.28", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.29", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -259,6 +259,8 @@ out:
 	return rc;
 }
 
+static uint32_t gBootSurf;	/* PLANE_SURF_1_A after i915 ran: the boot surface's GGTT offset */
+
 /* after i915 has run: the panel must still scan out the boot surface through the same GGTT entry, and pipe A must
  * still count frames; otherwise the desktop is black even though WindowServer looks fine */
 static int
@@ -279,6 +281,7 @@ xg_display_check(void)
 	} else if (mm && d && mm->getLength() >= 16ull << 20) {
 		volatile uint32_t *r = (volatile uint32_t *)mm->getVirtualAddress();
 		uint32_t surf = r[0x7019c / 4] & ~0xfffu, f0 = r[0x70040 / 4];
+		gBootSurf = surf;
 		uint64_t pte = ((volatile uint64_t *)(mm->getVirtualAddress() + (8ull << 20)))[surf >> 12];
 		IOSleep(100);
 		uint32_t f1 = r[0x70040 / 4];
@@ -441,6 +444,13 @@ xg_run_stage(int s)
 			if (rc == 1) {
 				xg_i915_map_init();
 				rc = xg_gt_check();
+			}
+			if (rc == 1 && gPipeLit && gBootSurf && xg_boot_fb_size) {
+				int err = xg_i915_reserve_bootfb(gBootSurf, xg_boot_fb_size);
+
+				IOLog("XeGfx: boot surface GGTT 0x%x + %llu reserved: %d\n", gBootSurf, xg_boot_fb_size, err);
+				if (err == -28)
+					rc = -28;	/* something already sits there: compositing into it would overwrite it */
 			}
 		}
 	}
