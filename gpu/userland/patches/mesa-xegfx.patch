@@ -1,20 +1,20 @@
-diff --git a/src/intel/common/intel_gem.h b/src/intel/common/intel_gem.h
-index 5a85ef1..d5d7bed 100644
 --- a/src/intel/common/intel_gem.h
 +++ b/src/intel/common/intel_gem.h
-@@ -75,6 +75,11 @@ intel_48b_address(uint64_t v)
+@@ -75,6 +75,13 @@
  extern int intel_virtio_ioctl(int fd, unsigned long request, void *arg);
  #endif
  
 +#ifdef __APPLE__
 +/* libdrm makes the dma-buf and sync_file descriptors an XeGfx kext cannot (xf86drm_xegfx.c) */
 +extern int drmIoctl(int fd, unsigned long request, void *arg);
++/* open(2) with a read-only fallback for sandboxes without device writes (WindowServer); ioctls then go via IOKit */
++extern int drmXeGfxOpen(const char *path, int flags);
 +#endif
 +
  /**
   * Call ioctl, restarting if it is interrupted
   */
-@@ -86,6 +91,8 @@ intel_ioctl(int fd, unsigned long request, void *arg)
+@@ -86,6 +93,8 @@
      do {
  #ifdef HAVE_INTEL_VIRTIO
        ret = intel_virtio_ioctl(fd, request, arg);
@@ -23,11 +23,9 @@ index 5a85ef1..d5d7bed 100644
  #else
        ret = ioctl(fd, request, arg);
  #endif
-diff --git a/src/intel/vulkan/anv_allocator.c b/src/intel/vulkan/anv_allocator.c
-index ade4a8c..5d4fa12 100644
 --- a/src/intel/vulkan/anv_allocator.c
 +++ b/src/intel/vulkan/anv_allocator.c
-@@ -1872,6 +1872,10 @@ anv_device_map_bo(struct anv_device *device,
+@@ -1872,6 +1872,10 @@
     return VK_SUCCESS;
  }
  
@@ -38,7 +36,7 @@ index ade4a8c..5d4fa12 100644
  VkResult
  anv_device_unmap_bo(struct anv_device *device,
                      struct anv_bo *bo,
-@@ -1893,6 +1897,10 @@ anv_device_unmap_bo(struct anv_device *device,
+@@ -1893,6 +1897,10 @@
        assert(((uintptr_t)map & (page_size - 1)) == 0);
     }
  
@@ -49,7 +47,7 @@ index ade4a8c..5d4fa12 100644
     if (replace) {
        map = mmap(map, map_size, PROT_NONE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-@@ -1902,7 +1910,9 @@ anv_device_unmap_bo(struct anv_device *device,
+@@ -1902,7 +1910,9 @@
        }
     } else {
        VG(VALGRIND_FREELIKE_BLOCK(map, 0));
@@ -59,11 +57,21 @@ index ade4a8c..5d4fa12 100644
     }
     return VK_SUCCESS;
  }
-diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
-index 0addc9c..72f43b7 100644
 --- a/src/intel/vulkan/anv_device.c
 +++ b/src/intel/vulkan/anv_device.c
-@@ -2572,6 +2572,14 @@ anv_device_get_pat_entry(struct anv_device *device,
+@@ -929,7 +929,11 @@
+    device->kmd_backend = anv_kmd_backend_get(device->info->kmd_type);
+ 
+    /* XXX(chadv): Can we dup() physicalDevice->fd here? */
++#ifdef __APPLE__
++   device->fd = drmXeGfxOpen(physical_device->path, O_RDWR | O_CLOEXEC);
++#else
+    device->fd = open(physical_device->path, O_RDWR | O_CLOEXEC);
++#endif
+    if (device->fd == -1) {
+       result = vk_error(device, VK_ERROR_INITIALIZATION_FAILED);
+       goto fail_device;
+@@ -2572,6 +2576,14 @@
     if (alloc_flags & ANV_BO_ALLOC_IMPORTED)
        return &device->info->pat.cached_coherent;
  
@@ -78,11 +86,23 @@ index 0addc9c..72f43b7 100644
     if (alloc_flags & (ANV_BO_ALLOC_EXTERNAL | ANV_BO_ALLOC_SCANOUT))
        return &device->info->pat.scanout;
  
-diff --git a/src/intel/vulkan/i915/anv_kmd_backend.c b/src/intel/vulkan/i915/anv_kmd_backend.c
-index d7e4e38..837922c 100644
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -3014,7 +3014,11 @@
+    int master_fd = -1;
+    int ret;
+ 
++#ifdef __APPLE__
++   fd = drmXeGfxOpen(path, O_RDWR | O_CLOEXEC);
++#else
+    fd = open(path, O_RDWR | O_CLOEXEC);
++#endif
+    if (fd < 0) {
+       if (errno == ENOMEM) {
+          return vk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
 --- a/src/intel/vulkan/i915/anv_kmd_backend.c
 +++ b/src/intel/vulkan/i915/anv_kmd_backend.c
-@@ -158,6 +158,10 @@ i915_gem_close(struct anv_device *device, struct anv_bo *bo)
+@@ -158,6 +158,10 @@
     intel_ioctl(device->fd, DRM_IOCTL_GEM_CLOSE, &close);
  }
  
@@ -93,7 +113,7 @@ index d7e4e38..837922c 100644
  static void *
  i915_gem_mmap_offset(struct anv_device *device, struct anv_bo *bo,
                       uint64_t offset, uint64_t size, uint32_t flags,
-@@ -185,6 +189,17 @@ i915_gem_mmap_offset(struct anv_device *device, struct anv_bo *bo,
+@@ -185,6 +189,17 @@
      */
     void *ptr;
  
@@ -111,11 +131,9 @@ index d7e4e38..837922c 100644
     if (device->physical->info.is_virtio)
        ptr = intel_virtio_bo_mmap(device->fd, bo->gem_handle,
                                   offset + size, placed_addr);
-diff --git a/src/util/anon_file.c b/src/util/anon_file.c
-index 0cb6cfa..319e36a 100644
 --- a/src/util/anon_file.c
 +++ b/src/util/anon_file.c
-@@ -203,6 +203,21 @@ os_create_anonymous_file(int64_t size, const char *debug_name)
+@@ -203,6 +203,21 @@
     fd = shm_mkstemp(template);
     if (fd != -1)
        shm_unlink(template);

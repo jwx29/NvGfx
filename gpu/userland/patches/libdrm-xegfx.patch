@@ -1,8 +1,20 @@
-diff --git a/meson.build b/meson.build
-index 5bc9388..0194cd1 100644
+Binary files a/.cache/clangd/index/drm_fourcc.h.0FA58D712699A3D6.idx and b/.cache/clangd/index/drm_fourcc.h.0FA58D712699A3D6.idx differ
+Binary files a/.cache/clangd/index/drm_mode.h.9DBDE13BAA631A31.idx and b/.cache/clangd/index/drm_mode.h.9DBDE13BAA631A31.idx differ
+Binary files a/.cache/clangd/index/drm.h.3762F800DCA780F3.idx and b/.cache/clangd/index/drm.h.3762F800DCA780F3.idx differ
+Binary files a/.cache/clangd/index/libdrm_macros.h.40BEC22FB8B62D9D.idx and b/.cache/clangd/index/libdrm_macros.h.40BEC22FB8B62D9D.idx differ
+Binary files a/.cache/clangd/index/util_math.h.25BE75C4E144FC88.idx and b/.cache/clangd/index/util_math.h.25BE75C4E144FC88.idx differ
+Binary files a/.cache/clangd/index/xf86drm.c.A773A71575114901.idx and b/.cache/clangd/index/xf86drm.c.A773A71575114901.idx differ
+Binary files a/.cache/clangd/index/xf86drm.h.65C8A709972A256B.idx and b/.cache/clangd/index/xf86drm.h.65C8A709972A256B.idx differ
+Binary files a/.cache/clangd/index/xf86drmHash.c.4BAA2C53231D4536.idx and b/.cache/clangd/index/xf86drmHash.c.4BAA2C53231D4536.idx differ
+Binary files a/.cache/clangd/index/xf86drmHash.h.2819954D7F225718.idx and b/.cache/clangd/index/xf86drmHash.h.2819954D7F225718.idx differ
+Binary files a/.cache/clangd/index/xf86drmMode.c.F8E563ABDDB9C472.idx and b/.cache/clangd/index/xf86drmMode.c.F8E563ABDDB9C472.idx differ
+Binary files a/.cache/clangd/index/xf86drmMode.h.F92203F97D179002.idx and b/.cache/clangd/index/xf86drmMode.h.F92203F97D179002.idx differ
+Binary files a/.cache/clangd/index/xf86drmRandom.c.7E40309B56B97248.idx and b/.cache/clangd/index/xf86drmRandom.c.7E40309B56B97248.idx differ
+Binary files a/.cache/clangd/index/xf86drmRandom.h.E128EE5F6F5A37D8.idx and b/.cache/clangd/index/xf86drmRandom.h.E128EE5F6F5A37D8.idx differ
+Binary files a/.cache/clangd/index/xf86drmSL.c.01FFD38FA21452E2.idx and b/.cache/clangd/index/xf86drmSL.c.01FFD38FA21452E2.idx differ
 --- a/meson.build
 +++ b/meson.build
-@@ -244,7 +244,7 @@ inc_root = include_directories('.')
+@@ -244,7 +244,7 @@
  inc_drm = include_directories('include/drm')
  
  libdrm_files = [files(
@@ -11,145 +23,25 @@ index 5bc9388..0194cd1 100644
     'xf86drmMode.c'
    ),
    config_file, format_mod_static_table
-diff --git a/xf86drm.c b/xf86drm.c
-index 73e4861..d6303f5 100644
---- a/xf86drm.c
-+++ b/xf86drm.c
-@@ -57,6 +57,7 @@
- #endif
+@@ -257,11 +257,14 @@
+   libdrm_kw = { 'version' : '2.@0@.0'.format(patch_ver) }
+ endif
  
- #include "xf86drm.h"
-+#include "xf86drm_xegfx.h"
- #include "libdrm_macros.h"
- #include "drm_fourcc.h"
- 
-@@ -107,30 +108,84 @@ static drmServerInfoPtr drm_server_info;
- 
- static bool drmNodeIsDRM(int maj, int min);
- #ifdef __APPLE__
--/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev, so a DRM
-- * node is recognised by finding its device number among the entries of /dev/dri. */
-+/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev. XeGfx's devfs
-+ * minor is its node slot, and an open descriptor's minor adds instance bits above a 10-bit slot, so neither is the
-+ * DRM minor: the number in card%d/renderD%d comes from the /dev/dri entry with the same major and slot. */
-+#define DRM_DARWIN_RAW_MINOR(d)	((int)((uint32_t)(d) & 0xffffff))
-+#define DRM_DARWIN_INST_FLAG	0x800000
-+#define DRM_DARWIN_SLOT_MASK	0x3ff
-+/* stat on a /dev/dri entry already goes through the clone, so both sides carry instance bits (N-232) */
-+#define DRM_DARWIN_SLOT(m)	(((m) & DRM_DARWIN_INST_FLAG) ? ((m) & DRM_DARWIN_SLOT_MASK) : (m))
++# XeGfx: ioctls of read-only nodes go through an IOKit user client (xf86drm_xegfx.c)
++dep_iokit = host_machine.system() == 'darwin' ? dependency('appleframeworks', modules : ['IOKit']) : []
 +
-+static int drm_darwin_name_minor(const char *name)
-+{
-+    int id;
-+
-+    if (sscanf(name, "card%d", &id) == 1 || sscanf(name, "renderD%d", &id) == 1)
-+        return id;
-+    return -1;
-+}
-+
-+/* the DRM minor of a device number from stat or fstat, or -1 when no /dev/dri entry carries it */
-+static int drm_darwin_minor(dev_t rdev)
-+{
-+    int raw = DRM_DARWIN_RAW_MINOR(rdev), slot, id = -1;
-+    DIR *dir = opendir(DRM_DIR_NAME);
-+    struct dirent *ent;
-+
-+    slot = DRM_DARWIN_SLOT(raw);
-+    if (!dir)
-+        return -1;
-+    while (id < 0 && (ent = readdir(dir)) != NULL) {
-+        char path[PATH_MAX];
-+        struct stat sbuf;
-+
-+        if (ent->d_name[0] == '.')
-+            continue;
-+        snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
-+        if (stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) && major(sbuf.st_rdev) == major(rdev) &&
-+            DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(sbuf.st_rdev)) == slot)
-+            id = drm_darwin_name_minor(ent->d_name);
-+    }
-+    closedir(dir);
-+    return id;
-+}
-+
-+/* every minor(st_rdev) below then yields the DRM minor, which is what the node names and drmOpenMinor use */
-+#undef minor
-+#define minor(d) drm_darwin_minor(d)
-+
-+/* every open of a node has its own clone minor, so two device numbers name the same node when the slots match */
-+#define DRM_SAME_RDEV(a, b) (major(a) == major(b) && \
-+    DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(a)) == DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(b)))
-+
- static bool drm_darwin_node_exists(int maj, int min)
- {
-     DIR *dir = opendir(DRM_DIR_NAME);
-     struct dirent *ent;
-     bool found = false;
- 
--    if (!dir)
-+    if (!dir || min < 0) {
-+        if (dir)
-+            closedir(dir);
-         return false;
-+    }
-     while (!found && (ent = readdir(dir)) != NULL) {
-         char path[PATH_MAX];
-         struct stat sbuf;
- 
--        if (ent->d_name[0] == '.')
-+        if (ent->d_name[0] == '.' || drm_darwin_name_minor(ent->d_name) != min)
-             continue;
-         snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
--        found = stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) &&
--                (int)major(sbuf.st_rdev) == maj && (int)minor(sbuf.st_rdev) == min;
-+        found = stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) && (int)major(sbuf.st_rdev) == maj;
-     }
-     closedir(dir);
-     return found;
- }
- #endif
-+#ifndef DRM_SAME_RDEV
-+#define DRM_SAME_RDEV(a, b) ((a) == (b))
-+#endif
- static char *drmGetMinorNameForFD(int fd, int type);
- 
- #define DRM_MODIFIER(v, f, f_name) \
-@@ -699,6 +754,11 @@ drmIoctl(int fd, unsigned long request, void *arg)
- {
-     int ret;
- 
-+#ifdef __APPLE__
-+    /* descriptors a kext cannot create (dma-buf, sync_file) are made here */
-+    if (drmXeGfxIoctl(fd, request, arg, &ret))
-+        return ret;
-+#endif
-     do {
-         ret = ioctl(fd, request, arg);
-     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-@@ -3318,7 +3378,7 @@ drm_public char *drmGetDeviceNameFromFd(int fd)
- 
-     for (i = 0; i < DRM_MAX_MINOR; i++) {
-         snprintf(name, sizeof name, DRM_DEV_NAME, DRM_DIR_NAME, i);
--        if (stat(name, &sbuf) == 0 && sbuf.st_rdev == d)
-+        if (stat(name, &sbuf) == 0 && DRM_SAME_RDEV(sbuf.st_rdev, d))
-             break;
-     }
-     if (i == DRM_MAX_MINOR)
-@@ -4627,7 +4687,7 @@ drm_device_has_rdev(drmDevicePtr device, dev_t find_rdev)
-     for (int i = 0; i < DRM_NODE_MAX; i++) {
-         if (device->available_nodes & 1 << i) {
-             if (stat(device->nodes[i], &sbuf) == 0 &&
--                sbuf.st_rdev == find_rdev)
-+                DRM_SAME_RDEV(sbuf.st_rdev, find_rdev))
-                 return true;
-         }
-     }
-diff --git a/xf86drm_xegfx.c b/xf86drm_xegfx.c
-new file mode 100644
-index 0000000..1ff2c60
---- /dev/null
+ libdrm = library(
+   'drm',
+   libdrm_files,
+   c_args : libdrm_c_args,
+-  dependencies : [dep_valgrind, dep_rt],
++  dependencies : [dep_valgrind, dep_rt, dep_iokit],
+   include_directories : inc_drm,
+   install : true,
+   kwargs : libdrm_kw,
+--- a/xf86drm_xegfx.c
 +++ b/xf86drm_xegfx.c
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,388 @@
 +/*
 + * SPDX-License-Identifier: MIT
 + *
@@ -172,7 +64,9 @@ index 0000000..1ff2c60
 +#include <sys/ioctl.h>
 +#include <sys/stat.h>
 +#include <unistd.h>
++#include <IOKit/IOKitLib.h>
 +
++#include "libdrm_macros.h"
 +#include "xf86drm.h"
 +#include "xf86drm_xegfx.h"
 +
@@ -210,15 +104,84 @@ index 0000000..1ff2c60
 +static int xg_n, xg_cap;
 +static pthread_mutex_t xg_lock = PTHREAD_MUTEX_INITIALIZER;
 +
-+static int raw_ioctl(int fd, unsigned long request, void *arg)
-+{
-+    int ret;
++/*
++ * WindowServer's sandbox allows a read-only open of /dev/dri nodes but no ioctl(2) on any device node. Such a
++ * descriptor's ioctls go to XeGfxAccel's 'XGDR' user client instead, named by the descriptor's instance minor;
++ * XeGfx only accepts them from the process that opened that instance.
++ */
++#define XG_FD_INST_FLAG 0x800000
++static io_connect_t xg_conn;
++static pthread_once_t xg_conn_once = PTHREAD_ONCE_INIT;
 +
++static void conn_open(void)
++{
++    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
++
++    if (svc) {
++        if (IOServiceOpen(svc, mach_task_self(), 0x58474452u, &xg_conn) != KERN_SUCCESS)
++            xg_conn = 0;
++        IOObjectRelease(svc);
++    }
++}
++
++static int remote_minor(int fd)
++{
++    struct stat st;
++    int fl = fcntl(fd, F_GETFL);
++
++    if (fl == -1 || (fl & O_ACCMODE) != O_RDONLY || fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
++        return -1;
++    if ((st.st_rdev & XG_FD_INST_FLAG) == 0)
++        return -1;
++    return (int)(st.st_rdev & 0xffffff);
++}
++
++static int remote_ioctl(int minor, unsigned long request, void *arg)
++{
++    uint64_t in[3] = { (uint64_t)minor, (uint64_t)request, (uint64_t)(uintptr_t)arg }, out = 0;
++    uint32_t n = 1;
++
++    pthread_once(&xg_conn_once, conn_open);
++    if (!xg_conn) {
++        errno = ENOTTY;
++        return -1;
++    }
++    do {
++        if (IOConnectCallScalarMethod(xg_conn, 0, in, 3, &out, &n) != KERN_SUCCESS) {
++            errno = EIO;
++            return -1;
++        }
++    } while (out == EINTR || out == EAGAIN);
++    if (out != 0) {
++        errno = (int)out;
++        return -1;
++    }
++    return 0;
++}
++
++drm_public int drmXeGfxRawIoctl(int fd, unsigned long request, void *arg)
++{
++    int ret, minor = remote_minor(fd);
++
++    if (minor >= 0)
++        return remote_ioctl(minor, request, arg);
 +    do {
 +        ret = ioctl(fd, request, arg);
 +    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
 +    return ret;
 +}
++
++/* open(2), falling back to read-only where a sandbox refuses write access (WindowServer) */
++drm_public int drmXeGfxOpen(const char *path, int flags)
++{
++    int fd = open(path, flags);
++
++    if (fd < 0 && (errno == EPERM || errno == EACCES) && (flags & O_ACCMODE) == O_RDWR)
++        fd = open(path, (flags & ~O_ACCMODE) | O_RDONLY);
++    return fd;
++}
++
++#define raw_ioctl drmXeGfxRawIoctl
 +
 +static void syncobj_destroy(int drm_fd, uint32_t h)
 +{
@@ -467,12 +430,9 @@ index 0000000..1ff2c60
 +    return 0;
 +}
 +#endif
-diff --git a/xf86drm_xegfx.h b/xf86drm_xegfx.h
-new file mode 100644
-index 0000000..64a99e6
---- /dev/null
+--- a/xf86drm_xegfx.h
 +++ b/xf86drm_xegfx.h
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,15 @@
 +/*
 + * SPDX-License-Identifier: MIT
 + * XeGfx (Darwin): drmIoctl() hands every request here first; nonzero means it was answered and *ret holds the
@@ -483,5 +443,201 @@ index 0000000..64a99e6
 +#define XF86DRM_XEGFX_H
 +#ifdef __APPLE__
 +int drmXeGfxIoctl(int fd, unsigned long request, void *arg, int *ret);
++/* ioctl(2), or the XeGfxAccel user client for a read-only node; open(2) with that read-only fallback */
++int drmXeGfxRawIoctl(int fd, unsigned long request, void *arg);
++int drmXeGfxOpen(const char *path, int flags);
 +#endif
 +#endif
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -57,6 +57,12 @@
+ #endif
+ 
+ #include "xf86drm.h"
++#include "xf86drm_xegfx.h"
++#ifdef __APPLE__
++#define xg_open drmXeGfxOpen
++#else
++#define xg_open open
++#endif
+ #include "libdrm_macros.h"
+ #include "drm_fourcc.h"
+ 
+@@ -107,30 +113,97 @@
+ 
+ static bool drmNodeIsDRM(int maj, int min);
+ #ifdef __APPLE__
+-/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev, so a DRM
+- * node is recognised by finding its device number among the entries of /dev/dri. */
+-static bool drm_darwin_node_exists(int maj, int min)
++/* Darwin assigns character majors at run time and its devname_r searches only the top level of /dev. XeGfx's devfs
++ * minor is its node slot, and an open descriptor's minor adds instance bits above a 10-bit slot, so neither is the
++ * DRM minor: the number in card%d/renderD%d comes from the /dev/dri entry with the same major and slot. */
++#define DRM_DARWIN_RAW_MINOR(d)	((int)((uint32_t)(d) & 0xffffff))
++#define DRM_DARWIN_INST_FLAG	0x800000
++#define DRM_DARWIN_SLOT_MASK	0x3ff
++/* stat on a /dev/dri entry already goes through the clone, so both sides carry instance bits (N-232) */
++#define DRM_DARWIN_SLOT(m)	(((m) & DRM_DARWIN_INST_FLAG) ? ((m) & DRM_DARWIN_SLOT_MASK) : (m))
++
++static int drm_darwin_name_minor(const char *name)
+ {
++    int id;
++
++    if (sscanf(name, "card%d", &id) == 1 || sscanf(name, "renderD%d", &id) == 1)
++        return id;
++    return -1;
++}
++
++/* one scan of /dev/dri per process: every stat of a clone node holds a kernel instance until devfs reclaims it,
++ * and libdrm asks for minors many times per enumeration (N-236 hung with dozens of processes enumerating) */
++static struct { int maj, slot, id; char name[16]; } drm_darwin_nodes[16];
++static int drm_darwin_nnodes = -1;
++
++static void drm_darwin_scan(void)
++{
+     DIR *dir = opendir(DRM_DIR_NAME);
+     struct dirent *ent;
+-    bool found = false;
++    int n = 0;
+ 
+-    if (!dir)
+-        return false;
+-    while (!found && (ent = readdir(dir)) != NULL) {
+-        char path[PATH_MAX];
+-        struct stat sbuf;
++    if (dir) {
++        while (n < 16 && (ent = readdir(dir)) != NULL) {
++            char path[PATH_MAX];
++            struct stat sbuf;
++            int id = drm_darwin_name_minor(ent->d_name);
+ 
+-        if (ent->d_name[0] == '.')
+-            continue;
+-        snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
+-        found = stat(path, &sbuf) == 0 && S_ISCHR(sbuf.st_mode) &&
+-                (int)major(sbuf.st_rdev) == maj && (int)minor(sbuf.st_rdev) == min;
+-    }
+-    closedir(dir);
+-    return found;
++            if (ent->d_name[0] == '.' || id < 0)
++                continue;
++            snprintf(path, sizeof(path), "%s/%s", DRM_DIR_NAME, ent->d_name);
++            if (stat(path, &sbuf) != 0 || !S_ISCHR(sbuf.st_mode))
++                continue;
++            drm_darwin_nodes[n].maj = major(sbuf.st_rdev);
++            drm_darwin_nodes[n].slot = DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(sbuf.st_rdev));
++            drm_darwin_nodes[n].id = id;
++            snprintf(drm_darwin_nodes[n].name, sizeof(drm_darwin_nodes[n].name), "%s", ent->d_name);
++            n++;
++        }
++        closedir(dir);
++    }
++    drm_darwin_nnodes = n;
+ }
++
++/* the DRM minor of a device number from stat or fstat, or -1 when no /dev/dri entry carries it */
++static int drm_darwin_minor(dev_t rdev)
++{
++    int slot = DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(rdev));
++
++    for (int pass = 0; pass < 2; pass++) {
++        if (pass == 1 || drm_darwin_nnodes < 0)
++            drm_darwin_scan();
++        for (int i = 0; i < drm_darwin_nnodes; i++)
++            if (drm_darwin_nodes[i].maj == (int)major(rdev) && drm_darwin_nodes[i].slot == slot)
++                return drm_darwin_nodes[i].id;
++    }
++    return -1;
++}
++
++/* every minor(st_rdev) below then yields the DRM minor, which is what the node names and drmOpenMinor use */
++#undef minor
++#define minor(d) drm_darwin_minor(d)
++
++/* every open of a node has its own clone minor, so two device numbers name the same node when the slots match */
++#define DRM_SAME_RDEV(a, b) (major(a) == major(b) && \
++    DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(a)) == DRM_DARWIN_SLOT(DRM_DARWIN_RAW_MINOR(b)))
++
++static bool drm_darwin_node_exists(int maj, int min)
++{
++    if (min < 0)
++        return false;
++    for (int pass = 0; pass < 2; pass++) {
++        if (pass == 1 || drm_darwin_nnodes < 0)
++            drm_darwin_scan();
++        for (int i = 0; i < drm_darwin_nnodes; i++)
++            if (drm_darwin_nodes[i].maj == maj && drm_darwin_nodes[i].id == min)
++                return true;
++    }
++    return false;
++}
+ #endif
++#ifndef DRM_SAME_RDEV
++#define DRM_SAME_RDEV(a, b) ((a) == (b))
++#endif
+ static char *drmGetMinorNameForFD(int fd, int type);
+ 
+ #define DRM_MODIFIER(v, f, f_name) \
+@@ -699,10 +772,17 @@
+ {
+     int ret;
+ 
++#ifdef __APPLE__
++    /* descriptors a kext cannot create (dma-buf, sync_file) are made here */
++    if (drmXeGfxIoctl(fd, request, arg, &ret))
++        return ret;
++    return drmXeGfxRawIoctl(fd, request, arg);
++#else
+     do {
+         ret = ioctl(fd, request, arg);
+     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+     return ret;
++#endif
+ }
+ 
+ static unsigned long drmGetKeyFromFd(int fd)
+@@ -920,7 +1000,7 @@
+     }
+ #endif
+ 
+-    fd = open(buf, O_RDWR | O_CLOEXEC);
++    fd = xg_open(buf, O_RDWR | O_CLOEXEC);
+     drmMsg("drmOpenDevice: open result is %d, (%s)\n",
+            fd, fd < 0 ? strerror(errno) : "OK");
+     if (fd >= 0)
+@@ -940,7 +1020,7 @@
+             chmod(buf, devmode);
+         }
+     }
+-    fd = open(buf, O_RDWR | O_CLOEXEC);
++    fd = xg_open(buf, O_RDWR | O_CLOEXEC);
+     drmMsg("drmOpenDevice: open result is %d, (%s)\n",
+            fd, fd < 0 ? strerror(errno) : "OK");
+     if (fd >= 0)
+@@ -978,7 +1058,7 @@
+         return -EINVAL;
+ 
+     sprintf(buf, dev_name, DRM_DIR_NAME, minor);
+-    if ((fd = open(buf, O_RDWR | O_CLOEXEC)) >= 0)
++    if ((fd = xg_open(buf, O_RDWR | O_CLOEXEC)) >= 0)
+         return fd;
+     return -errno;
+ }
+@@ -3318,7 +3398,7 @@
+ 
+     for (i = 0; i < DRM_MAX_MINOR; i++) {
+         snprintf(name, sizeof name, DRM_DEV_NAME, DRM_DIR_NAME, i);
+-        if (stat(name, &sbuf) == 0 && sbuf.st_rdev == d)
++        if (stat(name, &sbuf) == 0 && DRM_SAME_RDEV(sbuf.st_rdev, d))
+             break;
+     }
+     if (i == DRM_MAX_MINOR)
+@@ -4627,7 +4707,7 @@
+     for (int i = 0; i < DRM_NODE_MAX; i++) {
+         if (device->available_nodes & 1 << i) {
+             if (stat(device->nodes[i], &sbuf) == 0 &&
+-                sbuf.st_rdev == find_rdev)
++                DRM_SAME_RDEV(sbuf.st_rdev, find_rdev))
+                 return true;
+         }
+     }

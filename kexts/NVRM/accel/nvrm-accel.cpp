@@ -187,6 +187,32 @@ class IOAccelNVRMCarrier : public IOService {
 };
 OSDefineMetaClassAndStructors(IOAccelNVRMCarrier, IOService)
 
+#ifdef NMX_XEGFX
+// WindowServer's sandbox lets it open /dev/dri read-only but never ioctl(2) a device node; it may open IOAccel*
+// user clients. libdrm sends its ioctls here with the minor of its read-only fd, XeGfx checks the caller opened it.
+class IOAccelXeGfxDRMClient : public IOUserClient {
+    OSDeclareDefaultStructors(IOAccelXeGfxDRMClient)
+public:
+    IOReturn clientClose() APPLE_KEXT_OVERRIDE { terminate(); return kIOReturnSuccess; }
+    IOReturn externalMethod(uint32_t sel, IOExternalMethodArguments *a, IOExternalMethodDispatch *,
+                            OSObject *, void *) APPLE_KEXT_OVERRIDE {
+        static IOService *res;
+        if (sel != 0 || a->scalarInputCount != 3 || a->scalarOutputCount != 1) return kIOReturnBadArgument;
+        if (!res) { OSDictionary *m = serviceMatching("XeGfxResident"); if (m) res = waitForMatchingService(m, 1000ULL * 1000 * 1000); }
+        if (!res) return kIOReturnNotAttached;
+        int err = EIO;
+        const OSSymbol *fn = OSSymbol::withCStringNoCopy("xgDrmIoctl");
+        IOReturn r = res->callPlatformFunction(fn, false, (void *)(uintptr_t)a->scalarInput[0],
+                                               (void *)(uintptr_t)a->scalarInput[1],
+                                               (void *)(uintptr_t)a->scalarInput[2], &err);
+        if (fn) fn->release();
+        a->scalarOutput[0] = (uint64_t)err;
+        return r;
+    }
+};
+OSDefineMetaClassAndStructors(IOAccelXeGfxDRMClient, IOUserClient)
+#endif
+
 class NVAccel : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(NVAccel)
     NM_TAHOE_FWD(NVAccel)
@@ -538,6 +564,21 @@ public:
     IOService *fNVRM = nullptr;
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+#ifdef NMX_XEGFX
+        if (type == 0x58474452u) {   // 'XGDR'
+            IOService *carrier = nullptr;
+            for (unsigned i = 0; i < NV_CARRIERS && !carrier; i++)
+                carrier = fCarriers[(fCarrierNext + i) % NV_CARRIERS];
+            fCarrierNext++;
+            IOAccelXeGfxDRMClient *uc = OSTypeAlloc(IOAccelXeGfxDRMClient);
+            if (!uc || !carrier || !uc->initWithTask(owningTask, securityID, type)) { if (uc) uc->release(); return kIOReturnNoResources; }
+            if (!uc->attach(carrier)) { uc->release(); return kIOReturnInternalError; }
+            if (!uc->start(carrier)) { uc->detach(carrier); uc->release(); return kIOReturnInternalError; }
+            if (fUcLogged < 40) { fUcLogged++; ALOG("newUserClient('XGDR') -> DRM ioctl client for pid %d", proc_selfpid()); }
+            *handler = uc;
+            return kIOReturnSuccess;
+        }
+#endif
         if ((type & 0xFFFF0000u) != 0x4E560000u) {
             IOReturn fr = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
             if (fUcLogged < 40) { fUcLogged++;
