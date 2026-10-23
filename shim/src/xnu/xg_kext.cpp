@@ -32,10 +32,13 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.30", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.31", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
+extern int xg_spin_panic;
+extern unsigned long long xg_spin_max_us;
+extern unsigned int xg_spin_long;
 /* the firmware's console image, when pipe A scans it out at probe; i915's stolen allocator starts after it */
 unsigned long long xg_boot_fb_phys, xg_boot_fb_size;
 }
@@ -64,6 +67,8 @@ static thread_call_t gTraceCall;
 static bool gTraceOn;
 static char gLast[600];	/* the newest console lines, oldest dropped first */
 static unsigned gLastSeq, gTraceSeq;
+static char gAccel[96];	/* XeGfxAccel's breadcrumb (xgTrace), NVRAM xegfx-accel */
+static unsigned gAccelSeq, gAccelTraceSeq;
 static int gTraceProgress;
 static void xg_trace_write(void);
 
@@ -114,6 +119,14 @@ XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, v
 {
 	if (name && name->isEqualTo("xgDrmIoctl") && p4) {
 		*(int *)p4 = xg_fd_remote_ioctl((int)(uintptr_t)p1, (unsigned long)p2, (unsigned long long)(uintptr_t)p3);
+		return kIOReturnSuccess;
+	}
+	/* "xgTrace" (const char *line): XeGfxAccel's state, stored with the console trace (thread context only) */
+	if (name && name->isEqualTo("xgTrace") && p1 && gLogLock) {
+		IOInterruptState is = IOSimpleLockLockDisableInterrupt(gLogLock);
+		strlcpy(gAccel, (const char *)p1, sizeof(gAccel));
+		gAccelSeq++;
+		IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
 		return kIOReturnSuccess;
 	}
 	return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
@@ -413,6 +426,7 @@ xg_run_stage(int s)
 	gRunning = s;
 	xg_progress = s * 10;
 	gTraceOn = xg_env_has("xegfx.nvram_trace=1");
+	xg_spin_panic = !xg_env_has("xegfx.spin_panic=0");
 	if (gTraceOn) {
 		xg_trace_write();
 		thread_call_enter(gTraceCall);
@@ -505,12 +519,16 @@ static void
 xg_trace_write(void)
 {
 	static bool kept;
-	char b[sizeof(gLast) + 40], line[sizeof(gLast)];
+	char b[sizeof(gLast) + 40], line[sizeof(gLast)], accel[sizeof(gAccel)];
 	IORegistryEntry *o;
 	IOInterruptState is;
+	bool accelNew;
 
 	is = IOSimpleLockLockDisableInterrupt(gLogLock);
 	memcpy(line, gLast, sizeof(line));
+	memcpy(accel, gAccel, sizeof(accel));
+	accelNew = gAccelSeq != gAccelTraceSeq;
+	gAccelTraceSeq = gAccelSeq;
 	gTraceSeq = gLastSeq;
 	gTraceProgress = xg_progress;
 	IOSimpleLockUnlockEnableInterrupt(gLogLock, is);
@@ -532,6 +550,13 @@ xg_trace_write(void)
 		o->setProperty("xegfx-step", d);
 		d->release();
 	}
+	if (accelNew && accel[0]) {
+		snprintf(b, sizeof(b), "spin %llu us/%u %s", xg_spin_max_us, xg_spin_long, accel);
+		if (OSData *d = OSData::withBytes(b, (unsigned)strlen(b))) {
+			o->setProperty("xegfx-accel", d);
+			d->release();
+		}
+	}
 	if (IODTNVRAM *nv = OSDynamicCast(IODTNVRAM, o))
 		nv->sync();
 	o->release();
@@ -544,7 +569,7 @@ xg_trace_fire(thread_call_param_t, thread_call_param_t)
 
 	if (!gTraceOn)
 		return;
-	if (gLastSeq != gTraceSeq || xg_progress != gTraceProgress)
+	if (gLastSeq != gTraceSeq || xg_progress != gTraceProgress || gAccelSeq != gAccelTraceSeq)
 		xg_trace_write();
 	clock_interval_to_deadline(250, NSEC_PER_MSEC, &dl);
 	thread_call_enter_delayed(gTraceCall, dl);
@@ -594,6 +619,16 @@ xegfx_trace_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 	}
 	return 0;
 }
+static int
+xegfx_spin_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	char b[80];
+
+	snprintf(b, sizeof(b), "max_us %llu long %u panic %d", xg_spin_max_us, xg_spin_long, xg_spin_panic);
+	return SYSCTL_OUT(req, b, strlen(b) + 1);
+}
+SYSCTL_PROC(_debug, OID_AUTO, xegfx_spin, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_spin_sysctl, "A",
+    "the longest lock spin seen, spins over 10 ms, whether a spin past its limit panics");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_trace, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_trace_sysctl,
     "I", "1 = write the newest console line to NVRAM xegfx-step whenever it changes, outside the stages too");
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_stage, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, xegfx_stage_sysctl,
@@ -637,6 +672,7 @@ static struct sysctl_oid *const gOids[] = {
 	&sysctl__debug_xegfx_progress, &sysctl__debug_xegfx_wdog, &sysctl__debug_xegfx_env, &sysctl__debug_xegfx_log,
 	&sysctl__debug_xegfx_hold,
 	&sysctl__debug_xegfx_trace,
+	&sysctl__debug_xegfx_spin,
 };
 
 /* Linux's struct va_format, the argument of "%pV" */
