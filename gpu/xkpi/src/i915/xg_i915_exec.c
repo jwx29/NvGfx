@@ -16,6 +16,8 @@
 #include "gt/intel_ring.h"
 #include "gt/intel_gt.h"
 #include "gt/uc/intel_uc.h"
+#include "gt/intel_gtt.h"
+#include "i915_gem_gtt.h"
 
 #include "xg_i915.h"
 
@@ -163,4 +165,31 @@ xg_i915_store(struct xg_i915_store *sd, int timeout_ms)
 	}
 	pci_dev_put(pdev);
 	return (0);
+}
+
+/*
+ * With display disabled i915 never takes over the firmware's plane, so the GGTT range the boot surface scans out of
+ * is free for the next pin: once WindowServer composites into it (X6), a context or ring placed there means our
+ * frame copy writes over GPU state (N-251, N-255 froze about a minute in). Reserve it, PTEs left as they are.
+ */
+int
+xg_i915_reserve_bootfb(unsigned long long offset, unsigned long long size)
+{
+	static struct drm_mm_node node;
+	struct drm_i915_private *i915;
+	struct pci_dev *pdev;
+	struct i915_ggtt *ggtt;
+	int err;
+
+	if ((i915 = xg_i915_find(&pdev)) == NULL)
+		return (-ENODEV);
+	if (drm_mm_node_allocated(&node))
+		return (0);
+	ggtt = to_gt(i915)->ggtt;
+	offset = round_down(offset, I915_GTT_PAGE_SIZE);
+	size = round_up(size, I915_GTT_PAGE_SIZE);
+	mutex_lock(&ggtt->vm.mutex);
+	err = i915_gem_gtt_reserve(&ggtt->vm, NULL, &node, size, offset, I915_COLOR_UNEVICTABLE, PIN_NOEVICT);
+	mutex_unlock(&ggtt->vm.mutex);
+	return (err);
 }
