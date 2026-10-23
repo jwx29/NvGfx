@@ -1450,6 +1450,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h2);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h3);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
+#ifdef NMX_XEGFX
+    { extern struct sysctl_oid sysctl__debug_nvaccel_scanout_copies; sysctl_register_oid(&sysctl__debug_nvaccel_scanout_copies); }
+#endif
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
     gSysctlInstalled = true;
@@ -2401,9 +2404,17 @@ static unsigned nvFlipWhy = 0;
 
 #define NVSCANOUT_COPY_MAX 120
 static unsigned nvScanoutCopies = 0;
+#ifdef NMX_XEGFX
+// over XeGfx this copy is how WindowServer's frames reach the panel (N-254), not a bring-up probe: no cap, counted
+static SInt64 gCntScanoutCopies;
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_copies, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntScanoutCopies,
+            "composited frames copied onto the boot framebuffer by the swap path");
+#endif
 static bool nvAccelCopyToScanout(IOAccelResource2 *res)
 {
+#ifndef NMX_XEGFX
     if (nvScanoutCopies >= NVSCANOUT_COPY_MAX) return false;
+#endif
     if (!res) return false;
     NVAccel *a = NVAccel::gAccel;
     if (!a || !a->fFB) { NVFLIPWHY("copyToScanout: no accelerator/framebuffer"); return false; }
@@ -2439,7 +2450,12 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
     nvScanoutCopies++;
+#ifdef NMX_XEGFX
+    OSAddAtomic64(1, &gCntScanoutCopies);
+    if (nvScanoutCopies <= 3)
+#else
     if (nvScanoutCopies <= 3 || nvScanoutCopies == NVSCANOUT_COPY_MAX)
+#endif
         ALOG("*** COPIED THE COMPOSITED FRAME ONTO THE PANEL *** #%u: %ux%u, %u rows x %u bytes, "
              "src kva %p pitch %u -> scanout kva %p phys 0x%llx pitch %u%s",
              nvScanoutCopies, w, h, rows, rowb, vm->fKva, pitch, q.kva,
