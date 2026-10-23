@@ -82,6 +82,13 @@ struct vt_device *main_vd = &xg_vm_vd;
 #define	XG_RUN_PAGES	1	/* vm_page_alloc*: CPU access through the DMAP */
 #define	XG_RUN_KMEM	2	/* kmem_alloc_contig: also has a kernel mapping */
 #define	XG_RUN_FICT	3	/* vm_phys_fictitious_reg_range: device memory, no backing */
+#define	XG_RUN_USER	4	/* one wired page of a process (vm_fault_quick_hold_pages, X5) */
+
+/* one IOKit wiring of a user range; every page run made from it holds a reference, the last one unwires the range */
+struct xg_vm_hold {
+	volatile u_int	refs;
+	xg_vm_xmem_t	xm;
+};
 
 struct xg_vm_run {
 	uint64_t	pa;		/* trie key */
@@ -90,6 +97,7 @@ struct xg_vm_run {
 	int		kind;
 	xg_vm_xmem_t	xm;
 	char		*kva;		/* the IOKit allocation's kernel mapping */
+	struct xg_vm_hold *hold;	/* USER */
 	struct vm_page	pages[];
 };
 
@@ -438,6 +446,15 @@ xg_vm_run_find(vm_paddr_t pa)
 }
 
 static void
+xg_vm_hold_put(struct xg_vm_hold *h)
+{
+	if (h != NULL && atomic_fetchadd_int(&h->refs, -1) == 1) {
+		xg_vm_x_release(h->xm);
+		free(h, M_XGVM);
+	}
+}
+
+static void
 xg_vm_run_destroy(struct xg_vm_run *r)
 {
 	struct xg_vm_kmap *k;
@@ -447,6 +464,11 @@ xg_vm_run_destroy(struct xg_vm_run *r)
 	mtx_lock(&xg_vm_mtx);
 	XG_VM_RUN_PCTRIE_REMOVE(&xg_vm_runs, r->pa);
 	mtx_unlock(&xg_vm_mtx);
+	if (r->kind == XG_RUN_USER) {
+		xg_vm_hold_put(r->hold);
+		free(r, M_XGVM);
+		return;
+	}
 	if (r->kind != XG_RUN_FICT)
 		atomic_subtract_long(&xg_vm_npages, r->npages);
 	xg_vm_x_release(r->xm);
@@ -1697,23 +1719,79 @@ vm_map_range_valid_KBI(vm_map_t map, vm_offset_t start, vm_offset_t end)
 	return (start < end && end <= XG_VM_MAXUSER);
 }
 
-/* user page wiring (userptr, get_user_pages) is X5 work: until then every lookup misses (docs/xg_vm.md) */
+/* single-page user lookups are not used by the GPU stack; vm_fault_quick_hold_pages below wires whole ranges */
 vm_page_t
 pmap_extract_and_hold(pmap_t pmap, vm_offset_t va, vm_prot_t prot)
 {
 	return (NULL);
 }
 
+/*
+ * X5 user page holds for i915 userptr (ANV's VK_EXT_external_memory_host): the range of the calling process is wired
+ * through IOKit (the map argument is the shim's proc0 for every process, so the task comes from the thread), and each
+ * page gets a one-page USER run so PHYS_TO_VM_PAGE and the vm_page wire counts work as on FreeBSD. LinuxKPI's
+ * put_page unwires a page; its last unwire frees the run, and the last run of a hold completes the IOKit wiring. A
+ * page held twice (two userptr objects over one buffer) is wired again on its existing run.
+ */
 int
 vm_fault_quick_hold_pages(vm_map_t map, vm_offset_t addr, vm_size_t len, vm_prot_t prot, vm_page_t *ma,
     int max_count)
 {
-	static int warned;
+	vm_offset_t start = trunc_page(addr), end = round_page(addr + len);
+	int n = (int)atop(end - start), i;
+	unsigned long long *pa;
+	struct xg_vm_hold *h;
 
-	if (!warned) {
-		warned = 1;
-		printf("xegfx: vm: user page holds (userptr) are not implemented yet\n");
+	if (len == 0)
+		return (0);
+	if (n > max_count || end <= start || end > XG_VM_MAXUSER)
+		return (-1);
+	xg_vm_init();
+	if ((pa = malloc(n * sizeof(*pa), M_XGVM, M_WAITOK)) == NULL)
+		return (-1);
+	if ((h = malloc(sizeof(*h), M_XGVM, M_WAITOK | M_ZERO)) == NULL) {
+		free(pa, M_XGVM);
+		return (-1);
 	}
+	h->refs = 1;	/* this function's own; dropped at the end */
+	h->xm = xg_vm_x_hold_user(start, (unsigned int)n, (prot & VM_PROT_WRITE) != 0, pa);
+	if (h->xm == NULL) {
+		free(h, M_XGVM);
+		free(pa, M_XGVM);
+		return (-1);
+	}
+	for (i = 0; i < n; i++) {
+		struct xg_vm_run *r;
+
+		for (;;) {
+			if ((r = xg_vm_run_find(pa[i])) != NULL) {
+				if (r->kind != XG_RUN_USER)
+					goto fail;	/* a shim page mapped into a process: no user mappings exist yet */
+				atomic_add_int(&r->pages[0].ref_count, 1);
+				break;
+			}
+			if ((r = xg_vm_run_new(1, XG_RUN_USER)) == NULL)
+				goto fail;
+			r->pa = pa[i];
+			r->hold = h;
+			xg_vm_page_init(&r->pages[0], pa[i], VM_MEMATTR_DEFAULT);
+			r->pages[0].ref_count = 1;
+			atomic_add_int(&h->refs, 1);
+			if (xg_vm_run_insert(r) == 0)
+				break;
+			atomic_subtract_int(&h->refs, 1);	/* another hold inserted this page first: wire that one */
+			free(r, M_XGVM);
+		}
+		ma[i] = &r->pages[0];
+	}
+	free(pa, M_XGVM);
+	xg_vm_hold_put(h);
+	return (n);
+fail:
+	while (--i >= 0)
+		vm_page_unwire(ma[i], PQ_NONE);
+	free(pa, M_XGVM);
+	xg_vm_hold_put(h);
 	return (-1);
 }
 

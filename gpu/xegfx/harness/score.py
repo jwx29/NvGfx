@@ -76,8 +76,13 @@ def make_list(path, var, kconfig=None):
     return out
 
 
+# features drm-kmod leaves off that the shim provides: MMU_NOTIFIER enables i915 userptr (X5, shim/include/linux/mmu_notifier.h)
+KCONFIG_ADD = ["MMU_NOTIFIER"]
+
+
 def kconfig():
-    return [v for v in make_list(os.path.join(KMOD, "kconfig.mk"), "KCONFIG") if v.partition("=")[0] not in KCONFIG_DROP]
+    return [v for v in make_list(os.path.join(KMOD, "kconfig.mk"), "KCONFIG") if v.partition("=")[0] not in KCONFIG_DROP] \
+        + [k for k in KCONFIG_ADD]
 
 
 def kconfig_defines():
