@@ -2,7 +2,9 @@
 // ANV). N-263/N-265: WindowServer on the Intel GPU managed about 2.5 frames a second and CoreAnimation timed out its
 // fences. Each test runs on a 2560x1600 IOSurface texture, commit + waitUntilCompleted, and prints min/avg/max ms:
 // clear (render pass only), blit (texture to texture), draw (full-screen quad sampling a texture, blended).
-// MTLBENCH_N=iterations (default 30). Exit 0 when every command buffer completed.
+// MTLBENCH_N=iterations (default 30). MTLBENCH_PRIVATE=1: Private textures instead of IOSurfaces, which separates
+// the plugin's IOSurface copies (Intel: private per process, copied out after every GPU write) from the GPU work.
+// Exit 0 when every command buffer completed.
 // <wtl> project: xegfx | author: watchthelight </wtl>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -16,6 +18,13 @@ static double now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e
 
 static id<MTLTexture> surface_texture(id<MTLDevice> dev, MTLTextureUsage usage)
 {
+    if (getenv("MTLBENCH_PRIVATE") && getenv("MTLBENCH_PRIVATE")[0] == '1') {
+        MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                      width:kW height:kH mipmapped:NO];
+        pd.usage = usage;
+        pd.storageMode = MTLStorageModePrivate;
+        return [dev newTextureWithDescriptor:pd];
+    }
     NSDictionary *p = @{(id)kIOSurfaceWidth: @(kW), (id)kIOSurfaceHeight: @(kH), (id)kIOSurfaceBytesPerElement: @4,
                         (id)kIOSurfaceBytesPerRow: @(kW * 4), (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA')};
     IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)p);
