@@ -63,3 +63,6 @@ Install the package `package.sh` produces with NullMoth's own `install.sh`; it b
 ## Credits and licence
 
 NullMoth Systems wrote the driver. Third-party parts, per `NOTICE`: NVIDIA's open GPU kernel modules (MIT / GPL-2.0), Mesa NVK (MIT), metal2vulkan by Anees Iqbal (LGPL-3.0 or later, the base of `translator/`), NVIDIA GSP firmware under NVIDIA's firmware licence. The fork, like upstream, is under the PolyForm Noncommercial License 1.0.0.
+
+Projects we learned from:
+- [thanhnndev/nvidia-macos-driver](https://github.com/thanhnndev/nvidia-macos-driver): an AppleGraphicsDeviceControl service for a non-NVIDIA panel (NMXAGDC), the 0x2001 client-set reply CoreDisplay waits for before it sends display-pipe transactions, and why WindowServer must keep the accelerator that owns the main display.
