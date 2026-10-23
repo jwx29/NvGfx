@@ -10,6 +10,7 @@
 #include <sys/conf.h>
 #include <sys/proc.h>
 #include <sys/uio.h>
+#include <sys/ioccom.h>
 #include <sys/select.h>
 #include <sys/kauth.h>
 #include <sys/vnode.h>
@@ -148,6 +149,36 @@ xg_fd_d_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
 	if (inst < 0)
 		return (ENXIO);
 	return (xg_fd_errno(xg_fd_dev_ioctl(inst, cmd, data, fflag)));
+}
+
+/* what d_ioctl would get, with the copies ioctl(2) makes around it; only the opener may use an instance */
+extern "C" int
+xg_fd_remote_ioctl(int minor, unsigned long cmd, unsigned long long uarg)
+{
+	int inst = xg_fd_inst_of(xg_fd_makedev(0, minor)), error;
+	size_t len = IOCPARM_LEN(cmd);
+	char small[256] __attribute__((aligned(16)));
+	char *buf = small;
+
+	if (inst < 0 || xg_fd_inst_owner(inst) != proc_selfpid())
+		return (EBADF);
+	if (len > IOCPARM_MAX)
+		return (ENOTTY);
+	if (len > sizeof(small) && (buf = (char *)IOMalloc(len)) == NULL)
+		return (ENOMEM);
+	bzero(buf, len > sizeof(small) ? len : sizeof(small));
+	error = 0;
+	if ((cmd & IOC_IN) && len != 0)
+		error = copyin((user_addr_t)uarg, buf, len);
+	else if ((cmd & IOC_VOID) && len == 0)
+		*(user_addr_t *)buf = (user_addr_t)uarg;
+	if (error == 0)
+		error = xg_fd_errno(xg_fd_dev_ioctl(inst, cmd, buf, 0));
+	if (error == 0 && (cmd & IOC_OUT) && len != 0)
+		error = copyout(buf, (user_addr_t)uarg, len);
+	if (buf != small)
+		IOFree(buf, len);
+	return (error);
 }
 
 static int
