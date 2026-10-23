@@ -281,6 +281,11 @@ __get_user_pages_fast(unsigned long start, int nr_pages, int write,
 	end = start + ptoa((vm_offset_t)nr_pages);
 	if (!vm_map_range_valid(map, start, end))
 		return (-EINVAL);
+#ifdef __XNU_LKPI__
+	/* <wtl> XNU: no pmap behind the shim's vmspace (map->pmap faulted at 0xa0, N-268/N-269); the X5 hold wires the
+	   whole range through IOKit, and a 0 return would spin i915's userptr pin loop </wtl> */
+	return (linux_get_user_pages_internal(map, start, nr_pages, write, pages));
+#endif
 	prot = write ? (VM_PROT_READ | VM_PROT_WRITE) : VM_PROT_READ;
 	for (count = 0, mp = pages, va = start; va < end;
 	    mp++, va += PAGE_SIZE, count++) {
