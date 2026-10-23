@@ -124,6 +124,15 @@ static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in,
         OSObject *o = slot[i] ? slot[i]->copyProperty("NVRMTiming") : NULL; OSData *d = OSDynamicCast(OSData, o);
         if (d) { have = true; tBytes = d->getLength(); bzero(t[i], sizeof t[i]); if (tBytes == sizeof t[i]) memcpy(t[i], d->getBytesNoCopy(), sizeof t[i]); }
         OSSafeReleaseNULL(o);
+#ifdef NMX_XEGFX
+        // Apple's boot framebuffer has no timing record: the built-in panel's native mode, as NVRMFB publishes it for
+        // the same panel in Discrete (N-182 NVRMTiming), which the firmware also sets on the iGPU
+        if (!have) {
+            static const uint32_t panel[NVK5_TIMING_WORDS] = { NVK5_TIMING_TAG, 782710000u, 2560, 2640, 2672, 2720,
+                                                               1600, 1670, 1678, 1744, 165000, 0, 1 };
+            memcpy(t[i], panel, sizeof panel); have = true; tBytes = sizeof panel;
+        }
+#endif
         h[i].t = have ? t[i] : NULL; h[i].tBytes = tBytes;
     }
     int why = 0; int32_t idx = -1;
