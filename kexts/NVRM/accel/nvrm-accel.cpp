@@ -551,6 +551,7 @@ public:
     }
 #ifdef NMX_XEGFX
     IOMemoryMap *fBootFBMap = nullptr;
+    IOPhysicalAddress fBootFBPhys = 0;
     IOReturn describeBootFramebuffer(IOFramebuffer *ifb, struct NVRMVramRequest *r) {
         IODisplayModeID mode = 0; IOIndex depth = 0; IOPixelInformation pi = {};
         if (ifb->getCurrentDisplayMode(&mode, &depth) != kIOReturnSuccess ||
@@ -561,12 +562,15 @@ public:
         if (!fBootFBMap) {
             IODeviceMemory *mem = ifb->getApertureRange(kIOFBSystemAperture);
             if (!mem) { ALOG("boot framebuffer %s: no system aperture", ifb->getName()); return kIOReturnNoMemory; }
+            fBootFBPhys = mem->getPhysicalAddress();
             fBootFBMap = mem->map(kIOMapWriteCombineCache);
             mem->release();
             if (!fBootFBMap) { ALOG("boot framebuffer %s: aperture map failed", ifb->getName()); return kIOReturnNoMemory; }
         }
         r->kva = (void *)fBootFBMap->getVirtualAddress();
-        r->phys = 0;
+        // the aperture's real address: the family wants a scanout resource on the pipe before it marks it active and
+        // sends transactions (N-253: phys 0 = CPU-only, no resource, pipe never active, no frames)
+        r->phys = fBootFBPhys;
         r->width = pi.activeWidth; r->height = pi.activeHeight; r->pitch = pi.bytesPerRow;
         r->actualSize = fBootFBMap->getLength(); r->size = r->actualSize;
         ALOG("boot framebuffer %s: %u x %u pitch %u, %llu bytes at %p (CPU copy target)", ifb->getName(), r->width,
@@ -854,6 +858,9 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     m->fScanout = true;
     m->fPhys    = r.phys;
     m->fBytes   = r.actualSize;
+#ifdef NMX_XEGFX
+    m->fKva     = r.kva;
+#endif
     *(volatile unsigned long long *)((unsigned char *)m + 0xc8) = r.phys;
     ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u, res %p) -> vidmem %p over the LIVE SCANOUT "
          "phys 0x%llx %u x %u pitch %u (%llu bytes)",
@@ -897,7 +904,12 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
         return nullptr;
     }
 #ifdef NMX_XEGFX
-    // system memory: the buffer itself, never a device range over the made-up phys
+    // system memory: the buffer itself, never a device range over the made-up phys; the scanout is the real aperture
+    if (m->fScanout) {
+        IODeviceMemory *sd = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
+        if (sd) fApDesc = sd;
+        return fApDesc;
+    }
     if (IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, (OSObject *)m->fRmHandle)) {
         b->retain(); fApDesc = b; return fApDesc;
     }
