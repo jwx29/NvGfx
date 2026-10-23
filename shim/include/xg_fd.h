@@ -36,6 +36,14 @@ int	xg_fd_dev_ioctl(int inst, unsigned long cmd, void *data, int fflags);
 int	xg_fd_dev_rw(int inst, int write, unsigned long long uaddr, unsigned long len, long long *offset,
 	    int nonblock, unsigned long *done);
 int	xg_fd_dev_poll(int inst, int which);
+/* pid that opened the instance, -1 when it is not open */
+int	xg_fd_inst_owner(int inst);
+
+/*
+ * XNU side: an ioctl on an open instance named by its minor, for callers whose sandbox forbids ioctl(2) on device
+ * nodes (WindowServer); the XeGfxAccel user client calls it. Returns an XNU errno.
+ */
+int	xg_fd_remote_ioctl(int minor, unsigned long cmd, unsigned long long uarg);
 
 /* XNU side, called from xg_fd.c */
 int	xg_fd_xnu_node_create(int slot, unsigned int uid, unsigned int gid, int mode, const char *name,
