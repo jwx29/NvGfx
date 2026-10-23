@@ -4,15 +4,22 @@
 // clear (render pass only), blit (texture to texture), draw (full-screen quad sampling a texture, blended).
 // MTLBENCH_N=iterations (default 30). MTLBENCH_PRIVATE=1: Private textures instead of IOSurfaces, which separates
 // the plugin's IOSurface copies (Intel: private per process, copied out after every GPU write) from the GPU work.
-// Exit 0 when every command buffer completed.
+// NM_TEST_PLUGIN=<NVMTLDriver build>: that plugin in this process only (as mtlprobe). The clear and blit results are
+// also checked through the IOSurfaces' base addresses (surface-out, and surface-in for the CPU-filled blit source).
+// Exit 0 when every command buffer completed and the pixels match.
 // <wtl> project: xegfx | author: watchthelight </wtl>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #include <stdlib.h>
+#include <dlfcn.h>
+#include <objc/message.h>
+#include <IOKit/IOKitLib.h>
 #include <time.h>
 
 static const NSUInteger kW = 2560, kH = 1600;
+
+static IOSurfaceRef g_surf[2]; static int g_nsurf;
 
 static double now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
 
@@ -34,7 +41,7 @@ static id<MTLTexture> surface_texture(id<MTLDevice> dev, MTLTextureUsage usage)
     td.usage = usage;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [dev newTextureWithDescriptor:td iosurface:s plane:0];
-    CFRelease(s);
+    if (g_nsurf < 2) g_surf[g_nsurf++] = s; else CFRelease(s);
     return t;
 }
 
@@ -51,8 +58,18 @@ int main(void)
 {
     @autoreleasepool {
         id<MTLDevice> dev = nil;
-        for (id<MTLDevice> d in MTLCopyAllDevices())
-            if ([d.name rangeOfString:@"Intel" options:NSCaseInsensitiveSearch].location != NSNotFound) dev = d;
+        const char *plugin = getenv("NM_TEST_PLUGIN");
+        if (plugin) {
+            if (!dlopen(plugin, RTLD_NOW | RTLD_LOCAL)) { printf("dlopen: %s\n", dlerror()); return 3; }
+            io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
+            if (!svc) { printf("no NMXAccel service\n"); return 2; }
+            dev = ((id (*)(id, SEL, mach_port_t))objc_msgSend)([NSClassFromString(@"NVMTLDevice") alloc],
+                                                               NSSelectorFromString(@"initWithAcceleratorPort:"), svc);
+            printf("test plugin %s: %s\n", plugin, dev ? dev.name.UTF8String : "no device");
+        } else
+            for (id<MTLDevice> d in MTLCopyAllDevices())
+                if ([d.name rangeOfString:@"Intel" options:NSCaseInsensitiveSearch].location != NSNotFound) dev = d;
+        if (!dev && getenv("MTLBENCH_ANY")) dev = MTLCreateSystemDefaultDevice();   // checks the test itself on another GPU
         if (!dev) { printf("no Intel Metal device\n"); return 2; }
         printf("using %s\n", dev.name.UTF8String);
         int n = getenv("MTLBENCH_N") ? atoi(getenv("MTLBENCH_N")) : 30;
@@ -80,6 +97,25 @@ int main(void)
             fails += cb.status != MTLCommandBufferStatusCompleted;
         }
         int bad = report("clear", t, n, fails);
+        int wrong = 0;
+        if (g_nsurf == 2) {
+            const uint32_t want = ((n - 1) & 1 ? 0xffff0000u : 0xff000000u) | 0x00008000u;   // BGRA bytes as a little-endian word
+            IOSurfaceLock(g_surf[0], kIOSurfaceLockReadOnly, NULL);
+            const uint8_t *b = IOSurfaceGetBaseAddress(g_surf[0]); size_t row = IOSurfaceGetBytesPerRow(g_surf[0]);
+            for (int k = 0; k < 64; k++) {
+                uint32_t v = *(const uint32_t *)(b + (size_t)(k * 25 % kH) * row + (size_t)(k * 39 % kW) * 4);
+                int dg = (int)((v >> 8) & 0xff) - 0x80;
+                wrong += (v & 0xffff00ffu) != (want & 0xffff00ffu) || dg < -1 || dg > 1;
+            }
+            IOSurfaceUnlock(g_surf[0], kIOSurfaceLockReadOnly, NULL);
+            printf("check clear: %d of 64 wrong\n", wrong);
+            // CPU pattern into the blit source (surface-in on the next use)
+            IOSurfaceLock(g_surf[1], 0, NULL);
+            uint8_t *sb = IOSurfaceGetBaseAddress(g_surf[1]); size_t sr = IOSurfaceGetBytesPerRow(g_surf[1]);
+            for (NSUInteger y = 0; y < kH; y++) for (NSUInteger x = 0; x < kW; x++)
+                *(uint32_t *)(sb + y * sr + x * 4) = 0xff000000u | (uint32_t)((x * 7) & 0xff) << 16 | (uint32_t)(y & 0xff) << 8 | (uint32_t)((x ^ y) & 0xff);
+            IOSurfaceUnlock(g_surf[1], 0, NULL);
+        }
 
         // blit: one full-panel texture copy
         fails = 0;
@@ -97,6 +133,19 @@ int main(void)
             fails += cb.status != MTLCommandBufferStatusCompleted;
         }
         bad |= report("blit", t, n, fails);
+        if (g_nsurf == 2) {
+            int bw = 0;
+            IOSurfaceLock(g_surf[0], kIOSurfaceLockReadOnly, NULL);
+            const uint8_t *b = IOSurfaceGetBaseAddress(g_surf[0]); size_t row = IOSurfaceGetBytesPerRow(g_surf[0]);
+            for (int k = 0; k < 256; k++) {
+                NSUInteger x = (NSUInteger)(k * 997) % kW, y = (NSUInteger)(k * 613) % kH;
+                uint32_t want = 0xff000000u | (uint32_t)((x * 7) & 0xff) << 16 | (uint32_t)(y & 0xff) << 8 | (uint32_t)((x ^ y) & 0xff);
+                bw += *(const uint32_t *)(b + y * row + x * 4) != want;
+            }
+            IOSurfaceUnlock(g_surf[0], kIOSurfaceLockReadOnly, NULL);
+            printf("check blit (CPU pattern in, GPU copy, read back): %d of 256 wrong\n", bw);
+            wrong += bw;
+        }
 
         // draw: a full-screen quad sampling src, alpha-blended over dst (what a compositor does per layer)
         NSString *s = @"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -136,7 +185,7 @@ int main(void)
         }
         bad |= report("draw", t, n, fails);
         free(t);
-        printf("metal bench: %s\n", bad ? "INCOMPLETE" : "OK");
-        return bad ? 5 : 0;
+        printf("metal bench: %s\n", bad ? "INCOMPLETE" : wrong ? "WRONG PIXELS" : "OK");
+        return bad ? 5 : wrong ? 6 : 0;
     }
 }
