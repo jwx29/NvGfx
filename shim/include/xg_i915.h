@@ -46,6 +46,8 @@ int xg_i915_exec(struct xg_i915_exec *ex, int timeout_ms);
 void xg_i915_map_init(void);
 /* every engine writes a value into its own status page with MI_STORE_DWORD_IMM through the GGTT; the CPU reads it */
 int xg_i915_store(struct xg_i915_store *sd, int timeout_ms);
+/* keep i915 off the GGTT range the boot surface scans out of (Hybrid, display disabled); 0 or a negative errno */
+int xg_i915_reserve_bootfb(unsigned long long offset, unsigned long long size);
 
 #ifdef __cplusplus
 }
