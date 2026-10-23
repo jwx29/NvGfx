@@ -926,6 +926,23 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             }
         }
     }
+    // <wtl>
+    // Intel/AMD: the image is laid over the surface's own pages (explicit linear layout, the surface's bytesPerRow), so
+    // what the GPU draws is in the surface when the command buffer completes, and CPU writes need no upload (I-108).
+    if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_host_on()) {
+        size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
+        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0
+            && !nvmtl_vk_surface_host_import(IOSurfaceGetBaseAddress(surf), IOSurfaceGetAllocSize(surf), &t->_hostBuf)) {
+            if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &t->_hostBuf, 0, row, &t->_i)) {
+                t->_hostState = 1; t->_hostImg = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+                static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                    nvlog("surface %u %ux%u pitch %zu -> an image in the surface's own pages (no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+                return 0;
+            }
+            nvmtl_vk_buffer_destroy(&t->_hostBuf); t->_hostState = 0;
+        }
+    }
+    // </wtl>
     g_surf_private++;
     // A private image stands for the whole surface: wrappers that read it and wrappers that write it must share ONE image
     // (nvmtlNewSurfaceTexture caches it), or what one writes the other never sees. So it is made writable whenever the

@@ -1237,6 +1237,7 @@ static int nvmtl_surface_host_xfer(NVMTLTexture *r, size_t row, int to_image) {
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
+    if (r->_hostImg) { r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES; return; }   // CPU writes are already in the image
     @synchronized (nvmtl_surface_sync(r)) {
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
@@ -1292,6 +1293,12 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return YES;
+    if (r->_hostImg) {   // the GPU wrote the surface's pages themselves; a write lock only moves the seed for other processes
+        uint32_t seed = 0;
+        if (!nvmtl_noseed() && IOSurfaceLock(r->_surf, 0, NULL) == kIOReturnSuccess) IOSurfaceUnlock(r->_surf, 0, &seed);
+        r->_surfSeed = seed ? seed : IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
+        return YES;
+    }
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) { nvtrace("SURFOUT surf %u %ux%u NOT copyable", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h); return NO; }
     nvtrace("SURFOUT surf %u %ux%u vramOn %d t=%llu", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h, (int)r->_vramOn,

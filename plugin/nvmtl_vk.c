@@ -7487,6 +7487,13 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
             | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (render ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
         VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_PREINITIALIZED };
+    // <wtl> host-pointer memory (an IOSurface's pages on Intel/AMD) takes only images that say so; ANV wants the explicit layout too
+    VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, ici.pNext, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
+    if (b->imported) {
+        if (!g_linmod) { nvlog("buffer texture: host-pointer memory needs an explicit layout (no VK_EXT_image_drm_format_modifier)"); return -1; }
+        ici.pNext = &emi;
+    }
+    // </wtl>
     uint32_t vp = a8 ? 0 : nvmtl_vk_srgb_pair(vkfmt);
     VkFormat vfl[2] = { (VkFormat)vkfmt, (VkFormat)vp };
     VkImageFormatListCreateInfo fl = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, ici.pNext, 2, vfl };

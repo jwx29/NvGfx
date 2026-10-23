@@ -47,6 +47,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
   nvk_buffer _hostBuf; int8_t _hostState;   // the surface's own pages imported (Intel/AMD); -1 refused
+  BOOL _hostImg;   // the image itself lives in those pages: no copies in or out
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
