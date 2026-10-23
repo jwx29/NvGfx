@@ -32,7 +32,7 @@ void xg_newbus_dump(void);
 void xg_unimpl(const char *name) __attribute__((__noreturn__));
 kern_return_t _start(kmod_info_t *ki, void *d);
 kern_return_t _stop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.27", _start, _stop)
+KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.28", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
@@ -44,6 +44,8 @@ class XeGfxResident : public IOService {
 	OSDeclareDefaultStructors(XeGfxResident)
 public:
 	bool start(IOService *provider) override;
+	using IOService::callPlatformFunction;
+	IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
 };
 
 static XeGfxResident *gResident;
@@ -104,6 +106,17 @@ XeGfxResident::start(IOService *provider)
 	gResident = this;
 	registerService();
 	return true;
+}
+
+/* "xgDrmIoctl" (minor, cmd, user arg, int *errno): DRM for WindowServer, through XeGfxAccel's user client */
+IOReturn
+XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
+{
+	if (name && name->isEqualTo("xgDrmIoctl") && p4) {
+		*(int *)p4 = xg_fd_remote_ioctl((int)(uintptr_t)p1, (unsigned long)p2, (unsigned long long)(uintptr_t)p3);
+		return kIOReturnSuccess;
+	}
+	return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
 }
 OSDefineMetaClassAndStructors(XeGfxResident, IOService)
 

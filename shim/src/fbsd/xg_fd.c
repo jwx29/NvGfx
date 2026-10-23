@@ -1139,6 +1139,20 @@ xg_fd_inst_fget(int inst, struct file **fpp)
 	return (0);
 }
 
+int
+xg_fd_inst_owner(int inst)
+{
+	int pid = -1;
+
+	if (inst < 0 || inst >= XG_FD_NINST)
+		return (-1);
+	xg_fd_lock();
+	if (xg_fd_insts[inst].xi_state == XI_OPEN)
+		pid = xg_fd_insts[inst].xi_pid;
+	xg_fd_unlock();
+	return (pid);
+}
+
 /* XNU passes its own idea of O_NONBLOCK with every call; keep the FreeBSD file in step */
 static void
 xg_fd_sync_nonblock(struct file *fp, int nonblock)
