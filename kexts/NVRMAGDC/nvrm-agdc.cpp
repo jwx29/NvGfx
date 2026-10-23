@@ -54,6 +54,10 @@ extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxAGDC, "0.1", _start, _sto
 #define sysctl__debug_nvrmfb_agdc_k5_caps_mask sysctl__debug_xegfx_agdc_k5_caps_mask
 #define nvrmfb_agdc_k5_last_refused_idx xegfx_agdc_k5_last_refused_idx
 #define sysctl__debug_nvrmfb_agdc_k5_last_refused_idx sysctl__debug_xegfx_agdc_k5_last_refused_idx
+#define nvrmfb_agdc_client_ack xegfx_agdc_client_ack
+#define sysctl__debug_nvrmfb_agdc_client_ack sysctl__debug_xegfx_agdc_client_ack
+#define nvrmfb_agdc_client_set xegfx_agdc_client_set
+#define sysctl__debug_nvrmfb_agdc_client_set sysctl__debug_xegfx_agdc_client_set
 #else
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "0.1", _start, _stop) }
 #define AGDC_FB_CLASS     "NVRMNVDAFramebuffer"
@@ -91,6 +95,14 @@ static int    gAgdcK5Why = 0;
 static SInt64 gAgdcCmds = 0, gAgdcUnsupported = 0;
 static int    gAgdcLastRefused = 0;
 static int    gAgdcLogged = 0;
+// WindowServer's 4-byte "client set" (0x2001). thanhnndev's AGDC trace (nvidia-macos-driver e196ab19) saw CoreDisplay
+// submit display-pipe transactions only once it was accepted; Intel-only until an NVIDIA boot shows the same.
+#ifdef NMX_XEGFX
+static int    gAgdcClientAck = 1;
+#else
+static int    gAgdcClientAck = 0;
+#endif
+static SInt64 gAgdcClientSet = 0;
 // Slot-table rescans done while answering 0x980 (see nvdaAgdcRescanForReply).
 static SInt64 gAgdcRescans = 0;
 
@@ -196,6 +208,11 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
             c->maxFramebuffers = n; c->pciDevice = fPci;
         }
         gAgdcMaxFBOut = (int)c->maxFramebuffers;
+        return kIOReturnSuccess;
+    }
+    if (cmd == 0x2001 && gAgdcClientAck) {
+        if (!in || inSize != 4) return kIOReturnBadArgument;
+        OSAddAtomic64(1, &gAgdcClientSet);
         return kIOReturnSuccess;
     }
     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
@@ -322,6 +339,8 @@ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_k5_link, CTLFLAG_RD | CTLFLAG_LOCKED, 
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_k5_caps, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Caps,    "K5: plane-scaler capability queries answered");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_why,  CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Why,  0, "K5: why the last K5 query was not answered");
 SYSCTL_STRING(_debug, OID_AUTO, nvrmfb_agdc_fbmap, CTLFLAG_RD | CTLFLAG_LOCKED, gAgdcFBMap, sizeof gAgdcFBMap, "the slot table our 0x980 reports: n, then [i]id per IOFBDependentIndex");
+SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_client_ack, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gAgdcClientAck, 0, "1 = accept WindowServer's 0x2001 client set");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_client_set, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcClientSet, "0x2001 client-set calls accepted");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_rescans, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcRescans, "slot-table rescans done while answering 0x980 (a framebuffer that started after boot)");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_maxfb,   CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcMaxFBOut, 0, "maxFramebuffers in our last 0x980 reply (0 = never asked)");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_asked, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Asked, 0, "bit i = a 0x921/0x711 named index i");
@@ -338,6 +357,7 @@ static void nvdaAgdcRemoveSysctl(void)
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_rescans);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_asked); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_link_mask);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_caps_mask); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_last_refused_idx);
+    sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_ack); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_set);
 }
 static void nvdaAgdcInstallSysctl(void)
 {
@@ -349,6 +369,7 @@ static void nvdaAgdcInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_rescans);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_asked); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_link_mask);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_caps_mask); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_last_refused_idx);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_ack); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_set);
 }
 
 class NVDAGDCLoader : public IOService {
