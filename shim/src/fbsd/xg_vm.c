@@ -325,6 +325,13 @@ xg_vm_busy_release(vm_page_t m)
 		vm_page_xunbusy(m);
 }
 
+/* LinuxKPI trylock_page: i915 userptr put_pages takes it before set_page_dirty (N-270 hit the stub) */
+int
+vm_page_tryxbusy(vm_page_t m)
+{
+	return (xg_vm_tryxbusy(m));
+}
+
 void
 vm_page_xunbusy_hard(vm_page_t m)
 {
