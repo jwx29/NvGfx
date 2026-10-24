@@ -1772,8 +1772,14 @@ vm_fault_quick_hold_pages(vm_map_t map, vm_offset_t addr, vm_size_t len, vm_prot
 
 		for (;;) {
 			if ((r = xg_vm_run_find(pa[i])) != NULL) {
-				if (r->kind != XG_RUN_USER)
-					goto fail;	/* a shim page mapped into a process: no user mappings exist yet */
+				if (r->kind != XG_RUN_USER) {
+					/* a shim page mapped into a process (a GEM buffer's own pages): i915 refuses such userptrs too */
+					static volatile u_int logs;
+					if (atomic_fetchadd_int(&logs, 1) < 8)
+						printf("xegfx: userptr hold: page %d of 0x%lx (+%d) is a shim page (run kind %d), not user memory\n",
+						    i, (unsigned long)start, n, (int)r->kind);
+					goto fail;
+				}
 				atomic_add_int(&r->pages[0].ref_count, 1);
 				break;
 			}

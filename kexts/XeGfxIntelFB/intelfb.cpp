@@ -36,13 +36,16 @@ static void xifbGuardClear()
 {
     static bool done; if (done) return; done = true;
     IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane); if (!o) return;
-    o->removeProperty(XIFB_GUARD_VAR); o->release(); XIFBLOG("boot guard cleared: WindowServer is active on the panel");
+    // removeProperty did not reach NVRAM (N-283); a zero count does, the same way the count itself is written
+    unsigned char z = 0;
+    if (OSData *d = OSData::withBytes(&z, 1)) { if (o->setProperty(XIFB_GUARD_VAR, d)) XIFBLOG("boot guard cleared: WindowServer is active on the panel"); d->release(); }
+    o->release();
 }
 
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.2", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.3", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
