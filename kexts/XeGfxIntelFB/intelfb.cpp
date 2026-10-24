@@ -42,7 +42,7 @@ static void xifbGuardClear()
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.1", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.2", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
@@ -59,9 +59,12 @@ public:
         xifbGuardCount();
         return IONDRVFramebuffer::start(provider);
     }
-    IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
-        if (attribute == kIOWindowServerActiveAttribute && value) xifbGuardClear();
-        return IONDRVFramebuffer::setAttribute(attribute, value);
+    // IOGraphics keeps kIOWindowServerActiveAttribute to itself here (N-282), so WindowServer opening the server
+    // connection is what clears the guard
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override {
+        IOReturn r = IONDRVFramebuffer::newUserClient(owningTask, securityID, type, handler);
+        if (r == kIOReturnSuccess && type == kIOFBServerConnectType) xifbGuardClear();
+        return r;
     }
 };
 
