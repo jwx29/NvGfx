@@ -464,7 +464,8 @@ xg_run_stage(int s)
 		xg_trace_write();
 		thread_call_enter(gTraceCall);
 	}
-	if (gIrqoffCall && OSCompareAndSwap(0, 1, &gIrqoffArmed))
+	/* xegfx.irqoff_check=0 turns the checker off: N-290 passed with it, is its 20 ms wakeup the fix? */
+	if (gIrqoffCall && !xg_env_has("xegfx.irqoff_check=0") && OSCompareAndSwap(0, 1, &gIrqoffArmed))
 		xg_irqoff_check(nullptr, nullptr);
 	if (gWdogCall && gWdog > 0) {
 		uint64_t dl;
