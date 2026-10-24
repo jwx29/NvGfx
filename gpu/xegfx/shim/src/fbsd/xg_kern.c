@@ -358,8 +358,8 @@ arc4random_uniform(uint32_t bound)
 void
 xg_kern_init(void)
 {
-	/* from boot, not from kext load: DRM wait ioctls take absolute CLOCK_MONOTONIC deadlines from userspace, and a
-	 * later base pushed every timed wait out by the load offset */
+	/* ktime counts from boot (mach_absolute_time), not from kext load; syncobj wait deadlines from userspace are
+	 * rebased onto it in xg_fd.cpp */
 	xg_boot_abs = 0;
 	mp_ncpus = (int)real_ncpus;
 	mp_maxid = mp_ncpus - 1;
