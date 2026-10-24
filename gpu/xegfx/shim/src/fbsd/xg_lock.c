@@ -463,6 +463,7 @@ _rw_wlock_cookie(volatile uintptr_t *c, const char *file, int line)
 {
 	struct rwlock *rw = rwlock2rw(c);
 	uintptr_t tid = (uintptr_t)curthread, v;
+	struct xg_spin s = { 0, 0, 0 };
 
 	if (atomic_cmpset_acq_ptr(c, RW_UNLOCKED, tid))
 		return;
@@ -476,6 +477,11 @@ _rw_wlock_cookie(volatile uintptr_t *c, const char *file, int line)
 			if (*c == RW_UNLOCKED && atomic_cmpset_acq_ptr(c, RW_UNLOCKED, tid))
 				return;
 			cpu_spinwait();
+		}
+		/* inside a critical section (an RCU reader, a spin_lock) it spins, as for mutexes (N-239, N-286) */
+		if (curthread->td_critnest != 0) {
+			xg_spin_note(&s, "rw wlock (critical section)", rw->lock_object.lo_name, file, line, RW_OWNER(*c));
+			continue;
 		}
 		xg_sq_lock(c);
 		v = *c;
@@ -510,12 +516,22 @@ void
 __rw_rlock(volatile uintptr_t *c, const char *file, int line)
 {
 	uintptr_t v;
+	struct xg_spin s = { 0, 0, 0 };
 
 	for (;;) {
 		v = *c;
 		if (v & RW_LOCK_READ) {
 			if (atomic_cmpset_acq_ptr(c, v, v + RW_ONE_READER))
 				return;
+			continue;
+		}
+		/*
+		 * Linux rwlock_t is this lock, and Linux takes it inside rcu_read_lock, which pins with preemption off:
+		 * blocking there panicked WindowServer's mmap-offset lookup (N-286, drm_vma_offset_lock_lookup)
+		 */
+		if (curthread->td_critnest != 0) {
+			xg_spin_note(&s, "rw rlock (critical section)", rwlock2rw(c)->lock_object.lo_name, file, line, RW_OWNER(v));
+			cpu_spinwait();
 			continue;
 		}
 		xg_sq_lock(c);
