@@ -1481,6 +1481,10 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
 #ifdef NMX_XEGFX
     { extern struct sysctl_oid sysctl__debug_nvaccel_scanout_copies; sysctl_register_oid(&sysctl__debug_nvaccel_scanout_copies); }
+    { extern struct sysctl_oid sysctl__debug_nvaccel_scanout_last_us, sysctl__debug_nvaccel_scanout_max_us,
+          sysctl__debug_nvaccel_scanout_sum_us, sysctl__debug_nvaccel_scanout_self;
+      sysctl_register_oid(&sysctl__debug_nvaccel_scanout_last_us); sysctl_register_oid(&sysctl__debug_nvaccel_scanout_max_us);
+      sysctl_register_oid(&sysctl__debug_nvaccel_scanout_sum_us);  sysctl_register_oid(&sysctl__debug_nvaccel_scanout_self); }
     { extern struct sysctl_oid sysctl__debug_nvaccel_pipe_init, sysctl__debug_nvaccel_pipe_validate,
           sysctl__debug_nvaccel_pipe_complete, sysctl__debug_nvaccel_pipe_perform;
       sysctl_register_oid(&sysctl__debug_nvaccel_pipe_init);     sysctl_register_oid(&sysctl__debug_nvaccel_pipe_validate);
@@ -2443,6 +2447,13 @@ static unsigned nvScanoutCopies = 0;
 static SInt64 gCntScanoutCopies;
 SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_copies, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntScanoutCopies,
             "composited frames copied onto the boot framebuffer by the swap path");
+// the copy runs on ws_main_thread, so its cost is WindowServer's frame time: last, max, total in us, and self-copies skipped
+static SInt64 gScanoutLastUs, gScanoutMaxUs, gScanoutSumUs, gCntScanoutSelf;
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_last_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gScanoutLastUs, "last scanout copy, us");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gScanoutMaxUs, "slowest scanout copy, us");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_sum_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gScanoutSumUs, "all scanout copies, us");
+SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_scanout_self, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntScanoutSelf,
+            "swaps whose source was the scanout itself (copy skipped)");
 // how far CoreDisplay gets with the display pipe (thanhnndev: it submits transactions only after AGDC 0x2001 is accepted)
 SInt64 gCntPipeInit, gCntPipeValidate, gCntPipeComplete, gCntPipePerform;
 SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_pipe_init, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntPipeInit, "NVDisplayPipe::initFramebufferResource calls");
@@ -2515,6 +2526,15 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
         return false;
     }
 
+#ifdef NMX_XEGFX
+    // a swap with an empty a2 names the scanout itself (a1): copying it onto itself reads 16 MB of write-combined
+    // memory, ~0.8 s on ws_main_thread every other swap (N-255..N-280), and changes nothing on the panel
+    if (vm->fScanout || (const void *)vm->fKva == (const void *)q.kva) {
+        OSAddAtomic64(1, &gCntScanoutSelf);
+        return true;
+    }
+    const uint64_t t0 = mach_absolute_time();
+#endif
     const unsigned rows = (h < q.height) ? h : q.height;
     const unsigned rowb = ((pitch < q.pitch) ? pitch : q.pitch) & ~3u;
     const unsigned words = rowb / 4;
@@ -2528,6 +2548,12 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
     }
     nvScanoutCopies++;
 #ifdef NMX_XEGFX
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    const SInt64 us = (SInt64)(ns / 1000);
+    gScanoutLastUs = us;
+    if (us > gScanoutMaxUs) gScanoutMaxUs = us;
+    OSAddAtomic64(us, &gScanoutSumUs);
     OSAddAtomic64(1, &gCntScanoutCopies);
     if (nvScanoutCopies <= 3)
 #else
