@@ -36,6 +36,7 @@ KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.32", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
+extern "C" unsigned int xg_pci_handled;
 extern int xg_spin_panic;
 extern unsigned long long xg_spin_max_us;
 extern unsigned int xg_spin_long;
@@ -622,9 +623,10 @@ xegfx_trace_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 static int
 xegfx_spin_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
-	char b[80];
+	char b[120];
 
-	snprintf(b, sizeof(b), "max_us %llu long %u panic %d", xg_spin_max_us, xg_spin_long, xg_spin_panic);
+	snprintf(b, sizeof(b), "max_us %llu long %u panic %d irqs %u handled %u", xg_spin_max_us, xg_spin_long, xg_spin_panic,
+	    xg_pci_irqs, xg_pci_handled);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_spin, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_spin_sysctl, "A",
