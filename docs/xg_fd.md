@@ -35,6 +35,15 @@ that file (`linux_file_close`, then the driver's release).
 
 `O_NONBLOCK` is copied from XNU's flags into `f_flag` on every call (and on `FIONBIO`), because XNU's `fcntl` never
 reaches the FreeBSD file. FreeBSD errnos that XNU numbers differently (82 to 97) are translated on the way out.
+LinuxKPI's `ETIME` is `ETIMEDOUT` (60), while libdrm and Mesa on Darwin test for Darwin's `ETIME` (101), so a timed-out
+ioctl returns 101 (otherwise a syncobj wait that times out reads as `VK_ERROR_UNKNOWN`).
+
+`DRM_IOCTL_SYNCOBJ_WAIT` and `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` carry absolute `CLOCK_MONOTONIC` deadlines
+(`timeout_nsec`, and `deadline_nsec` with `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE`). On Darwin that clock is calendar
+time minus `kern.boottime`: on the Legion it runs about 2.5 s behind `mach_absolute_time`, which the shim's ktime
+counts from, and it slews with the calendar. Both ioctl paths rebase the deadlines onto ktime with an offset taken on
+every call, then put the caller's values back, because libdrm retries an interrupted wait with the same struct.
+0 (poll) and `INT64_MAX` (forever) pass through unchanged.
 
 A cdevsw without `d_fdopen` gets `xg_fd_devfileops`, which forwards read, write, ioctl, poll and close to the
 driver like `devfs_ops_f`.
