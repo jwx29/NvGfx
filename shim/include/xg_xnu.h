@@ -32,6 +32,13 @@ extern void lck_spin_unlock(xg_lck_spin_t *lck);
 extern int ml_set_interrupts_enabled(int enable);
 extern int ml_get_interrupts_enabled(void);
 extern int ml_at_interrupt_context(void);
+
+/* interrupts-off watchdog slots (xg_kern.c); the kext's checker panics on one held too long (I-116) */
+#define XG_IRQOFF_CPUS	64
+struct xg_irqoff { volatile unsigned long long t0; volatile unsigned long pc; volatile int what; };
+extern struct xg_irqoff xg_irqoff[XG_IRQOFF_CPUS];
+void xg_irqoff_mark(int what, const void *pc);
+void xg_irqoff_clear(void);
 extern void IODelay(unsigned int microseconds);
 extern void IOSleep(unsigned int milliseconds);
 extern void *IOMalloc(unsigned long size);
