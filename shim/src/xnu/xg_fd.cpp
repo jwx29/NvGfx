@@ -59,15 +59,29 @@ xg_fd_inst_of(dev_t dev)
 extern "C" int xg_printf(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
 
 /* I-113: ANV turns a failed execbuffer into VK_ERROR_DEVICE_LOST and reports the errno only on WindowServer's
- * stderr; put failing ioctls in the ring instead (every execbuffer failure, the first 64 others) */
+ * stderr; put failing ioctls in the ring instead (every execbuffer failure, the first 64 others per process, so the
+ * apps' GETPARAM probes cannot use up WindowServer's lines as they did in N-280) */
+#define XG_NOTE_PIDS 16
+static volatile SInt32 xg_note_pid[XG_NOTE_PIDS], xg_note_cnt[XG_NOTE_PIDS];
+
+static bool
+xg_fd_note_budget(int pid)
+{
+	for (int i = 0; i < XG_NOTE_PIDS; i++) {
+		if (xg_note_pid[i] == 0)
+			OSCompareAndSwap(0, (UInt32)pid, (volatile UInt32 *)&xg_note_pid[i]);
+		if (xg_note_pid[i] == pid)
+			return (OSIncrementAtomic(&xg_note_cnt[i]) < 64);
+	}
+	return (false);
+}
+
 static int
 xg_fd_ioctl_note(int inst, unsigned long cmd, int error)
 {
-	static volatile SInt32 others;
-
 	if (error == 0 || error == EINTR || error == EAGAIN || error == ETIME || error == ERESTART)
 		return (error);
-	if ((cmd & 0xff) == 0x69 || OSIncrementAtomic(&others) < 64)
+	if ((cmd & 0xff) == 0x69 || xg_fd_note_budget(proc_selfpid()))
 		xg_printf("xegfx: ioctl 0x%lx (nr 0x%lx) inst %d pid %d -> errno %d\n", cmd, cmd & 0xff, inst,
 		    proc_selfpid(), error);
 	return (error);
@@ -95,6 +109,14 @@ xg_fd_errno(int e)
 	case 97: return (EIO);		/* EINTEGRITY */
 	default: return (e);
 	}
+}
+
+/* LinuxKPI makes ETIME ETIMEDOUT (60); libdrm and Mesa on Darwin test for ETIME (101), so a timed-out syncobj or
+ * GEM wait read as a failure (VK_ERROR_UNKNOWN) instead of VK_TIMEOUT */
+static int
+xg_fd_ioctl_errno(int e)
+{
+	return (e == ETIMEDOUT ? ETIME : xg_fd_errno(e));
 }
 
 static int
@@ -165,7 +187,7 @@ xg_fd_d_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
 
 	if (inst < 0)
 		return (ENXIO);
-	return (xg_fd_ioctl_note(inst, cmd, xg_fd_errno(xg_fd_dev_ioctl(inst, cmd, data, fflag))));
+	return (xg_fd_ioctl_note(inst, cmd, xg_fd_ioctl_errno(xg_fd_dev_ioctl(inst, cmd, data, fflag))));
 }
 
 /* what d_ioctl would get, with the copies ioctl(2) makes around it; only the opener may use an instance */
@@ -190,7 +212,7 @@ xg_fd_remote_ioctl(int minor, unsigned long cmd, unsigned long long uarg)
 	else if ((cmd & IOC_VOID) && len == 0)
 		*(user_addr_t *)buf = (user_addr_t)uarg;
 	if (error == 0)
-		error = xg_fd_ioctl_note(inst, cmd, xg_fd_errno(xg_fd_dev_ioctl(inst, cmd, buf, 0)));
+		error = xg_fd_ioctl_note(inst, cmd, xg_fd_ioctl_errno(xg_fd_dev_ioctl(inst, cmd, buf, 0)));
 	if (error == 0 && (cmd & IOC_OUT) && len != 0)
 		error = copyout(buf, (user_addr_t)uarg, len);
 	if (buf != small)
