@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include <syslog.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -568,6 +569,8 @@ static VkBool32 VKAPI_PTR nvmtl_vkmsg_cb(VkDebugUtilsMessageSeverityFlagBitsEXT 
     const char *b = strrchr(id, '/'); b = b ? b + 1 : id;
     char t[600]; snprintf(t, sizeof t, "nvk-reason: %s %s: %s", (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "E" : "W", b, m);
     for (char *c = t; *c; c++) if ((unsigned char)*c < 0x20) *c = ' ';
+    /* the release log file is out of reach in WindowServer's sandbox; ANV's device-lost reason arrives here */
+    if (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) syslog(LOG_ERR, "NullMoth: %s", t);
     extern const char *nvmtl_log_path(void);
     FILE *f = fopen(nvmtl_log_path(), "a");
     if (f) {
