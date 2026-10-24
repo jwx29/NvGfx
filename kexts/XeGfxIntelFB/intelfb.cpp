@@ -47,7 +47,7 @@ static void xifbGuardClear()
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.4", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.5", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
@@ -62,6 +62,10 @@ public:
     }
     bool start(IOService *provider) override {
         xifbGuardCount();
+        // System Profiler names the GPU from the PCI device's "model"; without it About This Mac shows a bare "Display"
+        static const char model[] = "Intel Xe Graphics";
+        if (!provider->getProperty("model"))
+            if (OSData *m = OSData::withBytes(model, sizeof model)) { provider->setProperty("model", m); m->release(); }
         // the guard is for boots that hang: still running 120 s after start clears it. IOGraphics keeps the
         // WindowServer-active attribute and WindowServer's connection skips newUserClient here (N-282 to N-284)
         static thread_call_t tc;
