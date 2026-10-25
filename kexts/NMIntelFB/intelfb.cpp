@@ -373,10 +373,11 @@ bool NMIntelFB::start(IOService *provider)
     if (!fVBuf || fVBuf->prepare() != kIOReturnSuccess) { IFBLOG("virtual: no contiguous buffer"); OSSafeReleaseNULL(fVBuf); return false; }
     bzero(fVBuf->getBytesNoCopy(), fVBuf->getLength());
     fApertureBase = fVBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone); fApertureLen = fVBuf->getLength();
+    // IOFramebuffer must see the controller/group metadata during start().
+    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
+    setProperty("IOFBDependentIndex", 0ull, 32);
     if (!IOFramebuffer::start(provider)) { fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
     fSurfMap = fVBuf->map();
-    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-    setProperty("IOFBDependentIndex", 4ull, 32);
     if (IOWorkLoop *wl = getWorkLoop()) {
         fTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
             ((NMIntelFB *)o)->sample(); t->setTimeoutMS(2000); });
@@ -416,13 +417,15 @@ bool NMIntelFB::start(IOService *provider)
     }
     if (nmifbStep(7, "framebuffer start")) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     nmifbGuardCount();   // only a start that is about to publish can fail WindowServer; a clean decline is not a strike
+    // Publish the controller/group metadata BEFORE IOFramebuffer::start(), as IOGraphics
+    // can establish framebuffer grouping while start() is running.
+    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
+    setProperty("IOFBDependentIndex", 0ull, 32);
     if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
     // display pipe copies each frame into fSurfMap. Without NVAccel the panel stays a plain framebuffer.
     // The kernel mapping of the surface is made only when NVAccel asks for the scanout (head 4 copy path): a
     // write-combined map of the DSM framebuffer in start() hung the machine twice (I-090, stage 8).
-    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-    setProperty("IOFBDependentIndex", 4ull, 32);
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
@@ -567,3 +570,5 @@ void NMIntelFBLoader::stop(IOService *provider)
     IOService::stop(provider);
 }
 #endif
+
+

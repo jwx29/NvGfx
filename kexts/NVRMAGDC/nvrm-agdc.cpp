@@ -21,7 +21,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxAGDC, "0.1", _start, _stop) }
 #define NVDADeviceControl XeGfxDeviceControl
 #define NVDAGDCLoader     XeGfxAGDCLoader
-#define AGDC_FB_CLASS     "IONDRVFramebuffer"
+#define AGDC_FB_CLASS     "NMIntelFB"
 #define AGDC_VENDOR       "Intel"
 #define AGDC_VENDOR_ID    0x8086
 #define nvrmfb_agdc xegfx_agdc
@@ -236,17 +236,60 @@ static void nvdaAgdcDropTable(void)
 static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; } nvdaAgdcDropTable(); }
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
 {
-    *pci = nullptr; *fb = nullptr;
-    OSDictionary *m = IOService::serviceMatching(AGDC_FB_CLASS); if (!m) return;
-    IOService *f = IOService::copyMatchingService(m); m->release(); if (!f) return;
-    IOService *p = f->getProvider(); int hops = 0;
-    while (p && !p->metaCast("IOPCIDevice") && hops++ < 8) p = p->getProvider();
-    if (!p || !p->metaCast("IOPCIDevice")) { f->release(); return; }
+    *pci = nullptr;
+    *fb = nullptr;
+
+    OSDictionary *m = IOService::serviceMatching(AGDC_FB_CLASS);
+    if (!m)
+        return;
+
+    OSIterator *it = IOService::getMatchingServices(m);
+    m->release();
+
+    if (!it)
+        return;
+
+    OSObject *obj;
+
+    while ((obj = it->getNextObject())) {
+        IOService *f = OSDynamicCast(IOService, obj);
+        if (!f)
+            continue;
+
+        IOService *p = f->getProvider();
+        int hops = 0;
+
+        while (p && !p->metaCast("IOPCIDevice") && hops++ < 8)
+            p = p->getProvider();
+
+        if (!p || !p->metaCast("IOPCIDevice"))
+            continue;
+
 #ifdef NMX_XEGFX
-    { OSData *v = OSDynamicCast(OSData, p->getProperty("vendor-id"));
-      if (!v || v->getLength() < 2 || *(const uint16_t *)v->getBytesNoCopy() != AGDC_VENDOR_ID) { f->release(); return; } }
+        OSData *vendor = OSDynamicCast(
+            OSData, p->getProperty("vendor-id")
+        );
+
+        if (!vendor || vendor->getLength() < 2)
+            continue;
+
+        if (*(const uint16_t *)vendor->getBytesNoCopy() != 0x8086)
+            continue;
+
+        // Only select the Intel PCI-backed framebuffer,
+        // never the UEFIGraphicsFB platform framebuffer.
 #endif
-    gAgdcFBRef = f; *fb = f; *pci = p;
+
+        f->retain();
+
+        gAgdcFBRef = f;
+        *fb = f;
+        *pci = p;
+
+        break;
+    }
+
+    it->release();
 }
 
 static int gAgdcScanLogged = 0;
