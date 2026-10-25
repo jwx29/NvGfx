@@ -187,6 +187,37 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
                                                      unsigned long *out, unsigned long *outSize, IOExternalMethodArguments *args)
 {
     OSAddAtomic64(1, &gAgdcCmds);
+    #ifdef NMX_XEGFX
+        // Diagnostic: log the first 64 AGDC extended-capability requests.
+        static SInt32 g711DebugCount = 0;
+
+        if (cmd == NVK5_CMD_FBCAPEX &&
+            OSIncrementAtomic(&g711DebugCount) <= 64) {
+
+            if (in && inSize == sizeof(NVAGDCFBExtCap)) {
+                const NVAGDCFBExtCap *req =
+                    reinterpret_cast<const NVAGDCFBExtCap *>(in);
+
+                FBLOG(
+                    "X711: fbIndex=%u type=0x%x "
+                    "inSize=%lu outSize=%lu K5=%d",
+                    req->fbIndex,
+                    req->type,
+                    inSize,
+                    outSize ? *outSize : 0UL,
+                    gAgdcK5
+                );
+            } else {
+                FBLOG(
+                    "X711: invalid request "
+                    "in=%p inSize=%lu outSize=%lu",
+                    in,
+                    inSize,
+                    outSize ? *outSize : 0UL
+                );
+            }
+        }
+    #endif
     if (cmd == 1) {
         if (!out || !outSize || *outSize != sizeof(NVAGDCVendorInfo)) return kIOReturnBadArgument;
         NVAGDCVendorInfo *v = (NVAGDCVendorInfo *)out; bzero(v, sizeof *v);
@@ -215,6 +246,72 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
         OSAddAtomic64(1, &gAgdcClientSet);
         return kIOReturnSuccess;
     }
+    #ifdef NMX_XEGFX
+        // Extended colour capabilities for framebuffer slot 0.
+        // Based on the Meteor Lake NMXAGDC implementation.
+        if (gAgdcK5 &&
+            cmd == NVK5_CMD_FBCAPEX &&
+            in && out && outSize &&
+            inSize == sizeof(NVAGDCFBExtCap) &&
+            *outSize == sizeof(NVAGDCFBExtCap)) {
+
+            const NVAGDCFBExtCap *req =
+                reinterpret_cast<const NVAGDCFBExtCap *>(in);
+
+            const uint32_t type = req->type;
+            const uint32_t index = req->fbIndex;
+
+            if (index == 0 &&
+                (type == 1 || type == 2 || type == 4)) {
+
+                NVAGDCFBExtCap *c =
+                    reinterpret_cast<NVAGDCFBExtCap *>(out);
+
+                nvk5_zero(c, sizeof(*c));
+                c->fbIndex = index;
+                c->type = type;
+                c->count = 1;
+
+            uint8_t *e = c->entry[0];
+
+                nvk5_put32(e, 0x000, 0x80004);
+                nvk5_put32(e, 0x004, 1);   // plane 0 mask
+                nvk5_put32(e, 0x008, 0);
+
+                if (type == 2) {
+                    // Gamma: 1024-entry, 3-channel 16-bit table.
+                    nvk5_put32(e, 0x010, 0x200);
+                    nvk5_put32(e, 0x020, 0x00000000);
+                    nvk5_put32(e, 0x024, 0x3f800000);
+                    nvk5_put32(e, 0x028, 1024);
+
+                } else if (type == 4) {
+                    // Linearization: sRGB and linear.
+                    c->count = 2;
+
+                    nvk5_put32(e, 0x010, 1);
+                    nvk5_put32(e, 0x018, 0x10);
+                    nvk5_put32(e, 0x024, 0x3f800000);
+
+                    uint8_t *e2 = c->entry[1];
+
+                    nvk5_put32(e2, 0x000, 0x80004);
+                    nvk5_put32(e2, 0x004, 1);
+                    nvk5_put32(e2, 0x010, 1);
+                    nvk5_put32(e2, 0x018, 0x20);
+                    nvk5_put32(e2, 0x024, 0x3f800000);
+
+                } else {
+                    // CSC: 3x3 colour-conversion matrix.
+                    nvk5_put32(e, 0x010, 1);
+                    nvk5_put32(e, 0x024, 0xc0000000);
+                    nvk5_put32(e, 0x028, 0x40000000);
+                }
+
+                return kIOReturnSuccess;
+            }
+        }
+    #endif
     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
         IOReturn k5 = nvdaK5Answer(fFB, cmd, in, inSize, out, outSize);
         if (k5 != kIOReturnUnsupported) return k5;

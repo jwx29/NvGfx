@@ -428,6 +428,41 @@ bool NMIntelFB::start(IOService *provider)
     // write-combined map of the DSM framebuffer in start() hung the machine twice (I-090, stage 8).
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
+
+    // Publish the firmware's real timing for XeGfxAGDC K5.
+    // Format: 13 x uint32_t, consumed by nvrm-agdc-k5.h.
+    if (fPclk > 0 && fPclk <= 0xFFFFFFFFull &&
+        fHT > fWidth && fVT > fHeight &&
+        fHSS >= fWidth && fHSS < fHSE && fHSE <= fHT &&
+        fVSS >= fHeight && fVSS < fVSE && fVSE <= fVT) {
+
+        const uint32_t timing[13] = {
+            0x4B350001u,                    // NVRMTiming tag
+            static_cast<uint32_t>(fPclk),  // pixel clock, Hz
+            fWidth, fHSS, fHSE, fHT,       // horizontal
+            fHeight, fVSS, fVSE, fVT,      // vertical
+            static_cast<uint32_t>(
+                fPclk * 1000ull /
+                (static_cast<uint64_t>(fHT) * fVT)
+            ),                              // refresh, milli-Hz
+        0, 0                            // sync polarity (unknown)
+    };
+
+    OSData *data = OSData::withBytes(timing, sizeof(timing));
+    if (data) {
+        setProperty("NVRMTiming", data);
+        data->release();
+
+        IFBLOG("NVRMTiming published: %ux%u, "
+               "totals %ux%u, pclk %llu",
+               fWidth, fHeight, fHT, fVT,
+               (unsigned long long)fPclk);
+    }
+} else {
+    IFBLOG("NVRMTiming not published: "
+           "invalid/incomplete firmware timing");
+}
+
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);

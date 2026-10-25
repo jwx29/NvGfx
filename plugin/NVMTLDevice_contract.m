@@ -53,7 +53,10 @@ static void nvbt(const char *tag, int *count, int max);
         b->_b = b->_shadow; memset(&b->_shadow, 0, sizeof b->_shadow);
         return b;
     }
-    if (nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
+    /* XEGFX_WS_HOST_COPY: prevent WindowServer importing read-only pages as writable GPU host memory. */
+    const char *xegfx_proc = getprogname();
+    const bool xegfx_ws_copy = xegfx_proc && strcmp(xegfx_proc, "WindowServer") == 0;
+    if (!xegfx_ws_copy && nvmtl_vk_buffer_import_host(a0, a1, &b->_b) == 0) {
         static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: IMPORTED the caller's pages (%lu bytes at %p) \u2014 zero copy", (unsigned long)a1, a0);
         return b;
     }
