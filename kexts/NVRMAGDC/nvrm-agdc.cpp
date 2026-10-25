@@ -286,21 +286,53 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
                     nvk5_put32(e, 0x028, 1024);
 
                 } else if (type == 4) {
-                    // Linearization: sRGB and linear.
-                    c->count = 2;
+                    // Linearization capability based on Intel's AGDC response.
+                    // One capability entry, associated with plane 0.
+                    c->count = 1;
 
-                    nvk5_put32(e, 0x010, 1);
-                    nvk5_put32(e, 0x018, 0x10);
+                    nvk5_put32(e, 0x000, 0x00100000);
+
+                    // Plane mask (uint64_t): plane 0
+                    nvk5_put32(e, 0x004, 1);
+                    nvk5_put32(e, 0x008, 0);
+
+                    // Non-atomic application period: approximately 16.67 ms
+                    nvk5_put32(e, 0x00c, 0x41855555);
+
+                    // Linearization capability type: uint64_t 8
+                    nvk5_put32(e, 0x010, 8);
+                    nvk5_put32(e, 0x014, 0);
+
+                    // Maximum value: float 1.0
                     nvk5_put32(e, 0x024, 0x3f800000);
 
-                    uint8_t *e2 = c->entry[1];
+                    // Maximum table size: uint64_t 1024
+                    nvk5_put32(e, 0x028, 1024);
+                    nvk5_put32(e, 0x02c, 0);
+                } else if (type == 8) {
+                    // Pipeline scaler capability, using Intel-derived fields.
+                    // These values advertise capabilities; they don't implement
+                    // scaling in XeGfxAccel.
+                    nvk5_put32(e, 0x000, 0xC5);
 
-                    nvk5_put32(e2, 0x000, 0x80004);
-                    nvk5_put32(e2, 0x004, 1);
-                    nvk5_put32(e2, 0x010, 1);
-                    nvk5_put32(e2, 0x018, 0x20);
-                    nvk5_put32(e2, 0x024, 0x3f800000);
+                    nvk5_put32(e, 0x01c, 1);
+                    nvk5_put32(e, 0x020, 0);
 
+                    nvk5_put32(e, 0x024, 64);
+                    nvk5_put32(e, 0x028, 64);
+                    nvk5_put32(e, 0x02c, 4096);
+                    nvk5_put32(e, 0x030, 4096);
+                    nvk5_put32(e, 0x034, 0x301);
+                    nvk5_put32(e, 0x038, 2);
+
+                    nvk5_put32(e, 0x1a4, 1);
+                    nvk5_put32(e, 0x1a8, 0);
+                    nvk5_put32(e, 0x1ac, 64);
+                    nvk5_put32(e, 0x1b0, 64);
+                    nvk5_put32(e, 0x1b4, 4096);
+                    nvk5_put32(e, 0x1b8, 4096);
+                    nvk5_put32(e, 0x1bc, 0x301);
+                    nvk5_put32(e, 0x1c0, 2);
                 } else {
                     // CSC: 3x3 colour-conversion matrix.
                     nvk5_put32(e, 0x010, 1);
