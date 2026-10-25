@@ -13,6 +13,9 @@
 #include <sys/ioccom.h>
 #include <sys/select.h>
 #include <sys/kauth.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <kern/clock.h>
 #include <sys/vnode.h>
 #include <miscfs/devfs/devfs.h>
 #include <IOKit/IOLib.h>
@@ -56,6 +59,37 @@ xg_fd_inst_of(dev_t dev)
 	return (XG_FD_MINOR_INST(m));
 }
 
+extern "C" int xg_printf(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
+
+/* I-113: ANV turns a failed execbuffer into VK_ERROR_DEVICE_LOST and reports the errno only on WindowServer's
+ * stderr; put failing ioctls in the ring instead (every execbuffer failure, the first 64 others per process, so the
+ * apps' GETPARAM probes cannot use up WindowServer's lines as they did in N-280) */
+#define XG_NOTE_PIDS 16
+static volatile SInt32 xg_note_pid[XG_NOTE_PIDS], xg_note_cnt[XG_NOTE_PIDS];
+
+static bool
+xg_fd_note_budget(int pid)
+{
+	for (int i = 0; i < XG_NOTE_PIDS; i++) {
+		if (xg_note_pid[i] == 0)
+			OSCompareAndSwap(0, (UInt32)pid, (volatile UInt32 *)&xg_note_pid[i]);
+		if (xg_note_pid[i] == pid)
+			return (OSIncrementAtomic(&xg_note_cnt[i]) < 64);
+	}
+	return (false);
+}
+
+static int
+xg_fd_ioctl_note(int inst, unsigned long cmd, int error)
+{
+	if (error == 0 || error == EINTR || error == EAGAIN || error == ETIME || error == ERESTART)
+		return (error);
+	if ((cmd & 0xff) == 0x69 || xg_fd_note_budget(proc_selfpid()))
+		xg_printf("xegfx: ioctl 0x%lx (nr 0x%lx) inst %d pid %d -> errno %d\n", cmd, cmd & 0xff, inst,
+		    proc_selfpid(), error);
+	return (error);
+}
+
 /* the FreeBSD errnos that XNU numbers differently (sys/errno.h of both); the rest match */
 static int
 xg_fd_errno(int e)
@@ -78,6 +112,85 @@ xg_fd_errno(int e)
 	case 97: return (EIO);		/* EINTEGRITY */
 	default: return (e);
 	}
+}
+
+/* LinuxKPI makes ETIME ETIMEDOUT (60); libdrm and Mesa on Darwin test for ETIME (101), so a timed-out syncobj or
+ * GEM wait read as a failure (VK_ERROR_UNKNOWN) instead of VK_TIMEOUT */
+static int
+xg_fd_ioctl_errno(int e)
+{
+	return (e == ETIMEDOUT ? ETIME : xg_fd_errno(e));
+}
+
+/* syncobj waits take absolute CLOCK_MONOTONIC deadlines; on Darwin that clock is calendar time minus kern.boottime,
+ * seconds apart from the shim's ktime (mach_absolute_time) and slewed with the calendar, so rebase each call */
+static int64_t
+xg_fd_mono_minus_ktime(void)
+{
+	struct timeval bt;
+	size_t len = sizeof(bt);
+	clock_sec_t s;
+	clock_usec_t us;
+	uint64_t abs, abs_ns;
+
+	if (sysctlbyname("kern.boottime", &bt, &len, NULL, 0) != 0)
+		return (0);
+	clock_get_calendar_absolute_and_microtime(&s, &us, &abs);
+	absolutetime_to_nanoseconds(abs, &abs_ns);
+	return (((int64_t)s - bt.tv_sec) * 1000000000LL + ((int64_t)us - bt.tv_usec) * 1000LL - (int64_t)abs_ns);
+}
+
+static void
+xg_fd_rebase_ns(int64_t *v, int64_t off)
+{
+	if (*v <= 0 || *v == INT64_MAX)	/* poll, or wait forever */
+		return;
+	*v = (off < 0 && *v > INT64_MAX + off) ? INT64_MAX : *v - off;
+}
+
+/* the struct goes back to userspace and libdrm retries EINTR with it, so the caller restores the saved values */
+struct xg_fd_wait_save {
+	int64_t	*tmo, *dl;
+	int64_t	tmo_v, dl_v;
+};
+
+static void
+xg_fd_rebase_wait(unsigned long cmd, char *buf, xg_fd_wait_save *sv)
+{
+	size_t tmo, flg, dl, len = IOCPARM_LEN(cmd);
+	uint32_t flags;
+	int64_t off;
+
+	sv->tmo = sv->dl = NULL;
+
+	if (IOCGROUP(cmd) != 'd')
+		return;
+	switch (cmd & 0xff) {
+	case 0xc3: tmo = 8; flg = 20; dl = 32; break;	/* drm_syncobj_wait */
+	case 0xca: tmo = 16; flg = 28; dl = 40; break;	/* drm_syncobj_timeline_wait */
+	default: return;
+	}
+	if (len < flg + 4)
+		return;
+	off = xg_fd_mono_minus_ktime();
+	sv->tmo = (int64_t *)(buf + tmo);
+	sv->tmo_v = *sv->tmo;
+	xg_fd_rebase_ns(sv->tmo, off);
+	memcpy(&flags, buf + flg, sizeof(flags));
+	if ((flags & (1u << 3)) && len >= dl + 8) {	/* DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE */
+		sv->dl = (int64_t *)(buf + dl);
+		sv->dl_v = *sv->dl;
+		xg_fd_rebase_ns(sv->dl, off);
+	}
+}
+
+static void
+xg_fd_restore_wait(const xg_fd_wait_save *sv)
+{
+	if (sv->tmo != NULL)
+		*sv->tmo = sv->tmo_v;
+	if (sv->dl != NULL)
+		*sv->dl = sv->dl_v;
 }
 
 static int
@@ -144,11 +257,15 @@ xg_fd_d_write(dev_t dev, struct uio *uio, int ioflag)
 static int
 xg_fd_d_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p)
 {
-	int inst = xg_fd_inst_of(dev);
+	int inst = xg_fd_inst_of(dev), error;
+	xg_fd_wait_save sv;
 
 	if (inst < 0)
 		return (ENXIO);
-	return (xg_fd_errno(xg_fd_dev_ioctl(inst, cmd, data, fflag)));
+	xg_fd_rebase_wait(cmd, data, &sv);
+	error = xg_fd_ioctl_note(inst, cmd, xg_fd_ioctl_errno(xg_fd_dev_ioctl(inst, cmd, data, fflag)));
+	xg_fd_restore_wait(&sv);
+	return (error);
 }
 
 /* what d_ioctl would get, with the copies ioctl(2) makes around it; only the opener may use an instance */
@@ -172,8 +289,13 @@ xg_fd_remote_ioctl(int minor, unsigned long cmd, unsigned long long uarg)
 		error = copyin((user_addr_t)uarg, buf, len);
 	else if ((cmd & IOC_VOID) && len == 0)
 		*(user_addr_t *)buf = (user_addr_t)uarg;
-	if (error == 0)
-		error = xg_fd_errno(xg_fd_dev_ioctl(inst, cmd, buf, 0));
+	if (error == 0) {
+		xg_fd_wait_save sv;
+
+		xg_fd_rebase_wait(cmd, buf, &sv);
+		error = xg_fd_ioctl_note(inst, cmd, xg_fd_ioctl_errno(xg_fd_dev_ioctl(inst, cmd, buf, 0)));
+		xg_fd_restore_wait(&sv);
+	}
 	if (error == 0 && (cmd & IOC_OUT) && len != 0)
 		error = copyout(buf, (user_addr_t)uarg, len);
 	if (buf != small)

@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/compiler.h>
+#include <linux/mm_types.h>
 
 struct mm_struct;
 
@@ -40,6 +41,9 @@ static inline int
 mmu_interval_notifier_insert(struct mmu_interval_notifier *mni, struct mm_struct *mm, unsigned long start,
     unsigned long length, const struct mmu_interval_notifier_ops *ops)
 {
+	/* Linux holds the mm until remove; i915 keeps comparing notifier.mm with current->mm after the task exits */
+	if (mm != NULL)
+		mmgrab(mm);
 	mni->mm = mm;
 	mni->ops = ops;
 	mni->start = start;
@@ -52,6 +56,8 @@ static inline void
 mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
 {
 	mni->ops = NULL;
+	if (mni->mm != NULL)
+		mmdrop(mni->mm);
 }
 
 static inline unsigned long

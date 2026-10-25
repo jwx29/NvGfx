@@ -28,6 +28,7 @@ static xg_pci_xnu *gXgPciDevs;
 static IOLock *gXgPciLock;
 static bool gXgPciScanned;
 extern "C" { unsigned int xg_pci_irqs; }	/* every interrupt taken; stage 5 reports how many its requests raised */
+extern "C" { unsigned int xg_pci_handled; void xg_irqoff_mark(int what, const void *pc); void xg_irqoff_clear(void); }	/* handler (work loop) runs: irqs far ahead of it means the handler is stuck */
 
 /* the owner of one interrupt source: it carries the FreeBSD filter/handler pair */
 class XgPciIntr : public OSObject {
@@ -173,7 +174,9 @@ xg_pci_filter(OSObject *owner, IOFilterInterruptEventSource *src)
 	int r;
 
 	OSIncrementAtomic((volatile SInt32 *)&xg_pci_irqs);
+	xg_irqoff_mark(2, (const void *)o->filter);
 	r = o->filter(o->arg);
+	xg_irqoff_clear();
 
 	return ((r & XG_PCI_FILTER_SCHEDULE) != 0 && o->handler != NULL);
 }
@@ -185,8 +188,10 @@ xg_pci_action(OSObject *owner, IOInterruptEventSource *src, int count)
 
 	if (o->filter == NULL)
 		OSIncrementAtomic((volatile SInt32 *)&xg_pci_irqs);
-	if (o->handler != NULL)
+	if (o->handler != NULL) {
 		o->handler(o->arg);
+		OSIncrementAtomic((volatile SInt32 *)&xg_pci_handled);
+	}
 }
 
 static IOReturn

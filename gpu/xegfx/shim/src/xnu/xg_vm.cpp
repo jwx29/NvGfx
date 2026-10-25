@@ -8,6 +8,10 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <mach/vm_param.h>
 #include "xg_vm_xnu.h"
+#include <libkern/OSAtomic.h>
+#include <sys/proc.h>
+extern "C" int xg_printf(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
+static SInt32 xg_vm_hold_logs;
 
 /* osfmk/i386/pmap.h: the bounds of XNU's direct map; exported by the kernel but not declared in the SDK */
 
@@ -250,6 +254,7 @@ xg_vm_x_hold_user(unsigned long long uaddr, unsigned int npages, int writable, u
 	task_t task = current_task();
 	IOMemoryDescriptor *md;
 	xg_vm_xmem_t xm;
+	IOReturn ret;
 
 	if (task == kernel_task || npages == 0 || (uaddr & PAGE_MASK) != 0)
 		return nullptr;
@@ -257,7 +262,11 @@ xg_vm_x_hold_user(unsigned long long uaddr, unsigned int npages, int writable, u
 	    writable ? kIODirectionInOut : kIODirectionOut, task);
 	if (md == nullptr)
 		return nullptr;
-	if (md->prepare() != kIOReturnSuccess) {
+	if ((ret = md->prepare()) != kIOReturnSuccess) {
+		/* N-283: WindowServer's execbuffer gets EFAULT; this says whether wiring the range is what fails */
+		if (OSIncrementAtomic(&xg_vm_hold_logs) < 8)
+			xg_printf("xegfx: userptr hold: prepare 0x%x for 0x%llx + %u pages (pid %d)\n", ret, uaddr, npages,
+			    proc_selfpid());
 		md->release();
 		return nullptr;
 	}

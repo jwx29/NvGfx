@@ -6,12 +6,15 @@
 // the plugin's IOSurface copies (Intel: private per process, copied out after every GPU write) from the GPU work.
 // NM_TEST_PLUGIN=<NVMTLDriver build>: that plugin in this process only (as mtlprobe). The clear and blit results are
 // also checked through the IOSurfaces' base addresses (surface-out, and surface-in for the CPU-filled blit source).
+// MTLBENCH_PITCH=1: only the IOSurface pitch cases (pitch-wide: RGBA16Float 5632x64, row 45056; pitch-odd: R8Unorm 642x64,
+// row 656, not a multiple of 32), each a CPU-filled source blitted to a second surface and compared row by row.
 // Exit 0 when every command buffer completed and the pixels match.
 // <wtl> project: xegfx | author: watchthelight </wtl>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #include <stdlib.h>
+#include <string.h>
 #include <dlfcn.h>
 #include <objc/message.h>
 #include <IOKit/IOKitLib.h>
@@ -23,25 +26,26 @@ static IOSurfaceRef g_surf[2]; static int g_nsurf;
 
 static double now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
 
-static id<MTLTexture> surface_texture(id<MTLDevice> dev, MTLTextureUsage usage)
+// outSurf == NULL: the surface goes into g_surf (at most two, for the checks in main). Otherwise the caller owns it.
+static id<MTLTexture> surface_texture(id<MTLDevice> dev, MTLTextureUsage usage, NSUInteger w, NSUInteger h, NSUInteger bpe,
+                                      NSUInteger bytesPerRow, uint32_t fourcc, MTLPixelFormat mf, IOSurfaceRef *outSurf)
 {
-    if (getenv("MTLBENCH_PRIVATE") && getenv("MTLBENCH_PRIVATE")[0] == '1') {
-        MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                      width:kW height:kH mipmapped:NO];
+    if (!outSurf && getenv("MTLBENCH_PRIVATE") && getenv("MTLBENCH_PRIVATE")[0] == '1') {
+        MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mf width:w height:h mipmapped:NO];
         pd.usage = usage;
         pd.storageMode = MTLStorageModePrivate;
         return [dev newTextureWithDescriptor:pd];
     }
-    NSDictionary *p = @{(id)kIOSurfaceWidth: @(kW), (id)kIOSurfaceHeight: @(kH), (id)kIOSurfaceBytesPerElement: @4,
-                        (id)kIOSurfaceBytesPerRow: @(kW * 4), (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA')};
+    NSDictionary *p = @{(id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @(bpe),
+                        (id)kIOSurfaceBytesPerRow: @(bytesPerRow), (id)kIOSurfacePixelFormat: @(fourcc)};
     IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)p);
     if (!s) return nil;
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                  width:kW height:kH mipmapped:NO];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mf width:w height:h mipmapped:NO];
     td.usage = usage;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [dev newTextureWithDescriptor:td iosurface:s plane:0];
-    if (g_nsurf < 2) g_surf[g_nsurf++] = s; else CFRelease(s);
+    if (outSurf) *outSurf = s;
+    else if (g_nsurf < 2) g_surf[g_nsurf++] = s; else CFRelease(s);
     return t;
 }
 
@@ -52,6 +56,66 @@ static int report(const char *name, double *t, int n, int bad)
     printf("bench %-6s n %d  min %.2f  avg %.2f  max %.2f ms%s\n", name, n, mn, sum / n, mx,
            bad ? "  (some command buffers did not complete)" : "");
     return bad;
+}
+
+// MTLBENCH_PITCH=1 (pitch cases only): IOSurface row pitches the plugin's zero-copy path treats differently. The source is
+// filled by the CPU with a per-row pattern, one blit copies it to a second surface of the same layout, and every row's
+// active bytes (w * bpe, not the padding) are compared. The row is what IOSurface really gave, which can differ from the ask.
+// Returns 0 OK, 5 command buffer incomplete, 6 wrong bytes, 3 no surface or texture.
+static int pitch_case(id<MTLDevice> dev, id<MTLCommandQueue> q, const char *name, NSUInteger w, NSUInteger h, NSUInteger bpe,
+                      NSUInteger want_row, uint32_t fourcc, MTLPixelFormat mf, unsigned salt)
+{
+    IOSurfaceRef ss = NULL, ds = NULL;
+    id<MTLTexture> src = surface_texture(dev, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, w, h, bpe, want_row, fourcc, mf, &ss);
+    id<MTLTexture> dst = surface_texture(dev, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, w, h, bpe, want_row, fourcc, mf, &ds);
+    if (!src || !dst) { printf("%s: no IOSurface texture\n", name); if (ss) CFRelease(ss); if (ds) CFRelease(ds); return 3; }
+    size_t row = IOSurfaceGetBytesPerRow(ss), drow = IOSurfaceGetBytesPerRow(ds), act = (size_t)w * bpe;
+    printf("%s: %lux%lu bpe %lu  bytesPerRow asked %lu got %zu (dst %zu)  row %% 32 = %zu\n", name, (unsigned long)w,
+           (unsigned long)h, (unsigned long)bpe, (unsigned long)want_row, row, drow, row % 32);
+    if (row != want_row) printf("%s: pitch-rounded, IOSurface changed the row from %lu to %zu; testing with %zu\n", name,
+                                (unsigned long)want_row, row, row);
+
+    IOSurfaceLock(ss, 0, NULL);
+    uint8_t *sb = IOSurfaceGetBaseAddress(ss);
+    for (NSUInteger y = 0; y < h; y++) for (size_t x = 0; x < act; x++) sb[y * row + x] = (uint8_t)((x * 7 + y * 13 + salt) & 0xff);
+    IOSurfaceUnlock(ss, 0, NULL);
+    IOSurfaceLock(ds, 0, NULL);
+    memset(IOSurfaceGetBaseAddress(ds), 0, drow * h);
+    IOSurfaceUnlock(ds, 0, NULL);
+
+    double t0 = now_ms();
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+    [be copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(w, h, 1) toTexture:dst destinationSlice:0 destinationLevel:0
+      destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [be endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    double el = now_ms() - t0;
+    int fails = cb.status != MTLCommandBufferStatusCompleted;
+    report(name, &el, 1, fails);
+    if (fails) printf("%s: command buffer status %ld%s%s\n", name, (long)cb.status, cb.error ? " " : "",
+                      cb.error ? cb.error.localizedDescription.UTF8String : "");
+
+    unsigned badrows = 0; long fx = -1, fy = -1;
+    IOSurfaceLock(ds, kIOSurfaceLockReadOnly, NULL);
+    const uint8_t *db = IOSurfaceGetBaseAddress(ds);
+    for (NSUInteger y = 0; y < h; y++) {
+        int rowbad = 0;
+        for (size_t x = 0; x < act; x++)
+            if (db[y * drow + x] != (uint8_t)((x * 7 + y * 13 + salt) & 0xff)) {
+                if (fx < 0) { fx = (long)x; fy = (long)y; }
+                rowbad = 1; break;
+            }
+        badrows += rowbad;
+    }
+    IOSurfaceUnlock(ds, kIOSurfaceLockReadOnly, NULL);
+    if (badrows) printf("%s: %u of %lu rows wrong, first at byte x %ld (element %ld) y %ld\n", name, badrows, (unsigned long)h,
+                        fx, fx / (long)bpe, fy);
+    else if (!fails) printf("%s: all %lu rows match\n", name, (unsigned long)h);
+    CFRelease(ss); CFRelease(ds);
+    return fails ? 5 : badrows ? 6 : 0;
 }
 
 int main(void)
@@ -76,8 +140,15 @@ int main(void)
         if (n < 1 || n > 1000) n = 30;
         double *t = calloc((size_t)n, sizeof(double));
         id<MTLCommandQueue> q = [dev newCommandQueue];
-        id<MTLTexture> dst = surface_texture(dev, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
-        id<MTLTexture> src = surface_texture(dev, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
+        if (getenv("MTLBENCH_PITCH") && getenv("MTLBENCH_PITCH")[0] == '1') {
+            int rc = pitch_case(dev, q, "pitch-wide", 5632, 64, 8, 45056, (uint32_t)'RGhA', MTLPixelFormatRGBA16Float, 0x21);
+            int r2 = pitch_case(dev, q, "pitch-odd", 642, 64, 1, 656, (uint32_t)'L008', MTLPixelFormatR8Unorm, 0x5c);
+            printf("metal bench pitch: %s\n", rc == 5 || r2 == 5 ? "INCOMPLETE" : rc || r2 ? "WRONG PIXELS" : "OK");
+            free(t);
+            return rc == 5 || r2 == 5 ? 5 : rc || r2 ? 6 : 0;   // a failed setup (3) counts as wrong too
+        }
+        id<MTLTexture> dst = surface_texture(dev, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, kW, kH, 4, kW * 4, (uint32_t)'BGRA', MTLPixelFormatBGRA8Unorm, NULL);
+        id<MTLTexture> src = surface_texture(dev, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, kW, kH, 4, kW * 4, (uint32_t)'BGRA', MTLPixelFormatBGRA8Unorm, NULL);
         if (!dst || !src) { printf("no IOSurface texture\n"); return 3; }
         int fails = 0;
 

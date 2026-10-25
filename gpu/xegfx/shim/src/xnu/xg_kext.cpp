@@ -36,6 +36,39 @@ KMOD_EXPLICIT_DECL(org.watchthelight.XeGfx, "0.0.32", _start, _stop)
 char xg_env[512];
 int xg_progress;	/* last breadcrumb a running stage reached; the guard journals it */
 extern unsigned int xg_pci_irqs;
+extern "C" unsigned int xg_pci_handled;
+extern "C" {
+struct xg_irqoff { volatile unsigned long long t0; volatile unsigned long pc; volatile int what; };
+extern struct xg_irqoff xg_irqoff[64];
+extern int xg_spin_panic;
+}
+static thread_call_t gIrqoffCall;
+static volatile UInt32 gIrqoffArmed;
+static vm_address_t gKextBase;
+
+/*
+ * N-287..N-289 died in XNU's rendezvous timeout: one CPU kept interrupts off for half a second and the report never
+ * says which. This runs on a CPU that still answers, every 20 ms, and names the slot first (100 ms).
+ */
+static void
+xg_irqoff_check(thread_call_param_t, thread_call_param_t)
+{
+	uint64_t now = mach_absolute_time(), ns;
+
+	for (int c = 0; c < 64; c++) {
+		uint64_t t0 = xg_irqoff[c].t0;
+		if (t0 == 0 || t0 > now)
+			continue;
+		absolutetime_to_nanoseconds(now - t0, &ns);
+		if (ns > 100000000ull && xg_spin_panic)
+			panic("xegfx: cpu %d has had interrupts off for %llu ms in %s, pc %#lx (XeGfx base %#lx, offset %#lx)",
+			    c, ns / 1000000, xg_irqoff[c].what == 2 ? "the interrupt filter" : "a spin section",
+			    xg_irqoff[c].pc, (unsigned long)gKextBase, xg_irqoff[c].pc - (unsigned long)gKextBase);
+	}
+	uint64_t dl;
+	clock_interval_to_deadline(20, NSEC_PER_MSEC, &dl);
+	thread_call_enter_delayed(gIrqoffCall, dl);
+}
 extern int xg_spin_panic;
 extern unsigned long long xg_spin_max_us;
 extern unsigned int xg_spin_long;
@@ -431,6 +464,9 @@ xg_run_stage(int s)
 		xg_trace_write();
 		thread_call_enter(gTraceCall);
 	}
+	/* xegfx.irqoff_check=0 turns the checker off: N-290 passed with it, is its 20 ms wakeup the fix? */
+	if (gIrqoffCall && !xg_env_has("xegfx.irqoff_check=0") && OSCompareAndSwap(0, 1, &gIrqoffArmed))
+		xg_irqoff_check(nullptr, nullptr);
 	if (gWdogCall && gWdog > 0) {
 		uint64_t dl;
 		clock_interval_to_deadline(gWdog, NSEC_PER_SEC, &dl);
@@ -622,9 +658,10 @@ xegfx_trace_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 static int
 xegfx_spin_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 {
-	char b[80];
+	char b[120];
 
-	snprintf(b, sizeof(b), "max_us %llu long %u panic %d", xg_spin_max_us, xg_spin_long, xg_spin_panic);
+	snprintf(b, sizeof(b), "max_us %llu long %u panic %d irqs %u handled %u", xg_spin_max_us, xg_spin_long, xg_spin_panic,
+	    xg_pci_irqs, xg_pci_handled);
 	return SYSCTL_OUT(req, b, strlen(b) + 1);
 }
 SYSCTL_PROC(_debug, OID_AUTO, xegfx_spin, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_spin_sysctl, "A",
@@ -870,8 +907,10 @@ xg_unimpl(const char *name)
 }
 
 extern "C" kern_return_t
-_start(kmod_info_t *, void *)
+_start(kmod_info_t *ki, void *)
 {
+	gKextBase = ki ? ki->address : 0;
+	gIrqoffCall = thread_call_allocate(xg_irqoff_check, nullptr);
 	gStageLock = IOLockAlloc();
 	gLogLock = IOSimpleLockAlloc();
 	gSnapLock = IOLockAlloc();

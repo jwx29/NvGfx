@@ -178,13 +178,39 @@ critical_exit_KBI(void)
 		lck_spin_unlock(XG_TD_CRIT(td));
 }
 
+/* per CPU: since when and from where interrupts are off in a spin section or the interrupt filter (I-116 watchdog) */
+struct xg_irqoff xg_irqoff[XG_IRQOFF_CPUS];
+
+void
+xg_irqoff_mark(int what, const void *pc)
+{
+	int c = cpu_number();
+
+	if (c < XG_IRQOFF_CPUS) {
+		xg_irqoff[c].pc = (uintptr_t)pc;
+		xg_irqoff[c].what = what;
+		xg_irqoff[c].t0 = mach_absolute_time();
+	}
+}
+
+void
+xg_irqoff_clear(void)
+{
+	int c = cpu_number();
+
+	if (c < XG_IRQOFF_CPUS)
+		xg_irqoff[c].t0 = 0;
+}
+
 void
 spinlock_enter(void)
 {
 	struct thread *td = curthread;
 
-	if (td->td_md.md_spinlock_count++ == 0)
+	if (td->td_md.md_spinlock_count++ == 0) {
 		td->td_md.md_saved_flags = ml_set_interrupts_enabled(0);
+		xg_irqoff_mark(1, __builtin_return_address(0));
+	}
 	critical_enter_KBI();
 }
 
@@ -194,8 +220,10 @@ spinlock_exit(void)
 	struct thread *td = curthread;
 
 	critical_exit_KBI();
-	if (--td->td_md.md_spinlock_count == 0)
+	if (--td->td_md.md_spinlock_count == 0) {
+		xg_irqoff_clear();
 		ml_set_interrupts_enabled((int)td->td_md.md_saved_flags);
+	}
 }
 
 /* time: FreeBSD's ticks and LinuxKPI's jiffies are read through these (shim sys/kernel.h, linux/jiffies.h) */
@@ -358,7 +386,9 @@ arc4random_uniform(uint32_t bound)
 void
 xg_kern_init(void)
 {
-	xg_boot_abs = mach_absolute_time();
+	/* ktime counts from boot (mach_absolute_time), not from kext load; syncobj wait deadlines from userspace are
+	 * rebased onto it in xg_fd.cpp */
+	xg_boot_abs = 0;
 	mp_ncpus = (int)real_ncpus;
 	mp_maxid = mp_ncpus - 1;
 	if (mp_ncpus > XG_MAXCPU)

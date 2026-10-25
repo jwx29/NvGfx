@@ -131,16 +131,20 @@ xg_map_mmap(struct file *filp, void *key, struct xg_drm_mmap *a)
 
 	if (a->size == 0 || (a->offset | a->size) & ~PAGE_MASK)
 		return -EINVAL;
-	rcu_read_lock();
+	/*
+	 * Lookup lock first, then RCU: the shim's rwlock_t sleeps when contended and an RCU reader here cannot sleep
+	 * (N-286 panicked in exactly this spot). i915 takes them the other way round, which is fine where rwlock_t spins.
+	 */
 	drm_vma_offset_lock_lookup(dev->vma_offset_manager);
+	rcu_read_lock();
 	node = drm_vma_offset_lookup_locked(dev->vma_offset_manager, a->offset >> PAGE_SHIFT,
 	    a->size >> PAGE_SHIFT);
 	if (node && drm_vma_node_is_allowed(node, priv) && !node->driver_private) {
 		mmo = container_of(node, struct i915_mmap_offset, vma_node);
 		obj = i915_gem_object_get_rcu(mmo->obj);
 	}
-	drm_vma_offset_unlock_lookup(dev->vma_offset_manager);
 	rcu_read_unlock();
+	drm_vma_offset_unlock_lookup(dev->vma_offset_manager);
 	if (obj == NULL)
 		return node ? -EACCES : -EINVAL;
 

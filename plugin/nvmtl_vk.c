@@ -4,10 +4,12 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include <syslog.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -568,6 +570,8 @@ static VkBool32 VKAPI_PTR nvmtl_vkmsg_cb(VkDebugUtilsMessageSeverityFlagBitsEXT 
     const char *b = strrchr(id, '/'); b = b ? b + 1 : id;
     char t[600]; snprintf(t, sizeof t, "nvk-reason: %s %s: %s", (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "E" : "W", b, m);
     for (char *c = t; *c; c++) if ((unsigned char)*c < 0x20) *c = ' ';
+    /* the release log file is out of reach in WindowServer's sandbox; ANV's device-lost reason arrives here */
+    if (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) syslog(LOG_ERR, "NullMoth: %s", t);
     extern const char *nvmtl_log_path(void);
     FILE *f = fopen(nvmtl_log_path(), "a");
     if (f) {
@@ -1403,6 +1407,23 @@ const char *nvmtl_image_ident(const void *addr, char *out, size_t n)
     return out;
 }
 
+// i915 holds userptr pages for writing, so a read-only range (constant data, a mapped file) fails at the next submit
+// with EFAULT and ANV loses the device (N-284, WindowServer); such buffers are copied instead
+static int nvmtl_range_writable(const void *ptr, size_t size)
+{
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)ptr, end = a + size;
+    while (a < end) {
+        mach_vm_address_t ra = a; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS)
+            return 0;
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        if (ra > a || !(info.protection & VM_PROT_WRITE)) return 0;
+        a = ra + rs;
+    }
+    return 1;
+}
+
 int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
 {
     if (nvmtl_vk_init()) return -1;
@@ -1411,6 +1432,10 @@ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
     if (((uintptr_t)ptr & (g_host_align - 1)) || (size & (g_host_align - 1))) {
         static int said; if (!said++) nvlog("vk: host-pointer import refused — ptr %p / size %zu are not both a multiple of %zu; that buffer is COPIED",
                                             ptr, size, g_host_align);
+        return -1;
+    }
+    if (!nvmtl_range_writable(ptr, size)) {
+        static int said; if (said++ < 4) nvlog("vk: host-pointer import refused — %p (+%zu) is not all writable memory; that buffer is COPIED", ptr, size);
         return -1;
     }
     VkMemoryHostPointerPropertiesEXT mhp = { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT, NULL, 0 };
