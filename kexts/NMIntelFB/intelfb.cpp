@@ -525,9 +525,10 @@ IOReturn NMIntelFB::getAttributeForConnection(IOIndex idx, IOSelect attr, uintpt
     }
 }
 
-// NVAccel's display pipe asks every head for its scan-out (NVRM_VRAM_FN_SCANOUT). This head answers with a CPU mapping and
-// no VRAM address: phys 0 keeps NVAccel from treating Intel memory as NVIDIA VRAM (it is not in the NVIDIA card's BAR1),
-// so frames reach the panel only through the copy into kva.
+// NVAccel's display pipe asks every head for its scan-out (NVRM_VRAM_FN_SCANOUT).
+// Experimental: publish the real physical console framebuffer aperture as a display-pipe resource.
+// This is Intel system/display memory, NOT NVIDIA VRAM or a BAR1 offset; the accelerator must
+// continue using the CPU copy path and must not attempt NVIDIA hardware access to this address.
 IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
@@ -535,9 +536,22 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
         if (!fSurfMap) mapSurface();
         if (!fSurfMap) return kIOReturnNotReady;
+
+        const uint64_t bytes = static_cast<uint64_t>(fRowBytes) * fHeight;
+        const IOPhysicalAddress phys = fApertureBase + fSurf;
+        if (!phys || !bytes || !fWidth || !fHeight) return kIOReturnNotReady;
+
         r->kva = (void *)fSurfMap->getVirtualAddress();
-        r->phys = 0; r->actualSize = 0;
-        r->width = fWidth; r->height = fHeight; r->pitch = fRowBytes;
+        r->phys = phys;
+        r->actualSize = bytes;
+        r->size = bytes;
+        r->width = fWidth;
+        r->height = fHeight;
+        r->pitch = fRowBytes;
+
+        IFBLOG("scanout ABI: real physical address 0x%llx, %ux%u pitch %u, %llu bytes",
+               (unsigned long long)r->phys, r->width, r->height, r->pitch,
+               (unsigned long long)r->actualSize);
         return kIOReturnSuccess;
     }
     return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);

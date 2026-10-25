@@ -515,8 +515,9 @@ info "Head-4 published mask: $value"
 
 info "6: Register NMIntelFB and enable the scanout-backed display-pipe gate (nvaccelfb=3)"
 # 1 registers the framebuffer; 3 also enables gNvScanout and re-delivers mode change.
+# 4 enables aperture-memory descriptors.
 # The sysctl read-back typically shows 1 (armed), NOT the last value written.
-sysctl -w debug.nvaccelfb=3 || fail "Framebuffer registration/scanout sysctl failed."
+sysctl -w debug.nvaccelfb=4 || fail "Framebuffer registration/scanout sysctl failed."
 registered=0
 for ((i=0; i<15; i++)); do
     reg="$(get_sysctl debug.nvaccel_heads_registered || echo 0)"
