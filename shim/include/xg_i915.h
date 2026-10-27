@@ -40,6 +40,8 @@ struct xg_i915_store {
 
 /* all return 0 with the report filled, or -ENODEV when no i915 device is bound */
 int xg_i915_state(struct xg_i915_state *st);
+/* I-116 A/B: 1 keeps every GT awake (wakeref), 2 also holds forcewake on all domains; the GT count, or -ENODEV */
+int xg_i915_gtawake(int level);
 /* one kernel-context request per uabi engine, each waited for at most timeout_ms; sleeps */
 int xg_i915_exec(struct xg_i915_exec *ex, int timeout_ms);
 /* install the GEM map ioctls ('N' 0x40/0x41, NullMoth's Darwin libdrm ABI) on the DRM nodes */
