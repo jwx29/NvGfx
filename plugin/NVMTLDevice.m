@@ -209,6 +209,15 @@ static bool nvmtl_gpu_profile_string(CFStringRef key, char *out, size_t n)
     IOObjectRelease(it);
     return ok;
 }
+// True when the generation the driver published is this one, whatever family follows it. The TU11x cards publish
+// "Turing GTX 16" where the TU10x ones publish plain "Turing", so an exact compare left every GTX 16 card without a
+// hardware encoder. Both GTX 16 chips encode on the Turing libraries: measured on a GTX 1650 (TU117), H.264 and HEVC
+// 5 of 5 frames with no errors, although its profile lists no encoder class (the library allocates the class itself).
+static bool nvmtl_gen_is(const char *gen, const char *name)
+{
+    size_t n = strlen(name);
+    return !strncmp(gen, name, n) && (gen[n] == '\0' || gen[n] == ' ');
+}
 static bool nvmtl_video_is_blackwell(void)
 {
     if (g_video_blackwell >= 0) return g_video_blackwell == 1;
@@ -232,9 +241,9 @@ static const char *nvmtl_nvenc_hevc_library_for_this_gpu(void)
     char gen[32];
     if (!nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen))
         return nvmtl_video_is_blackwell() ? "libnvenc_hevc.dylib" : NULL;
-    if (!strcmp(gen, "Blackwell")) return "libnvenc_hevc.dylib";
-    if (!strcmp(gen, "Ampere")) return "libnvenc_hevc_ga10x.dylib";
-    if (!strcmp(gen, "Turing")) return "libnvenc_hevc_tu10x.dylib";
+    if (nvmtl_gen_is(gen, "Blackwell")) return "libnvenc_hevc.dylib";
+    if (nvmtl_gen_is(gen, "Ampere")) return "libnvenc_hevc_ga10x.dylib";
+    if (nvmtl_gen_is(gen, "Turing")) return "libnvenc_hevc_tu10x.dylib";
     return NULL;
 }
 static const char *nvmtl_nvenc_library_for_this_gpu(void)
@@ -244,10 +253,35 @@ static const char *nvmtl_nvenc_library_for_this_gpu(void)
         // No profile: fall back to the name test, which only recognises Blackwell.
         return nvmtl_video_is_blackwell() ? "libnvenc_h264.dylib" : NULL;
     }
-    if (!strcmp(gen, "Blackwell")) return "libnvenc_h264.dylib";
-    if (!strcmp(gen, "Ampere")) return "libnvenc_h264_ga10x.dylib";
-    if (!strcmp(gen, "Turing")) return "libnvenc_h264_tu10x.dylib";
+    if (nvmtl_gen_is(gen, "Blackwell")) return "libnvenc_h264.dylib";
+    if (nvmtl_gen_is(gen, "Ampere")) return "libnvenc_h264_ga10x.dylib";
+    if (nvmtl_gen_is(gen, "Turing")) return "libnvenc_h264_tu10x.dylib";
     return NULL;
+}
+static bool nvmtl_is_sandboxed(void)
+{
+    typedef int (*sandbox_check_fn)(pid_t, const char *, int, ...);
+    static sandbox_check_fn sbc = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sbc = (sandbox_check_fn)dlsym(RTLD_DEFAULT, "sandbox_check");
+    });
+    return sbc ? (sbc(getpid(), NULL, 0) != 0) : false;
+}
+static bool nvmtl_is_decode_service(const char *me)
+{
+    return me && strncmp(me, "VTDecoderXPCService", 19) == 0;
+}
+// Apple's sandboxed apps (Safari's WebKit GPU process, QuickTime Player, Preview) hand decoding to VTDecoderXPCService,
+// where the decoder is registered; inside them the in-process registration fails on the sandbox (#349). Chromium and
+// Electron decode in their own GPU process and ask VideoToolbox for a hardware decoder there, so skipping it left
+// Discord with no H.264 decoder at all and its videos stopped playing on 2.5.4. Only Apple's own processes delegate.
+static bool nvmtl_decode_is_delegated(const char *me)
+{
+    if (!nvmtl_is_sandboxed() || nvmtl_is_decode_service(me)) return false;
+    CFBundleRef main = CFBundleGetMainBundle();
+    CFStringRef ident = main ? CFBundleGetIdentifier(main) : NULL;
+    return ident && CFStringHasPrefix(ident, CFSTR("com.apple."));
 }
 static void nvmtl_nvdec_register(void)
 {
@@ -256,6 +290,10 @@ static void nvmtl_nvdec_register(void)
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVDEC")) { nvlog("nvdec: NVMTL_NO_NVDEC set - not registering in %s", me); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_decode_is_delegated(me)) {
+            nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process H.264 decoder (delegates to VTDecoderXPCService)", me);
+            return;
+        }
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
         if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - not registering", me); return; }
@@ -368,6 +406,10 @@ static void nvmtl_nvdec_hevc_register(void)
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVDEC_HEVC")) { nvlog("nvdec: NVMTL_NO_NVDEC_HEVC set - not registering HEVC in %s", me); return; }
         if (!strcmp(me, "WindowServer")) return;
+        if (nvmtl_decode_is_delegated(me)) {
+            nvlog("nvdec: %s is a sandboxed Apple process - not registering in-process HEVC decoder (delegates to VTDecoderXPCService)", me);
+            return;
+        }
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
         if (!reg) { nvlog("nvdec: VideoToolbox is not loaded in %s - not registering HEVC", me); return; }
@@ -397,7 +439,7 @@ static void nvmtl_nvdec_hevc_register(void);
 __attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
 {
     const char *me = getprogname();
-    if (!me || strcmp(me, "VTDecoderXPCService") || getenv("NVMTL_NO_NVDEC")) return;
+    if (!nvmtl_is_decode_service(me) || getenv("NVMTL_NO_NVDEC")) return;
     // off the loader's thread: the registration dlopens the decoder library
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         uint32_t dev = 0;
@@ -456,15 +498,19 @@ static void nvmtl_nvenc_hevc_register(void)
     });
 }
 // ANGLE refuses Metal on NVIDIA (disableMetalOnNvidia), and Chromium on macOS has no other GL backend, so without this
-// the GPU process exits at start-up and the app draws everything on the CPU. Chrome and Chromium get it by default:
-// without it their GPU process cannot start. Electron stays opt-in (NVMTL_ANGLE_METAL=1) because it showed artifacts,
+// the GPU process exits at start-up and the app draws everything on the CPU. Chrome, Chromium, Brave, Edge and Discord
+// get it by default: without it their GPU process cannot start. Electron stays opt-in (NVMTL_ANGLE_METAL=1) because it showed artifacts,
 // stutter and lost transparency on several cards. NVMTL_ANGLE_METAL=0 turns the rule off in every process. An existing
 // ANGLE override is kept; no sandbox setting is changed.
 static bool nvmtl_angle_chrome_family(void)
 {
     const char *me = getprogname();
     if (!me) return false;
-    return strncmp(me, "Google Chrome", 13) == 0 || strncmp(me, "Chromium", 8) == 0;
+    return strncmp(me, "Google Chrome", 13) == 0 ||
+           strncmp(me, "Brave Browser", 13) == 0 ||
+           strncmp(me, "Microsoft Edge", 14) == 0 ||
+           strncmp(me, "Chromium", 8) == 0 ||
+           strncmp(me, "Discord", 7) == 0;
 }
 __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
 {
@@ -727,6 +773,15 @@ static int nvmtl_pixfmt(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8)
     case MTLPixelFormatRGB10A2Uint:      *vk = 68 ; *bpp = 4; return 0;
     case MTLPixelFormatBGR10A2Unorm:     *vk = 58 ; *bpp = 4; return 0;
     case MTLPixelFormatRG11B10Float:     *vk = 122 ; *bpp = 4; return 0;
+    // Apple's extended-range formats have no Vulkan twin. CoreAnimation renders video and wide-colour layers into them
+    // (PBGRAXb is BGRA10_XR); without them Apple TV aborted on every video (#309). Each maps to a format of the same size
+    // that holds the values this driver's readers expect: the 64-bit ones to half floats (the whole -0.75..1.25 range,
+    // blendable), the 32-bit ones to 10:10:10:2 unorm (10-bit precision, values above 1.0 clamp). The bytes are not
+    // Apple's XR bit layout, which only a CPU reading raw texels would see.
+    case MTLPixelFormatBGRA10_XR:        *vk = 97 ; *bpp = 8; return 0;
+    case MTLPixelFormatBGRA10_XR_sRGB:   *vk = 97 ; *bpp = 8; return 0;
+    case MTLPixelFormatBGR10_XR:         *vk = 58 ; *bpp = 4; return 0;
+    case MTLPixelFormatBGR10_XR_sRGB:    *vk = 58 ; *bpp = 4; return 0;
     case MTLPixelFormatRGB9E5Float:      *vk = 123 ;  *bpp = 4; return 0;
     case MTLPixelFormatRG32Uint:         *vk = 101 ;           *bpp = 8;  return 0;
     case MTLPixelFormatRG32Sint:         *vk = 102 ;           *bpp = 8;  return 0;

@@ -891,28 +891,26 @@ __attribute__((weak)) NV_STATUS NV_API_CALL os_call_vgpu_vfio(void *, NvU32)
     return NV_ERR_NOT_SUPPORTED;
 }
 
-__attribute__((weak)) void* NV_API_CALL os_cgroup_for_pid(int pid, void *pidInfo)
+// NVLink fabric memory windows (multi-GPU servers); no Mac has a fabric.
+NV_STATUS NV_API_CALL nv_dma_init_sysmem_window_for_fabric_access(nv_state_t *, NvU64, NvU64 *, NvU64 *, NvBool *)
+{
+    return NV_ERR_NOT_SUPPORTED;
+}
+
+void NV_API_CALL nv_dma_destroy_sysmem_window_for_fabric_access(nv_state_t *, NvU64, NvU64)
+{
+}
+
+// Linux reports reclaimable page-cache memory here for RM's sysmem accounting; macOS has no equivalent RM can use.
+NvU64 NV_API_CALL os_get_reclaimable_memory_usage(void)
+{
+    return 0;
+}
+
+__attribute__((weak)) void* NV_API_CALL os_cgroup_for_pid(int pid, void *pidInfo, int impl)
 {
     NV_XNU_STUB_HIT("os_cgroup_for_pid");
     return NULL;
-}
-
-__attribute__((weak)) void* NV_API_CALL os_cgroup_get_from_fd(NvU32 fd)
-{
-    NV_XNU_STUB_HIT("os_cgroup_get_from_fd");
-    return NULL;
-}
-
-__attribute__((weak)) NvU32 NV_API_CALL os_cgroup_implementation(void)
-{
-    NV_XNU_STUB_HIT("os_cgroup_implementation");
-    return (NvU32)0;
-}
-
-__attribute__((weak)) void NV_API_CALL os_cgroup_put(void *cgroup)
-{
-    NV_XNU_STUB_HIT("os_cgroup_put");
-
 }
 
 __attribute__((weak)) NvBool NV_API_CALL os_check_access(RsAccessRight accessRight)
@@ -1002,30 +1000,6 @@ __attribute__((weak)) NV_STATUS NV_API_CALL os_device_vm_present(void)
 __attribute__((weak)) void NV_API_CALL os_disable_console_access(void)
 {
     NV_XNU_STUB_HIT("os_disable_console_access");
-
-}
-
-__attribute__((weak)) void* NV_API_CALL os_dmem_cgroup_register_region(NvU64 size, const char *name)
-{
-    NV_XNU_STUB_HIT("os_dmem_cgroup_register_region");
-    return NULL;
-}
-
-__attribute__((weak)) NV_STATUS NV_API_CALL os_dmem_cgroup_try_charge(void *region, NvU64 size, void **ret_pool, void **ret_limit_pool)
-{
-    NV_XNU_STUB_HIT("os_dmem_cgroup_try_charge");
-    return NV_ERR_NOT_SUPPORTED;
-}
-
-__attribute__((weak)) void NV_API_CALL os_dmem_cgroup_uncharge(void *pool, NvU64 size)
-{
-    NV_XNU_STUB_HIT("os_dmem_cgroup_uncharge");
-
-}
-
-__attribute__((weak)) void NV_API_CALL os_dmem_cgroup_unregister_region(void *region)
-{
-    NV_XNU_STUB_HIT("os_dmem_cgroup_unregister_region");
 
 }
 
@@ -1485,12 +1459,6 @@ __attribute__((weak)) NV_STATUS NV_API_CALL os_offline_page_at_address(NvU64 add
     return NV_ERR_NOT_SUPPORTED;
 }
 
-__attribute__((weak)) NV_STATUS NV_API_CALL os_open_temporary_file(void **)
-{
-    NV_XNU_STUB_HIT("os_open_temporary_file");
-    return NV_ERR_NOT_SUPPORTED;
-}
-
 __attribute__((weak)) void* NV_API_CALL os_pci_init_handle(NvU32, NvU8, NvU8, NvU8, NvU16 *, NvU16 *)
 {
     NV_XNU_STUB_HIT("os_pci_init_handle");
@@ -1653,7 +1621,7 @@ __attribute__((weak)) NvBool NV_API_CALL os_supports_kernel_suspend_notifiers(vo
     return NV_FALSE;
 }
 
-__attribute__((weak)) NV_STATUS NV_API_CALL os_tegra_igpu_perf_boost(void *, NvBool, NvU32)
+__attribute__((weak)) NV_STATUS NV_API_CALL os_tegra_igpu_perf_boost(void *, NvBool, NvU32, int)
 {
     NV_XNU_STUB_HIT("os_tegra_igpu_perf_boost");
     return NV_ERR_NOT_SUPPORTED;
@@ -1785,7 +1753,12 @@ __attribute__((weak)) long libspdm_x509_get_version(void) { NV_XNU_STUB_HIT("lib
 __attribute__((weak)) long libspdm_x509_set_date_time(void) { NV_XNU_STUB_HIT("libspdm_x509_set_date_time"); return 0; }
 __attribute__((weak)) long libspdm_x509_verify_cert(void) { NV_XNU_STUB_HIT("libspdm_x509_verify_cert"); return 0; }
 __attribute__((weak)) long libspdm_x509_verify_cert_chain(void) { NV_XNU_STUB_HIT("libspdm_x509_verify_cert_chain"); return 0; }
-__attribute__((weak)) long nv_parms(void) { NV_XNU_STUB_HIT("nv_parms"); return 0; }
+// NVIDIA's module-parameter table (nv-reg.h), not a function: rm_parse_option_string() walks it comparing each entry's
+// name until a NULL entry, and an option it does not find becomes an RM registry dword. It was a stub function of the
+// same name, so that walk read the stub's machine code as string pointers and any nvregdwords= boot-arg stopped the
+// boot in strcmp. Empty here, so every nvregdwords option reaches RM's registry.
+struct nv_xnu_parm { const char *name; NvU32 *data; };
+__attribute__((used)) struct nv_xnu_parm nv_parms[] = { { NULL, NULL } };
 __attribute__((weak)) long nvswitch_os_acquire_fabric_mgmt_cap(void) { NV_XNU_STUB_HIT("nvswitch_os_acquire_fabric_mgmt_cap"); return 0; }
 __attribute__((weak)) long nvswitch_os_add_client_event(void) { NV_XNU_STUB_HIT("nvswitch_os_add_client_event"); return 0; }
 __attribute__((weak)) long nvswitch_os_alloc_contig_memory(void) { NV_XNU_STUB_HIT("nvswitch_os_alloc_contig_memory"); return 0; }
