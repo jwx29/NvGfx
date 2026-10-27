@@ -12,6 +12,7 @@
 #include "i915_request.h"
 #include "gt/intel_engine.h"
 #include "gt/intel_engine_pm.h"
+#include "gt/intel_gt_pm.h"
 #include "gt/intel_gpu_commands.h"
 #include "gt/intel_ring.h"
 #include "gt/intel_gt.h"
@@ -66,6 +67,32 @@ xg_i915_state(struct xg_i915_state *st)
 		st->render_minor = i915->drm.render->index;
 	pci_dev_put(pdev);
 	return (0);
+}
+
+int
+xg_i915_gtawake(int level)
+{
+	struct drm_i915_private *i915;
+	struct pci_dev *pdev;
+	struct intel_gt *gt;
+	unsigned int id;
+	int n = 0;
+
+	if (level <= 0)
+		return (0);
+	if ((i915 = xg_i915_find(&pdev)) == NULL)
+		return (-ENODEV);
+	/* what i915's forcewake_user debugfs file does on open; never released, the A/B runs to the next restart */
+	for_each_gt(gt, i915, id) {
+		atomic_inc(&gt->user_wakeref);
+		intel_gt_pm_get_untracked(gt);
+		if (level >= 2)
+			intel_uncore_forcewake_user_get(gt->uncore);
+		n++;
+	}
+	pci_dev_put(pdev);
+	printf("xegfx: gtawake %d held on %d GTs\n", level, n);
+	return (n);
 }
 
 int

@@ -357,6 +357,8 @@ xg_gt_check(void)
 		rc = -5;
 	else if (rc == 1 && (st.guc_status != 10 || !st.guc_submission))
 		rc = -62;	/* 10 is INTEL_UC_FIRMWARE_RUNNING */
+	/* xegfx.gtawake=1|2: zep245's whole-Mac freezes stopped only with forcewake held on all domains (I-116) */
+	int awake = rc != 1 ? 0 : xg_i915_gtawake(xg_env_has("xegfx.gtawake=2") ? 2 : xg_env_has("xegfx.gtawake=1") ? 1 : 0);
 	if (d) {
 		xg_put(d, "gts", st.gts, 8);
 		xg_put(d, "wedged", st.wedged, 8);
@@ -367,6 +369,7 @@ xg_gt_check(void)
 		xg_put(d, "gsc-fw-status", (uint32_t)st.gsc_status);
 		xg_put(d, "engines", st.engines, 8);
 		xg_put(d, "render-minor", (uint32_t)st.render_minor);
+		xg_put(d, "gtawake-gts", (uint32_t)awake);
 		xg_put(d, "result", (uint32_t)rc);
 		if (gResident)
 			gResident->setProperty("XeGfxGt", d);
