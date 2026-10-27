@@ -56,7 +56,7 @@ What each step showed on the 7D67:
 
 The open problems are tracked in [NvGfx #12](https://github.com/watchthelight-labs/NvGfx/issues/12) and [#18](https://github.com/watchthelight-labs/NvGfx/issues/18).
 
-The source is at 0.0.45 ([CHANGELOG](CHANGELOG.md)). The last version that has booted is 0.0.43 (N-290, desktop stable for the 900 s test, then a panic at 88 minutes under heavy disk work); 0.0.44 and 0.0.45 only add off-by-default switches for testing that freeze and are built, not tested. The newest test build is the [v0.0.27 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.27) (Vulkan and Metal on Arrow Lake). Desktop runs need the NvGfx `xe` build of the accelerator and plugin as well.
+The source is at 0.0.45 ([CHANGELOG](CHANGELOG.md)), which is also the newest booted version. On N-296 it ran the Intel desktop for the full hour with the NVRAM trace off (`xegfx.nvram_trace=0`); N-295, the same build with the trace on, froze at 16 minutes. One clean hour is not a fix yet, so a two-hour run under disk and GPU load comes next. The newest test build is the [v0.0.45 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.45). Desktop runs need the NvGfx `xe` build of the accelerator and plugin as well.
 
 [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) got to a GPU-composited desktop first: it runs an i915-derived driver with Metal and Vulkan on a Dell Latitude 5350 under macOS 15. XeGfx takes a different road (unchanged drm-kmod sources over its own shim) and targets Tahoe as well.
 
