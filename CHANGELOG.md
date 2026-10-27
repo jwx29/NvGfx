@@ -1,8 +1,11 @@
 # Changelog
 
-Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the test laptop (Legion 5 15IAX10, Arrow Lake iGPU `8086:7D67`); "built" means it compiled and has not been run. Only the v0.0.27 prerelease has a published binary.
+Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the test laptop (Legion 5 15IAX10, Arrow Lake iGPU `8086:7D67`); "built" means it compiled and has not been run. Prereleases with a binary: v0.0.27, v0.0.35, v0.0.36, v0.0.38 and v0.0.45.
 
-## 0.0.45 (built, not booted)
+## 0.0.45 (booted: N-295, N-296)
+
+N-295 (`gtawake=2`) froze 16 minutes into the Intel desktop with the same rendezvous panic, so forcewake is not the I-116 cause. N-296 ran the same build with `xegfx.nvram_trace=0` and the Intel desktop stayed up for the full hour. The trace's NVRAM writes run in SMM on this firmware, where a CPU cannot answer the rendezvous interrupt, so the trace is now the main suspect. Leave it off for desktop runs.
+
 
 - `xegfx.gtawake=1` holds every GT's wakeref, `=2` also takes forcewake on all domains, so the GT never enters RC6. Off by default. It mirrors what stopped the whole-Mac freezes on another Xe port (I-116). The implementation of `xg_i915_gtawake` is in the NvGfx fork's `gpu/xkpi` overlay.
 - `XeGfxGt` in the registry reports `gtawake-gts`.
