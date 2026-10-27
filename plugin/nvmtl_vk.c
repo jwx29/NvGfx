@@ -765,6 +765,18 @@ static int nvmtl_vk_initialize(void)
             g_lim.maxComputeWorkGroupSize[2], g_lim.maxComputeWorkGroupInvocations, g_sm_count); }
     pvkGetPhysicalDeviceMemoryProperties(g_pdev, &g_memp);
 
+    /* diag test memory detection */
+    for (uint32_t i = 0; i < g_memp.memoryHeapCount; i++) {
+        nvlog(
+            "Intel memory heap %u: %llu MiB, flags=0x%x",
+            i,
+            (unsigned long long)
+                (g_memp.memoryHeaps[i].size >> 20),
+            g_memp.memoryHeaps[i].flags
+        );
+    }
+    /* diag */
+
     uint32_t qn = 0; pvkGetPhysicalDeviceQueueFamilyProperties(g_pdev, &qn, NULL);
     VkQueueFamilyProperties qf[16]; if (qn > 16) qn = 16; pvkGetPhysicalDeviceQueueFamilyProperties(g_pdev, &qn, qf);
     for (uint32_t i = 0; i < qn; i++)
@@ -1707,20 +1719,97 @@ static int nvmtl_vk_vram_wall0(uint64_t want, uint64_t *freev_out, uint64_t *bud
 }
 uint64_t nvmtl_vk_working_set(void)
 {
-    uint64_t b = 0, u = 0; if (nvmtl_vk_init()) return 2ull << 30;
-    { static int res2 = -1; if (res2 < 0) { const char *e = getenv("NVMTL_NO_RES2"), *w = getenv("NVMTL_RES2_WS");
-          res2 = !(w && w[0] == '0') && g_sparse && !(e && e[0] == '1'); }
-      if (res2 && nvmtl_vk_vram_bytes()) return nvmtl_vk_vram_bytes(); }
+    uint64_t b = 0, u = 0;
+
+    if (nvmtl_vk_init())
+        return 2ull << 30;
+
+    /*
+     * Intel integrated GPUs use unified system memory.
+     *
+     * The Vulkan heap represents maximum shared GPU capacity.
+     * The Vulkan budget represents the current recommended limit.
+     *
+     * Do not apply discrete-VRAM headroom or non-image reserves.
+     */
+    if (nvmtl_vk_vendor() == 0x8086) {
+        uint64_t heap = nvmtl_vk_vram_bytes();
+
+        nvmtl_vk_vram_budget(&b, &u);
+
+        uint64_t ws = b < heap ? b : heap;
+
+        nvlog(
+            "XeGfx unified working set: "
+            "heap=%llu MiB budget=%llu MiB "
+            "used=%llu MiB working_set=%llu MiB",
+            (unsigned long long)(heap >> 20),
+            (unsigned long long)(b >> 20),
+            (unsigned long long)(u >> 20),
+            (unsigned long long)(ws >> 20)
+        );
+
+        return ws;
+    }
+
+    /*
+     * Original discrete-GPU handling.
+     * Keep this unchanged for NVIDIA and AMD.
+     */
+    {
+        static int res2 = -1;
+
+        if (res2 < 0) {
+            const char *e = getenv("NVMTL_NO_RES2");
+            const char *w = getenv("NVMTL_RES2_WS");
+
+            res2 = !(w && w[0] == '0') &&
+                   g_sparse &&
+                   !(e && e[0] == '1');
+        }
+
+        if (res2 && nvmtl_vk_vram_bytes())
+            return nvmtl_vk_vram_bytes();
+    }
+
     nvmtl_vk_vram_budget(&b, &u);
-    static long long ovr = -2; if (ovr == -2) { const char *e = getenv("NVMTL_VRAM_WS_NONIMAGE_MB"); ovr = (e && *e) ? atoll(e) : -1; }
-    uint64_t nonimg = ovr >= 0 ? (uint64_t)ovr << 20 : NVMTL_VRAM_NONIMAGE;
-    if (u > g_vram_bytes && u - g_vram_bytes > nonimg) nonimg = u - g_vram_bytes;
+
+    static long long ovr = -2;
+
+    if (ovr == -2) {
+        const char *e = getenv("NVMTL_VRAM_WS_NONIMAGE_MB");
+        ovr = (e && *e) ? atoll(e) : -1;
+    }
+
+    uint64_t nonimg = ovr >= 0
+        ? (uint64_t)ovr << 20
+        : NVMTL_VRAM_NONIMAGE;
+
+    if (u > g_vram_bytes &&
+        u - g_vram_bytes > nonimg) {
+        nonimg = u - g_vram_bytes;
+    }
+
     uint64_t reserve = NVMTL_VRAM_HEADROOM + nonimg;
     uint64_t room = b > reserve ? b - reserve : 0;
-    { static long long pct = -2; if (pct == -2) { const char *e = getenv("NVMTL_WS_FILL_PCT"); pct = (e && *e) ? atoll(e) : 92;
-          if (pct < 50 || pct > 100) pct = 92; }
-      room = room / 100 * (uint64_t)pct; }
-    return room > (1ull << 30) ? room : (1ull << 30);
+
+    {
+        static long long pct = -2;
+
+        if (pct == -2) {
+            const char *e = getenv("NVMTL_WS_FILL_PCT");
+            pct = (e && *e) ? atoll(e) : 92;
+
+            if (pct < 50 || pct > 100)
+                pct = 92;
+        }
+
+        room = room / 100 * (uint64_t)pct;
+    }
+
+    return room > (1ull << 30)
+        ? room
+        : (1ull << 30);
 }
 unsigned long long nvmtl_tex_objs_live(void);
 unsigned long long nvmtl_tex_objs_released(void);

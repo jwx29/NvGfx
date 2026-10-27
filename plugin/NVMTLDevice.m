@@ -2036,8 +2036,16 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     nvlog("recommendedMaxWorkingSetSize -> %llu MB", (unsigned long long)(ws >> 20));
     return ws;
 }
-- (BOOL)hasUnifiedMemory { return NO; }
-- (uint64_t)dedicatedMemorySize { return nvmtl_vk_vram_bytes(); }
+- (BOOL)hasUnifiedMemory {
+    return nvmtl_vk_vendor() == 0x8086 ? YES : NO;
+}
+
+- (uint64_t)dedicatedMemorySize {
+    if (nvmtl_vk_vendor() == 0x8086)
+        return 0;
+
+    return nvmtl_vk_vram_bytes();
+}
 
 - (BOOL)nvmtlSampleCountOK:(NSUInteger)n {
     if (n == 0 || (n & (n - 1)) != 0 || n > 64) return NO;

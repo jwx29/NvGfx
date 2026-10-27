@@ -11,8 +11,12 @@
 // SIZE +0x10, SURF +0x1C. Transcoder T timings at 0x60000 + T*0x1000, TRANSCONF at 0x70008 + P*0x1000, PIPESRC 0x6001C.
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -199,6 +203,7 @@ private:
 public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
+    IOReturn setProperties(OSObject *properties) override;
     void stop(IOService *provider) override;
 
     IOReturn enableController() override { return kIOReturnSuccess; }
@@ -285,6 +290,77 @@ public:
 };
 
 OSDefineMetaClassAndStructors(NMIntelFB, IOFramebuffer)
+
+/* Reporting-only: root passes ANV's queried shared heap, never a scanout map. */
+IOReturn NMIntelFB::setProperties(OSObject *properties)
+{
+    auto outer = OSDynamicCast(OSDictionary, properties);
+    OSObject *payload = outer ? outer->getObject("XeGfxGPUIdentity") : nullptr;
+    if (!payload) return IOFramebuffer::setProperties(properties);
+
+    if (IOUserClient::clientHasPrivilege(current_task(),
+            kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+        return kIOReturnNotPrivileged;
+
+    auto report = OSDynamicCast(OSDictionary, payload);
+    if (!report || !fPCI || fStopping || !fWidth || !fHeight ||
+        fPCI->configRead16(kIOPCIConfigVendorID) != 0x8086 ||
+        fPCI->configRead16(kIOPCIConfigDeviceID) != 0x7d55)
+        return kIOReturnNotReady;
+
+    auto number = [report](const char *key) {
+        return OSDynamicCast(OSNumber, report->getObject(key));
+    };
+    OSNumber *version = number("version");
+    OSNumber *vendor = number("vendor");
+    OSNumber *device = number("device");
+    OSNumber *heap = number("sharedHeapBytes");
+    OSNumber *ram = number("physicalRAMBytes");
+    OSString *name = OSDynamicCast(OSString, report->getObject("name"));
+    if (!version || !vendor || !device || !heap || !ram || !name ||
+        version->unsigned64BitValue() != 1 ||
+        vendor->unsigned64BitValue() != 0x8086 ||
+        device->unsigned64BitValue() != 0x7d55)
+        return kIOReturnBadArgument;
+
+    const uint64_t bytes = heap->unsigned64BitValue();
+    const uint64_t physical = ram->unsigned64BitValue();
+    if (bytes < (256ull << 20) || !physical ||
+        physical > (1ull << 40) || bytes > physical ||
+        (bytes >> 20) > 0xffffffffull ||
+        !name->getLength() || name->getLength() > 127)
+        return kIOReturnBadArgument;
+    const char *label = name->getCStringNoCopy();
+    if (!label || label[name->getLength()] != '\0')
+        return kIOReturnBadArgument;
+    for (unsigned i = 0; i < name->getLength(); ++i)
+        if ((unsigned char)label[i] < 0x20 ||
+            (unsigned char)label[i] > 0x7e)
+            return kIOReturnBadArgument;
+
+    OSData *model = OSData::withBytes(label, name->getLength() + 1);
+    OSNumber *mb = OSNumber::withNumber(bytes >> 20, 32);
+    if (!model || !mb) {
+        if (model) model->release();
+        if (mb) mb->release();
+        return kIOReturnNoMemory;
+    }
+
+    /* The PCI property is read by System Information on Intel shared GPUs. */
+    bool ok = fPCI->setProperty("model", model);
+    ok = fPCI->setProperty("VRAM,totalMB", mb) && ok;
+    ok = fPCI->setProperty("XeGfxSharedHeapBytes", heap) && ok;
+    ok = fPCI->setProperty("XeGfxMemoryIsShared", kOSBooleanTrue) && ok;
+    /* Also expose the values on the framebuffer for straightforward checks. */
+    ok = setProperty("VRAM,totalMB", mb) && ok;
+    ok = setProperty("XeGfxSharedHeapBytes", heap) && ok;
+    model->release();
+    mb->release();
+    IFBLOG("shared GPU identity: %s, heap=%llu MiB, published=%d",
+           label, (unsigned long long)(bytes >> 20), ok);
+    return ok ? kIOReturnSuccess : kIOReturnNoMemory;
+}
+
 #ifdef NMINTELFB_VIRTUAL
 static NMIntelFB *gVirt;
 static int nmintelfb_sample_sysctl SYSCTL_HANDLER_ARGS
