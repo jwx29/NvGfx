@@ -591,6 +591,17 @@ fi
 
 sudo sysctl -w debug.xegfx_agdc_k5=1
 
+# Automatically publish the queried ANV shared-memory capacity.
+if [[ -x ./xegfx-vram-report/xegfx-gpu-report ]]; then
+    info "Publishing XeGfx shared VRAM capacity"
+
+    if ./xegfx-vram-report/xegfx-gpu-report; then
+        info "XeGfx shared VRAM reporting updated."
+    else
+        warn "VRAM reporting failed; GPU activation is unchanged."
+    fi
+fi
+
 info "READY FOR MANUAL TEST. This script DID NOT restart WindowServer."
 info "Verify the Metal plugin and Mesa/ANV are installed before expecting acceleration."
 info "To restart manually ONLY when ready: sudo killall -TERM WindowServer"
