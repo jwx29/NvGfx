@@ -56,7 +56,7 @@ What each step showed on the 7D67:
 
 The open problems are tracked in [NvGfx #12](https://github.com/watchthelight-labs/NvGfx/issues/12) and [#18](https://github.com/watchthelight-labs/NvGfx/issues/18).
 
-The source is at 0.0.45. The last version that has booted is 0.0.43 (N-290, desktop stable for the 900 s test, then a panic at 88 minutes under heavy disk work); 0.0.44 and 0.0.45 only add off-by-default switches for testing that freeze and are built, not tested. The newest test build is the [v0.0.27 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.27) (Vulkan and Metal on Arrow Lake). Desktop runs need the NvGfx `xe` build of the accelerator and plugin as well.
+The source is at 0.0.45 ([CHANGELOG](CHANGELOG.md)). The last version that has booted is 0.0.43 (N-290, desktop stable for the 900 s test, then a panic at 88 minutes under heavy disk work); 0.0.44 and 0.0.45 only add off-by-default switches for testing that freeze and are built, not tested. The newest test build is the [v0.0.27 prerelease](https://github.com/watchthelight-labs/XeGfx/releases/tag/v0.0.27) (Vulkan and Metal on Arrow Lake). Desktop runs need the NvGfx `xe` build of the accelerator and plugin as well.
 
 [VedCloud's Meteor Lake port](https://github.com/VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics) got to a GPU-composited desktop first: it runs an i915-derived driver with Metal and Vulkan on a Dell Latitude 5350 under macOS 15. XeGfx takes a different road (unchanged drm-kmod sources over its own shim) and targets Tahoe as well.
 
@@ -126,7 +126,7 @@ A broken GPU driver can stop a machine before anything reaches the disk, so the 
 
 ## Where development happens
 
-This repository holds the XNU side: the FreeBSD-kernel-API layer (`shim/`), the build harness and the checks. It is pulled as a subtree into the [NvGfx](https://github.com/watchthelight-labs/NvGfx) fork, branch `xe`, under `gpu/xegfx`, and that is where you should build it. The fork adds `gpu/xkpi`, an overlay that replaces the few drm-kmod files that are GPL-only, and the Metal plugin and accelerator glue. A build from this repository alone still uses drm-kmod's GPL-only headers and is only good for development.
+This repository holds the XNU side: the FreeBSD-kernel-API layer (`shim/`), the build harness and the checks. It is pulled as a subtree into the [NvGfx](https://github.com/watchthelight-labs/NvGfx) fork, branch `xe`, under `gpu/xegfx`, and that is where you should build it. The fork adds `gpu/xkpi`, an overlay that replaces the few drm-kmod files that are GPL-only and holds the i915 glue the stages call (`xg_i915_state`, `xg_i915_exec`, `xg_i915_gtawake` and the rest of `shim/include/xg_i915.h`), and the Metal plugin and accelerator glue. A build from this repository alone still uses drm-kmod's GPL-only headers and is only good for development.
 
 ## Building
 

@@ -15,7 +15,7 @@ Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the
 
 - The interrupts-off watchdog names the CPU and the caller before macOS hits its rendezvous timeout (I-116). On N-290 the Intel desktop stayed up for the 900 s test, the first run to do so since I-116 appeared.
 
-## 0.0.42 (booted: N-289)
+## 0.0.42 (booted: N-289, crashed at about 15 to 20 s with the I-116 rendezvous panic)
 
 - Reverts the blanket rwlock spin from 0.0.40, which caused rendezvous panics (N-287, N-288).
 - `xg_map_mmap` takes the lookup lock before `rcu_read_lock` instead, which fixes the sleeping-lock-in-RCU panic on WindowServer's mmap path.
