@@ -8,7 +8,7 @@ It is a test driver for people who want to help, not something to install on a M
 
 ## Does it work on my machine?
 
-Find your GPU's PCI ID with `ioreg -l | grep -i '"device-id"'` on macOS or `lspci -nn | grep VGA` on Linux. Only one machine has run XeGfx so far, so everything except the first row is untested. A report from your machine, working or not, is the most useful thing you can send ([issue #3](https://github.com/watchthelight-labs/XeGfx/issues/3)).
+Find your GPU's PCI ID with `ioreg -l | grep -i '"device-id"'` on macOS or `lspci -nn | grep VGA` on Linux. We have run XeGfx on one machine, and one other owner of the same CPU reports running it with patches of their own ([ArrowWhatever](https://github.com/Mountainatic/ArrowWhatever), documents only so far), so everything except the first row is untested. A report from your machine, working or not, is the most useful thing you can send ([issue #3](https://github.com/watchthelight-labs/XeGfx/issues/3)).
 
 | Family | Example PCI IDs (8086:) | Graphics | State |
 |---|---|---|---|
@@ -98,6 +98,7 @@ XeGfx is built on other people's work. Thanks to all of them.
 | [wallali77666-cyber/iris-xe-macos-driver](https://github.com/wallali77666-cyber/iris-xe-macos-driver) | a NullMoth-style stack aimed at Tiger Lake |
 | [zep245/IrisXe-macos-driver](https://github.com/zep245/IrisXe-macos-driver) | i915 and Mesa ANV running on Tiger Lake under Sequoia through NullMoth's Intel path; sandboxed apps see no GPU because the sandbox refuses `opendir(/dev/dri)`, and the in-kernel LinuxKPI panics it ran into (thread_call limits, `cond_resched` inside `ggtt_pin`, TLB flush timeouts) |
 | [CENSEDAXIS20025/ASUS-FX608LP-Hackintosh-Multiboot](https://github.com/CENSEDAXIS20025/ASUS-FX608LP-Hackintosh-Multiboot) | the same Core Ultra 9 275HX, 7D67 iGPU and RTX 5070 Laptop running macOS on the RTX with the iGPU blocked and the MUX set to discrete only |
+| [Mountainatic/ArrowWhatever](https://github.com/Mountainatic/ArrowWhatever) | the same Core Ultra 9 275HX and 7D67 iGPU with an RTX 5080 Laptop on XeGfx 0.0.44, with ten patches of their own: a pin versus last-unwire race in userptr buffers, GGTT zero-copy scanout with a flip deferred until the GPU is idle (about 60 fps at 2560x1600, up from about 15), and the panel timing read from BAR0. Documents only so far, no raw logs; we have not taken a patch yet |
 | [samranahmad09/WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP) | checking a bring-up by capturing i915's registers on Linux next to a macOS readout, and a blitter ring self-test |
 | [lutzbichler/drm-kmod](https://github.com/lutzbichler/drm-kmod) (xe patches) and [drm-kmod #316](https://github.com/freebsd/drm-kmod/issues/316) | the state of the xe driver outside Linux |
 | [drm-kmod #315](https://github.com/freebsd/drm-kmod/issues/315), [#418](https://github.com/freebsd/drm-kmod/pull/418), [#468](https://github.com/freebsd/drm-kmod/pull/468) | LinuxKPI bugs FreeBSD already fixed for Meteor Lake and Arc, to carry over |
