@@ -20,13 +20,6 @@
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
 #include "nvmtl_vk.h"
-
-/* XeGfx diagnostic: disable NVMTL host-pointer and IOSurface imports.
- * Set to 0 to restore the existing Phase 1 WindowServer-only guard.
- * This does not disable external-memory imports performed directly by ANV. */
-#ifndef XEGFX_DIAG_NO_HOST_IMPORT
-#define XEGFX_DIAG_NO_HOST_IMPORT 1
-#endif
 #include "nvmtl_tex_upload.h"
 #include "nvmtl_cmd_refusal.h"
 #include "nvmtl_sampler_state.h"
@@ -1433,25 +1426,8 @@ static int nvmtl_range_writable(const void *ptr, size_t size)
 
 int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
 {
-#if XEGFX_DIAG_NO_HOST_IMPORT
-    /* Diagnostic: force the caller's existing copy-backed fallback. */
-    if (out) memset(out, 0, sizeof *out);
-    return -1;
-#endif
-
-    if (!out) return -1;
-    memset(out, 0, sizeof *out);
-
-    // XeGfx: WindowServer must use copy-backed GPU buffers.
-    const char *program = getprogname();
-    if (program && strcmp(program, "WindowServer") == 0) {
-        static int logged;
-        if (!logged++)
-            nvlog("XeGfx: WindowServer host imports disabled");
-        return -1;
-    }
-
     if (nvmtl_vk_init()) return -1;
+    memset(out, 0, sizeof *out);
     if (!g_host_import || !pvkGetMemoryHostPointerPropertiesEXT || !g_host_align || !ptr || !size) return -1;
     if (((uintptr_t)ptr & (g_host_align - 1)) || (size & (g_host_align - 1))) {
         static int said; if (!said++) nvlog("vk: host-pointer import refused — ptr %p / size %zu are not both a multiple of %zu; that buffer is COPIED",
@@ -6351,17 +6327,10 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
 // GPU copy straight into or out of them.
 int nvmtl_vk_surface_host_on(void)
 {
-#if XEGFX_DIAG_NO_HOST_IMPORT
-    /* Diagnostic: do not import IOSurface backing pages directly. */
-    return 0;
-#endif
-
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("NVMTL_NO_SURFACE_HOST");
-        const char *program = getprogname();
-        const int is_ws = program && strcmp(program, "WindowServer") == 0;
-        on = !is_ws && !nvmtl_vk_init() && g_host_import && g_host_align && nvmtl_vk_vendor() != 0x10de && !(e && e[0] == '1');
+        on = !nvmtl_vk_init() && g_host_import && g_host_align && nvmtl_vk_vendor() != 0x10de && !(e && e[0] == '1');
         nvlog("vk: IOSurface copies %s (host import %s, NVMTL_NO_SURFACE_HOST=%s)", on ? "go straight to the surface's pages"
               : "stage through a buffer", g_host_import ? "present" : "ABSENT", e ? e : "unset");
     }

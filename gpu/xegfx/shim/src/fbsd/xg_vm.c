@@ -1908,18 +1908,6 @@ xg_vm_phys_to_kva(vm_paddr_t pa)
 		panic("xegfx: vm: cannot map physical page 0x%lx", (u_long)page);
 	n->pa = page;
 	n->kva = kva;
-        /* Diagnostic: identify physical pages held by the permanent mapping cache. */
-        {
-            static volatile u_int map_logs;
-            unsigned int index = atomic_fetchadd_int(&map_logs, 1);
-
-            if (index < 128 ||
-                (page >= 0x180000000ULL && page < 0x180100000ULL)) {
-                printf("xegfx: phys-cache: pa=0x%llx kva=%p pid=%d\n",
-                    (unsigned long long)page,
-                    kva);
-            }
-        }
 	mtx_lock(&xg_vm_mtx);
 	p = XG_VM_PMAP_PCTRIE_LOOKUP(&xg_vm_pmaps, page);
 	if (p == NULL && XG_VM_PMAP_PCTRIE_INSERT(&xg_vm_pmaps, n) == 0) {
