@@ -1,6 +1,18 @@
 # Changelog
 
-Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the test laptop (Legion 5 15IAX10, Arrow Lake iGPU `8086:7D67`); "built" means it compiled and has not been run. Prereleases with a binary: v0.0.27, v0.0.35, v0.0.36, v0.0.38 and v0.0.45.
+Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the test laptop (Legion 5 15IAX10, Arrow Lake iGPU `8086:7D67`); "built" means it compiled and has not been run. Prereleases with a binary: v0.0.27, v0.0.35, v0.0.36, v0.0.38, v0.0.45 and v0.0.46.
+
+## 0.0.46 (booted: N-300 to N-302)
+
+- A userptr page that is being freed is never wired again (I-121). `vm_page_unwire` dropped the last wiring before `vm_page_free` took the run out of the table, so a new hold on the same page could take the count from 0 to 1 in between and `vm_page_free` panicked with "freeing wired page". It happened at the restart that ended N-299 after 5.6 hours under load. The restart that ended N-300, with the desktop live under the same load, did not panic.
+
+The NvGfx `xe` side of the same runs:
+
+- XeGfxIntelFB 0.6 publishes `VRAM,totalMB` on the GPU (3/4 of RAM above 4 GB, the size ANV gives its heap), so System Information shows "VRAM (Dynamic, Max): 24576 MB" on a 32 GB machine instead of the 15 MB firmware framebuffer (N-301). `xeintelfbvram=<MB>` overrides it.
+- XeGfxIntelFB 0.7 reads the panel's EDID over eDP AUX A and measures the refresh rate from the pipe's frame counter. The panel gets its real name, size and 165 Hz, macOS applies the same display override it uses on the NVIDIA GPU, and the HiDPI 1280x800 mode is offered (N-302). Scaled sizes larger than half the panel still need the pipe scaler, which is not done yet.
+- XeGfxIntelFB 0.8 names the GPU by generation ("Intel Arrow Lake Xe-LPG" for 7D67), and the Metal device on Intel uses the same name (built, not booted).
+- Plugin: `NVMTL_XE_UNIFIED=1` in nvrm610.conf makes the Intel device report unified memory. Off by default; N-302 runs WindowServer with it on.
+- Plugin: heap textures keep their swizzle and buffers record their memory type, which fixed the flat yellow Dock symbols (I-120). N-298 ran four hours of desktop under load with it.
 
 ## 0.0.45 (booted: N-295, N-296)
 
