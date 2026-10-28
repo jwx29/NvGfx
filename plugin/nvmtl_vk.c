@@ -1181,6 +1181,16 @@ static void bpark_free(nvk_buffer *b)
     pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc;
     memset(b, 0, sizeof *b);
 }
+// <wtl> WindowServer asks for linear views that run up to a few KB past a page-rounded buffer (Apple's GPUs just read
+// on); on Intel such buffers get a spare page that views may use, so those views are not refused
+static size_t buftex_slack(size_t size)
+{
+    static int on = -1;
+    if (on < 0) on = nvmtl_vk_vendor() == 0x8086 && !getenv("NVMTL_NO_BUFTEX_SLACK");
+    return on && size >= 16384 && !(size & 4095) ? 4096 : 0;
+}
+static size_t buftex_room(const nvk_buffer *b) { return !b->imported && !b->sparse && b->alloc > b->size ? b->alloc : b->size; }
+// </wtl>
 static int bpark_take(size_t size, int host_visible, nvk_buffer *out)
 {
     if (!bpark_on()) return -1;
@@ -1319,7 +1329,7 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
     memset(out, 0, sizeof *out); out->size = size;
     if (!host_visible && size >= (1u << 20) && nvmtl_vk_sparse_on() && nvmtl_vk_buffer_create_sparse(size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
-    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size,
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size + buftex_slack(size),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | NVMTL_RT_BUFFER_USAGE,
@@ -7718,8 +7728,9 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         nvlog("buffer texture: bytesPerRow %zu cannot hold %u texels of %u B", row_pitch, w, bpp); return -1; }
     if (g_linmod && row_pitch % 32) {
         nvlog("buffer texture: REFUSED, bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
-    if (offset > b->size || (size_t)row_pitch * (h - 1) + (size_t)w * bpp > b->size - offset) {
-        nvlog("buffer texture: REFUSED, %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer", w, h, offset, row_pitch, b->size); return -1; }
+    const size_t room = buftex_room(b);
+    if (offset > b->size || (size_t)row_pitch * (h - 1) + (size_t)w * bpp > room - offset) {
+        nvlog("buffer texture: REFUSED, %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer (%zu with its spare)", w, h, offset, row_pitch, b->size, room); return -1; }
     PFN_vkGetPhysicalDeviceFormatProperties gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
     VkFormatProperties fp; memset(&fp, 0, sizeof fp);
     if (gfp) gfp(g_pdev, (VkFormat)vkfmt, &fp);
@@ -7923,7 +7934,7 @@ static int vpool_heap_create(size_t size, nvk_heap *out)
 }
 static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
 {
-    size_t al = pool_align(), len = (size + al - 1) / al * al; if (!len) len = al;
+    size_t al = pool_align(), len = (size + buftex_slack(size) + al - 1) / al * al; if (!len) len = al;
     pthread_mutex_lock(&g_pool_lock);
     pool_block **head = vram ? &g_vpool : &g_pool;
     pool_block *blk = *head; size_t off = 0; int got = 0;
