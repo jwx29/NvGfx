@@ -780,6 +780,25 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
         nvlog("newTiledTextureWithDescriptor: %lux%lu bpr %lu off %lu: no linear view and no CPU copy (buffer %lu B) -> nil",
               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset, (unsigned long)_b.size);
         return nil; }
+    // A one-time copy goes stale when the caller rewrites the bytes in place (the cursor's clear square on Intel, I-119),
+    // so read-only views get a buffer of our own that is refilled from the caller's bytes at every submission.
+    const NSUInteger ru = d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget);
+    if (d.usage != MTLTextureUsageUnknown && !ru && !getenv("NVMTL_NO_TILED_RESYNC")) {
+        NVMTLBuffer *s = [NVMTLBuffer new];
+        const size_t n = MIN((size_t)bpr * d.height, _b.size - offset);
+        if (s && !nvmtl_vk_buffer_create(n, 1, &s->_b) && s->_b.map) {
+            s->_storage = MTLStorageModeShared;
+            memcpy(s->_b.map, (char *)base + offset, n);
+            s->_hostPtr = (char *)base + offset; s->_hostLen = n;
+            NVMTLBuffer *src = self;   // the caller's bytes live as long as the stand-in does
+            s->_hostDealloc = ^(void *p, NSUInteger l) { (void)p; (void)l; (void)src; };
+            id<MTLTexture> v = [s newTextureWithDescriptor:d offset:0 bytesPerRow:bpr];
+            { static int said; if (said++ < 4) nvlog("newTiledTextureWithDescriptor: linear view refused (fmt %lu %lux%lu bpr %lu off %lu, buffer %lu B, usage 0x%lx) -> %s",
+                  (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset,
+                  (unsigned long)_b.size, (unsigned long)d.usage, v ? "view of a stand-in resynced at every submission" : "stand-in view also refused, copied texture"); }
+            if (v) return v;
+        }
+    }
     MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
     id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
     if (c) [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
