@@ -2091,7 +2091,12 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     nvlog("recommendedMaxWorkingSetSize -> %llu MB", (unsigned long long)(ws >> 20));
     return ws;
 }
-- (BOOL)hasUnifiedMemory { return NO; }
+- (BOOL)hasUnifiedMemory {
+    // the Intel GPU shares system RAM; NVMTL_XE_UNIFIED=1 (nvrm610.conf) says so, off until an xe-guard run proves it
+    static int uni = -1;
+    if (uni < 0) { const char *e = getenv("NVMTL_XE_UNIFIED"); uni = e && *e && *e != '0'; }
+    return uni && nvmtl_vk_vendor() == 0x8086;
+}
 - (uint64_t)dedicatedMemorySize { return nvmtl_vk_vram_bytes(); }
 
 - (BOOL)nvmtlSampleCountOK:(NSUInteger)n {
