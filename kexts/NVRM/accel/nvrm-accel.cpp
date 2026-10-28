@@ -14,6 +14,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #ifdef NMX_XEGFX
 #include <IOKit/graphics/IOFramebuffer.h>   // the boot framebuffer's aperture and mode
+#include "nvaccel_scanout_copy.h"              // Xe-only, opt-in bulk copy with legacy fallback
 #endif
 #include <pexpert/pexpert.h>
 #include <libkern/OSKextLib.h>
@@ -146,6 +147,11 @@ public:
 OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
 static void (*gEnableAccel)(const char *why) = nullptr;
 static int gNvScanout = 0;
+#ifdef NMX_XEGFX
+// Safe baseline: the proven volatile 32-bit store loop. Explicitly enable memcpy on mapped
+// framebuffer memory after measuring it on the target machine; 0 rolls back without reboot.
+static int gXeScanoutBulkCopy = 0;
+#endif
 static int gNvAperture = 0;
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
     OSDeclareDefaultStructors(NVDisplayMachine)
@@ -1259,6 +1265,11 @@ public:
 
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+#ifdef NMX_XEGFX
+// Display-transaction copies were not represented by nvaccel_scanout_last_us: it only
+// measures the separate legacy swap path. Measure the actual row-copy cost here too.
+static SInt64 gXeIopCopyFrames, gXeIopCopyLastUs, gXeIopCopyMaxUs, gXeIopCopySumUs;
+#endif
 static SInt64 gCntIopOkHead[kNvMaxFB];
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
@@ -1396,11 +1407,23 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
+#ifdef NMX_XEGFX
+    const uint64_t copyStart = mach_absolute_time();
+    nvAccelScanoutCopyRows(d, src, h, dpr, spr, words, gXeScanoutBulkCopy != 0);
+    uint64_t copyNs = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - copyStart, &copyNs);
+    const SInt64 copyUs = (SInt64)(copyNs / 1000);
+    gXeIopCopyLastUs = copyUs;
+    if (copyUs > gXeIopCopyMaxUs) gXeIopCopyMaxUs = copyUs;
+    OSAddAtomic64(copyUs, &gXeIopCopySumUs);
+    OSAddAtomic64(1, &gXeIopCopyFrames);
+#else
     for (unsigned y = 0; y < h; y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
+#endif
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
@@ -1491,6 +1514,14 @@ NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
 NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+#ifdef NMX_XEGFX
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_scanout_bulk_copy, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+           &gXeScanoutBulkCopy, 0, "Xe only: 1 = memcpy scanout rows, 0 = original volatile dword copies (default)");
+NVACCEL_CNT(nvaccel_iop_copy_frames,   gXeIopCopyFrames,  "Xe only: display transactions that copied rows");
+NVACCEL_CNT(nvaccel_iop_copy_last_us,  gXeIopCopyLastUs,  "Xe only: last display-transaction row copy, us");
+NVACCEL_CNT(nvaccel_iop_copy_max_us,   gXeIopCopyMaxUs,   "Xe only: maximum display-transaction row copy, us");
+NVACCEL_CNT(nvaccel_iop_copy_sum_us,   gXeIopCopySumUs,   "Xe only: cumulative display-transaction row copy, us");
+#endif
 static SInt64 gCntIopCopySkip;
 NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
 static int    gIopFlip = 0;
@@ -1639,6 +1670,11 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
+#ifdef NMX_XEGFX
+    sysctl_register_oid(&sysctl__debug_nvaccel_scanout_bulk_copy);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_frames); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_last_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_max_us); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_sum_us);
+#endif
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
@@ -2718,11 +2754,15 @@ static bool nvAccelCopyToScanout(IOAccelResource2 *res)
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     const volatile unsigned int *s = (const volatile unsigned int *)vm->fKva;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
+#ifdef NMX_XEGFX
+    nvAccelScanoutCopyRows(d, s, rows, dpr, spr, words, gXeScanoutBulkCopy != 0);
+#else
     for (unsigned y = 0; y < rows; y++) {
         const volatile unsigned int *sp = s + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
+#endif
     nvScanoutCopies++;
 #ifdef NMX_XEGFX
     uint64_t ns = 0;
