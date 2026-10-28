@@ -443,7 +443,6 @@ bool NMIntelFB::adoptFirmwareMode()
     }
     setProperty("NMIntelFBFirmwarePipeMatches", candidates, 32);
     for (int p = chosen; p <= chosen; ++p) {
-        uint32_t ctl = rd(PLANE_CTL(p));
         if (nmifbStep(3, "plane regs")) return false;
         uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FF;
         fWidth = (size & 0xFFFF) + 1; fHeight = ((size >> 16) & 0xFFFF) + 1;
