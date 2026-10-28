@@ -1377,9 +1377,9 @@ static void nvmtl_ws_present_note(const char *path, unsigned width, unsigned hei
     }
     if (!enabled) return;
     const uint64_t total = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - begin;
-    static _Atomic unsigned reports;
+    static unsigned reports;
     // Bounded to protect WindowServer from per-frame logging and allocations.
-    const unsigned n = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED);
+    const unsigned n = __atomic_fetch_add(&reports, 1u, __ATOMIC_RELAXED);
     if (n < 16 || (total > 16000000ULL && n < 64))
         nvlog("ws-present %s %ux%u total=%.3fms lock=%.3fms gpu-or-read=%.3fms cpu-copy=%.3fms sample=%u",
               path, width, height, total * 1e-6, lockNs * 1e-6,
