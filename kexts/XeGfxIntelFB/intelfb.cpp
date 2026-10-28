@@ -7,6 +7,7 @@
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSData.h>
 #include <pexpert/pexpert.h>
+#include <sys/sysctl.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 
@@ -47,7 +48,7 @@ static void xifbGuardClear()
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.5", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.6", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
@@ -66,6 +67,17 @@ public:
         static const char model[] = "Intel Xe Graphics";
         if (!provider->getProperty("model"))
             if (OSData *m = OSData::withBytes(model, sizeof model)) { provider->setProperty("model", m); m->release(); }
+        // System Profiler shows VRAM,totalMB of an Intel PCI device as "VRAM (Dynamic, Max)", else the 15 MB GOP
+        // framebuffer. Same size ANV gives its heap: 3/4 of RAM above 4 GB, half below. xeintelfbvram=<MB> overrides.
+        if (!provider->getProperty("VRAM,totalMB")) {
+            uint32_t mb = 0;
+            if (!PE_parse_boot_argn("xeintelfbvram", &mb, sizeof mb)) {
+                uint64_t ram = 0; size_t len = sizeof ram;
+                if (!sysctlbyname("hw.memsize", &ram, &len, nullptr, 0) && ram)
+                    mb = (uint32_t)((ram <= (4ull << 30) ? ram / 2 : ram / 4 * 3) >> 20);
+            }
+            if (mb) { provider->setProperty("VRAM,totalMB", (unsigned long long)mb, 32); XIFBLOG("VRAM,totalMB %u", mb); }
+        }
         // the guard is for boots that hang: still running 120 s after start clears it. IOGraphics keeps the
         // WindowServer-active attribute and WindowServer's connection skips newUserClient here (N-282 to N-284)
         static thread_call_t tc;
