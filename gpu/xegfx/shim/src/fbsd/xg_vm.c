@@ -452,6 +452,36 @@ xg_vm_run_find(vm_paddr_t pa)
 	return (r);
 }
 
+/*
+ * The user page run at pa with a new wiring, NULL when there is none. A run whose last wiring is gone is being freed
+ * (vm_page_unwire drops the count before vm_page_free removes the run), so it must not be wired again: *dying says to
+ * wait for it to leave the table.
+ */
+static struct xg_vm_run *
+xg_vm_run_wire_user(vm_paddr_t pa, bool *dying)
+{
+	struct xg_vm_run *r;
+	u_int x;
+
+	*dying = false;
+	mtx_lock(&xg_vm_mtx);
+	r = XG_VM_RUN_PCTRIE_LOOKUP_LE(&xg_vm_runs, pa);
+	if (r != NULL && pa >= r->pa + ptoa(r->npages))
+		r = NULL;
+	if (r != NULL && r->kind == XG_RUN_USER) {
+		x = atomic_load_int(&r->pages[0].ref_count);
+		do {
+			if (VPRC_WIRE_COUNT(x) == 0) {
+				*dying = true;
+				r = NULL;
+				break;
+			}
+		} while (!atomic_fcmpset_int(&r->pages[0].ref_count, &x, x + 1));
+	}
+	mtx_unlock(&xg_vm_mtx);
+	return (r);
+}
+
 static void
 xg_vm_hold_put(struct xg_vm_hold *h)
 {
@@ -1771,6 +1801,14 @@ vm_fault_quick_hold_pages(vm_map_t map, vm_offset_t addr, vm_size_t len, vm_prot
 		struct xg_vm_run *r;
 
 		for (;;) {
+			bool dying;
+
+			if ((r = xg_vm_run_wire_user(pa[i], &dying)) != NULL)
+				break;
+			if (dying) {
+				pause("xgvmusr", 1);
+				continue;
+			}
 			if ((r = xg_vm_run_find(pa[i])) != NULL) {
 				if (r->kind != XG_RUN_USER) {
 					/* a shim page mapped into a process (a GEM buffer's own pages): i915 refuses such userptrs too */
@@ -1780,8 +1818,7 @@ vm_fault_quick_hold_pages(vm_map_t map, vm_offset_t addr, vm_size_t len, vm_prot
 						    i, (unsigned long)start, n, (int)r->kind);
 					goto fail;
 				}
-				atomic_add_int(&r->pages[0].ref_count, 1);
-				break;
+				continue;	/* a user run appeared since the lookup above */
 			}
 			if ((r = xg_vm_run_new(1, XG_RUN_USER)) == NULL)
 				goto fail;
