@@ -5591,7 +5591,8 @@ int nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4]
  * rasterization-order attachment access nor fragment shader interlock. Core Animation draws a text cell's background, its
  * glyph and the cursor in one draw, so a later triangle could read the pixel before the erase landed and put the old
  * cursor's edge back (a one-pixel line left in Terminal). Small triangle-list draws whose pipeline reads the attachments
- * are drawn one triangle (and instance) at a time behind the same by-region barrier used between draws. Draws over
+ * are drawn one triangle (and instance) at a time behind the same by-region barrier used between draws; instanced
+ * triangle strips one instance at a time. Draws over
  * NVMTL_FETCH_SPLIT_MAX triangles (default 256; a game's full-screen blend) stay whole: splitting them would cost far more
  * than the ordering is worth there. NVMTL_FETCH_UNORDERED=1 draws every one whole.
  */
@@ -5601,6 +5602,15 @@ static int nvmtl_fetch_split(nvk_cmdbuf *c, uint32_t count, uint32_t instances)
     if (unordered < 0) { const char *e = getenv("NVMTL_FETCH_UNORDERED"); unordered = e && e[0] == '1'; }
     if (maxTris < 0) { const char *e = getenv("NVMTL_FETCH_SPLIT_MAX"); maxTris = e ? atoi(e) : 256; if (maxTris < 0) maxTris = 0; }
     if (!c->fetch_draw || unordered) return 0;
+    // Core Animation draws text cells as one instanced quad strip; each instance is its own draw so a later cell or
+    // the cursor reads what the earlier ones wrote (I-119: stale bands along Terminal's full rows)
+    if (c->topo == 4 && instances > 1 && count >= 3) {
+        static int maxInst = -1;
+        if (maxInst < 0) { const char *e = getenv("NVMTL_FETCH_STRIP_MAX"); maxInst = e ? atoi(e) : 8192; if (maxInst < 0) maxInst = 0; }
+        if (instances <= (uint32_t)maxInst) return 2;
+        static int said3; if (said3++ < 2) nvlog("vk: framebuffer fetch strip draw of %u instances drawn whole (split limit %d)", instances, maxInst);
+        return 0;
+    }
     if (c->topo != 3) {
         static int said; if (said++ < 2) nvlog("vk: framebuffer fetch draw of MTLPrimitiveType %u is drawn whole - "
                                                "overlapping primitives in it can read stale colour", c->topo);
@@ -5618,7 +5628,15 @@ void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t i
 {
     if (c->nobind) return;
     const uint32_t n = instances ? instances : 1;
-    if (nvmtl_fetch_split(c, count, n)) {
+    const int split = nvmtl_fetch_split(c, count, n);
+    if (split == 2) {
+        for (uint32_t k = 0; k < n; k++) {
+            if (k) nvmtl_fetch_barrier(c);
+            NVMTL_SEMU_DRAW(c, pvkCmdDraw(c->cb, count, 1, first, baseInstance + k));
+        }
+        return;
+    }
+    if (split) {
         for (uint32_t k = 0; k < n; k++) for (uint32_t i = 0; i + 3 <= count; i += 3) {
             if (k || i) nvmtl_fetch_barrier(c);
             NVMTL_SEMU_DRAW(c, pvkCmdDraw(c->cb, 3, 1, first + i, baseInstance + k));
@@ -5692,7 +5710,15 @@ void nvmtl_vk_cmd_draw_indexed(nvk_cmdbuf *c, nvk_buffer *idx, size_t offset, ui
     pvkCmdBindIndexBuffer(c->cb, (VkBuffer)idx->buf, offset, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
     if (c->nobind) return;
     const uint32_t n = instances ? instances : 1;
-    if (nvmtl_fetch_split(c, count, n)) {
+    const int split = nvmtl_fetch_split(c, count, n);
+    if (split == 2) {
+        for (uint32_t k = 0; k < n; k++) {
+            if (k) nvmtl_fetch_barrier(c);
+            NVMTL_SEMU_DRAW(c, pvkCmdDrawIndexed(c->cb, count, 1, 0, baseVertex, baseInstance + k));
+        }
+        return;
+    }
+    if (split) {
         for (uint32_t k = 0; k < n; k++) for (uint32_t i = 0; i + 3 <= count; i += 3) {
             if (k || i) nvmtl_fetch_barrier(c);
             NVMTL_SEMU_DRAW(c, pvkCmdDrawIndexed(c->cb, 3, 1, i, baseVertex, baseInstance + k));
