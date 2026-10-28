@@ -6596,7 +6596,12 @@ int nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_byte
     pvkCmdCopyImageToBuffer(c.cb, img->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stage.buf, 1, &bic);
     if (nvmtl_vk_submit_wait(&c)) return -1;
     const uint8_t *src = (const uint8_t *)stage.map;
-    for (uint32_t y = 0; y < rows; y++) memcpy((uint8_t *)dst + y * row_bytes, src + (size_t)y * cols * bpp, (size_t)cols * bpp);
+    const size_t packed = (size_t)cols * bpp;
+    // VedCloud: a tightly packed readback is one contiguous transfer rather
+    // than thousands of memcpy calls. Preserve padding when pitches differ.
+    if (row_bytes == packed) memcpy(dst, src, packed * rows);
+    else for (uint32_t y = 0; y < rows; y++)
+        memcpy((uint8_t *)dst + (size_t)y * row_bytes, src + (size_t)y * packed, packed);
     return 0;
 }
 

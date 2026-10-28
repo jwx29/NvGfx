@@ -11,6 +11,7 @@
 void nvlog(const char *fmt, ...);
 
 #import "NVMTLObjects.h"
+#include "nvmtl_ws_stage.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 static int nvmtl_trace_on(void);
@@ -1356,6 +1357,34 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 // lock is free: a page-off waiting for another surface's pending GPU write holds that lock until the write is released,
 // by the same completion thread that would be blocked here. Taken, the commit's mark stands and the re-mark is retried
 // off this thread (nvmtl_surface_remark_later).
+// WindowServer presentation fallback. The fast shared-VRAM and host-import paths
+// above remain unchanged. A three-slot CPU pool caps staging memory to 48 MiB.
+static bool nvmtl_ws_staging_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *p = getprogname(), *v = getenv("NVMTL_WS_STAGED_SURFOUT");
+        enabled = p && strcmp(p, "WindowServer") == 0 && v && !strcmp(v, "1");
+    }
+    return enabled != 0;
+}
+static void nvmtl_ws_present_note(const char *path, unsigned width, unsigned height,
+                                  uint64_t begin, uint64_t lockNs, uint64_t readNs, uint64_t copyNs)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *p = getprogname(), *v = getenv("NVMTL_WS_PRESENT_TRACE");
+        enabled = p && !strcmp(p, "WindowServer") && v && !strcmp(v, "1");
+    }
+    if (!enabled) return;
+    const uint64_t total = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - begin;
+    static _Atomic unsigned reports;
+    // Bounded to protect WindowServer from per-frame logging and allocations.
+    const unsigned n = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED);
+    if (n < 16 || (total > 16000000ULL && n < 64))
+        nvlog("ws-present %s %ux%u total=%.3fms lock=%.3fms gpu-or-read=%.3fms cpu-copy=%.3fms sample=%u",
+              path, width, height, total * 1e-6, lockNs * 1e-6,
+              readNs * 1e-6, copyNs * 1e-6, n + 1);
+}
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return YES;
@@ -1380,14 +1409,95 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
         return YES;
     }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    uint64_t lockNs = 0, readNs = 0, copyNs = 0;
     uint32_t lockopt = nvmtl_noseed() ? kIOSurfaceLockReadOnly : 0;
-    if (IOSurfaceLock(r->_surf, lockopt, NULL) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }
-    void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
-    size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = !(base && row) ? -1 : !nvmtl_surface_host_xfer(r, row, 0) ? 0 : nvmtl_vk_image_read(r->_q, &r->_i, base, row);
-    if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
-    uint32_t seed = 0; IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed); if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
-    if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
+    uint32_t seed = 0;
+    IOReturn unlocked = kIOReturnSuccess;
+    int rc = -1;
+    BOOL staged = NO;
+    size_t packed = 0, bytes = 0;
+    void *scratch = NULL;
+    // The existing VRAM and imported-IOSurface fast paths win. Stage only
+    // when host import was already refused or cannot be used on this surface.
+    const BOOL stageEligible = nvmtl_ws_staging_on() &&
+        // SurfaceOut's staging destination must contain an ordinary, packed,
+        // single-layer uncompressed image. Do not guess compressed formats.
+        r->_i.bpp == 4 && r->_i.bw <= 1 && r->_i.bh <= 1 && r->_i.layers <= 1 &&
+        (r->_hostState < 0 || !nvmtl_vk_surface_host_on() || IOSurfaceGetPlaneCount(r->_surf) > 1) &&
+        !nvmtl_ws_stage_plan(r->_i.w, r->_i.h, r->_i.bpp, &packed, &bytes);
+    const int lease = stageEligible ? nvmtl_ws_stage_acquire(bytes, &scratch) : -1;
+    if (lease >= 0) {
+        staged = YES;
+        // Another process may write while the GPU reads into scratch. Do
+        // not publish an obsolete image over a newer IOSurface seed.
+        const uint32_t before = IOSurfaceGetSeed(r->_surf);
+        uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        rc = nvmtl_vk_image_read(r->_q, &r->_i, scratch, packed);
+        readNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t;
+        if (rc) {
+            nvmtl_ws_stage_release(lease);
+            nvmtl_ws_present_note("staged-read-failed", r->_i.w, r->_i.h, t0, lockNs, readNs, copyNs);
+            return NO;    // never publish a failed or incomplete GPU readback
+        }
+        t = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        IOReturn locked = IOSurfaceLock(r->_surf, lockopt, NULL);
+        lockNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t;
+        if (locked != kIOReturnSuccess) {
+            nvmtl_ws_stage_release(lease);
+            nvmtl_ws_present_note("staged-lock-failed", r->_i.w, r->_i.h, t0, lockNs, readNs, copyNs);
+            return NO;
+        }
+        const uintptr_t root = (uintptr_t)IOSurfaceGetBaseAddress(r->_surf);
+        const uintptr_t plane = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+        const size_t allocation = IOSurfaceGetAllocSize(r->_surf);
+        const size_t pitch = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+        // Read seed while locked. The write-lock itself doesn't commit a new
+        // seed until unlock; an intervening CPU writer must not be overwritten.
+        if (IOSurfaceGetSeed(r->_surf) != before || !root || plane < root || plane - root > allocation) {
+            IOSurfaceUnlock(r->_surf, lockopt, NULL);
+            nvmtl_ws_stage_release(lease);
+            nvmtl_ws_present_note("staged-stale", r->_i.w, r->_i.h, t0, lockNs, readNs, copyNs);
+            return NO;
+        }
+        t = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        rc = nvmtl_ws_stage_copy((void *)plane, pitch, allocation - (size_t)(plane - root),
+                                  scratch, packed, r->_i.h);
+        copyNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t;
+        if (!rc && r->_i.bpp == 4) {
+            char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf));
+            nvmtl_frame_dump(tag, (void *)plane, pitch, r->_i.w, r->_i.h);
+        }
+        unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed);
+        if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
+        nvmtl_ws_stage_release(lease);
+    } else {
+        // Original path, unchanged in behaviour: attempt direct GPU-to-surface
+        // import and fall back to Vulkan image readback with the surface locked.
+        uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (IOSurfaceLock(r->_surf, lockopt, NULL) != kIOReturnSuccess) {
+            nvlog("G13 surface-out: IOSurfaceLock FAILED");
+            return NO;
+        }
+        lockNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t;
+        void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+        size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+        t = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        rc = !(base && row) ? -1 : !nvmtl_surface_host_xfer(r, row, 0) ? 0 :
+             nvmtl_vk_image_read(r->_q, &r->_i, base, row);
+        readNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t;
+        if (!rc && r->_i.bpp == 4) {
+            char tag[24]; snprintf(tag, sizeof tag, "out%u-", (unsigned)IOSurfaceGetID(r->_surf));
+            nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h);
+        }
+        unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed);
+        if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
+    }
+    nvmtl_ws_present_note(staged ? "staged" : "direct-or-locked", r->_i.w, r->_i.h,
+                          t0, lockNs, readNs, copyNs);
+    if (rc || unlocked != kIOReturnSuccess) {
+        nvlog("G13 surface-out: readback FAILED (%ux%u, staged=%d)", r->_i.w, r->_i.h, staged);
+        return NO;
+    }
     r->_surfSeed = seed; r->_surfSynced = YES;
     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
