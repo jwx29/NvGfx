@@ -6578,7 +6578,19 @@ int nvmtl_vk_surface_host_import(void *base, size_t alloc, nvk_buffer *out)
 {
     memset(out, 0, sizeof *out);
     if (!nvmtl_vk_surface_host_on() || !base) return -1;
-    return nvmtl_vk_buffer_import_host(base, alloc & ~(g_host_align - 1), out);
+    // WindowServer's window surfaces end mid-page (2472x1376: 3332.5 pages); rounding down cut off their last row.
+    // The rest of that page is still the surface's own mapping, so round up when one VM region covers it.
+    size_t len = alloc & ~(g_host_align - 1);
+    if (len < alloc && !getenv("NVMTL_NO_SURFACE_ROUNDUP")) {
+        mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)base; mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+        const size_t up = (alloc + g_host_align - 1) & ~(g_host_align - 1);
+        if (mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) == KERN_SUCCESS
+            && a <= (uintptr_t)base && (uintptr_t)base + up <= a + sz) len = up;
+        static int said; if (said++ < 4) nvlog("surface host import: %zu-byte surface ends mid-page -> %zu bytes (%s)", alloc, len,
+                                               len == up ? "rounded up inside its own mapping" : "rounded down, region too short");
+    }
+    return nvmtl_vk_buffer_import_host(base, len, out);
 }
 // to_image: buffer -> image (surface-in), else image -> buffer (surface-out); off/row_bytes locate the plane in hb
 int nvmtl_vk_image_xfer_host(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t off, size_t row_bytes, int to_image)
