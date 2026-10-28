@@ -1183,14 +1183,13 @@ static void bpark_free(nvk_buffer *b)
 }
 // <wtl> WindowServer asks for linear views that run up to a few KB past a page-rounded buffer (Apple's GPUs just read
 // on); on Intel such buffers get a spare page that views may use, so those views are not refused
-static int buftex_slack_on(void)
+static size_t buftex_slack(size_t size)
 {
     static int on = -1;
     if (on < 0) on = nvmtl_vk_vendor() == 0x8086 && !getenv("NVMTL_NO_BUFTEX_SLACK");
-    return on;
+    return on && size >= 16384 && !(size & 4095) ? 4096 : 0;
 }
-static size_t buftex_slack(size_t size) { return buftex_slack_on() && size >= 16384 && !(size & 4095) ? 4096 : 0; }
-static size_t buftex_room(const nvk_buffer *b) { return !b->sparse && b->alloc > b->size ? b->alloc : b->size; }
+static size_t buftex_room(const nvk_buffer *b) { return !b->imported && !b->sparse && b->alloc > b->size ? b->alloc : b->size; }
 // </wtl>
 static int bpark_take(size_t size, int host_visible, nvk_buffer *out)
 {
@@ -1435,23 +1434,7 @@ static int nvmtl_range_writable(const void *ptr, size_t size)
     return 1;
 }
 
-static int import_host_body(void *ptr, size_t size, size_t isz, nvk_buffer *out);
-// <wtl> WindowServer's NoCopy strips need the spare page too: borrow the next page when it is mapped, else reserve it
-// (imported = 2: the page is ours and goes when the buffer does)
 int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
-{
-    size_t isz = size; int tail = 0;
-    if (buftex_slack_on() && ptr && size && !((uintptr_t)ptr & 4095) && !(size & 4095)) {
-        vm_address_t end = (vm_address_t)ptr + size;
-        if (nvmtl_range_writable((void *)end, 4096)) isz += 4096;
-        else if (vm_allocate(mach_task_self(), &end, 4096, VM_FLAGS_FIXED) == KERN_SUCCESS) { isz += 4096; tail = 1; }
-    }
-    int r = import_host_body(ptr, size, isz, out);
-    if (tail) { if (r) vm_deallocate(mach_task_self(), (vm_address_t)ptr + size, 4096); else out->imported = 2; }
-    return r;
-}
-// </wtl>
-static int import_host_body(void *ptr, size_t size, size_t isz, nvk_buffer *out)
 {
     if (nvmtl_vk_init()) return -1;
     memset(out, 0, sizeof *out);
@@ -1471,7 +1454,7 @@ static int import_host_body(void *ptr, size_t size, size_t isz, nvk_buffer *out)
     out->size = size;
     VkExternalMemoryBufferCreateInfo emb = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL,
                                              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
-    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &emb, 0, isz,
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &emb, 0, size,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | NVMTL_RT_BUFFER_USAGE,
@@ -1487,7 +1470,7 @@ static int import_host_body(void *ptr, size_t size, size_t isz, nvk_buffer *out)
                                        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0 };
     VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, &mafi,
                                              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr };
-    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, isz, (uint32_t)mt };
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, size, (uint32_t)mt };
     if (nvmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem) != VK_SUCCESS) {
         nvlog("vk: vkAllocateMemory refused the imported host pointer %p (%zu bytes, memory type %d)", ptr, size, mt);
         pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL); out->buf = NULL; out->mem = NULL; return -1; }
@@ -1495,8 +1478,8 @@ static int import_host_body(void *ptr, size_t size, size_t isz, nvk_buffer *out)
         nvlog("vk: vkBindBufferMemory refused the imported allocation");
         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
         out->buf = NULL; out->mem = NULL; return -1; }
-    out->map = ptr; out->alloc = isz; out->imported = 1; out->mtype1 = mt + 1;
-    g_alloc_bytes += isz; g_buf_made++;
+    out->map = ptr; out->alloc = size; out->imported = 1; out->mtype1 = mt + 1;
+    g_alloc_bytes += size; g_buf_made++;
     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
     return 0;
 }
@@ -6130,7 +6113,6 @@ static void nvmtl_vk_buffer_destroy_body(nvk_buffer *b)
     if (!b->placed && !b->imported && b->mem && b->map && pvkUnmapMemory) { pvkUnmapMemory(g_dev, (VkDeviceMemory)b->mem); b->map = NULL; }
     if (b->bar1) g_bar1_bytes -= b->alloc;
     if (!b->placed && b->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)b->mem, NULL); g_alloc_bytes -= b->alloc; }
-    if (b->imported == 2) vm_deallocate(mach_task_self(), (vm_address_t)b->map + b->size, 4096);   // <wtl> our reserved tail page
     memset(b, 0, sizeof *b);
 }
 
