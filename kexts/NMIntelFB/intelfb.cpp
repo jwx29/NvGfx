@@ -395,20 +395,61 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
 
 bool NMIntelFB::adoptFirmwareMode()
 {
-    // the panel is on whichever pipe the firmware used; take the first pipe whose transcoder and plane 1 are both on
+    // Firmware can light both eDP and HDMI before macOS starts. Do not blindly
+    // adopt the first enabled pipe: it may not be the GOP/boot-console surface.
+    // Only select a pipe whose validated linear plane matches the firmware
+    // console's geometry. This is firmware HDMI-primary support, not hotplug
+    // or HDMI link/mode training; it is safe to leave all display registers alone.
+    PE_Video console; bzero(&console, sizeof console);
+    const bool haveConsole = getPlatform() &&
+        getPlatform()->getConsoleInfo(&console) == kIOReturnSuccess &&
+        console.v_baseAddr && console.v_depth == 32;
+    const uint32_t diagnosticDDI = rd(0xC4030u); // SHOTPLUG_CTL_DDI, read-only
+    const uint32_t diagnosticTC = rd(0xC4034u);  // SHOTPLUG_CTL_TC, read-only
+    setProperty("NMIntelFBHPDDDI", diagnosticDDI, 32);
+    setProperty("NMIntelFBHPDTC", diagnosticTC, 32);
+    IFBLOG("read-only HPD snapshot: SHOTPLUG_CTL_DDI=0x%08x TC=0x%08x (status bits are not proof of HDMI routing)",
+           diagnosticDDI, diagnosticTC);
+    if (!haveConsole) {
+        IFBLOG("no validated 32-bit firmware console; refusing to guess the active HDMI/eDP pipe");
+        return false;
+    }
+    int candidates = 0, chosen = -1;
     for (int p = 0; p < 4; p++) {
-        uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
+        const uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
         if (!(conf & kEnable) || !(ctl & kEnable)) continue;
-        if (fmtOf(ctl) != 8) { IFBLOG("pipe %c: plane format %u is not XRGB8888 - leaving the firmware screen", 'A' + p, fmtOf(ctl)); return false; }
-        if (tileOf(ctl) != 0) { IFBLOG("pipe %c: plane is tiled (%u) - leaving the firmware screen", 'A' + p, tileOf(ctl)); return false; }
+        const uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FFu;
+        const uint32_t width = (size & 0xFFFFu) + 1u, height = (size >> 16) + 1u, pitch = stride * 64u;
+        const bool linear = fmtOf(ctl) == 8 && tileOf(ctl) == 0;
+        const bool match = linear && width >= 320u && height >= 200u && pitch >= width * 4u &&
+            width == console.v_width && height == console.v_height && pitch == console.v_rowBytes;
+        IFBLOG("firmware pipe %c: enabled plane %ux%u pitch %u format %u tile %u console-match %d",
+               'A' + p, width, height, pitch, fmtOf(ctl), tileOf(ctl), match ? 1 : 0);
+        if (match) { chosen = p; ++candidates; }
+    }
+    // No match must fail closed. If several pipes use identical geometry,
+    // preserve the earlier first-pipe policy for compatibility but report the
+    // ambiguity: only a true GGTT/console identity check can distinguish them.
+    if (!candidates) {
+        IFBLOG("no lit linear plane matches the boot console; HDMI needs firmware GOP takeover or native modesetting");
+        return false;
+    }
+    if (candidates > 1) {
+        IFBLOG("%d lit planes match console geometry; selecting first as before (cannot disambiguate eDP/HDMI from size alone)", candidates);
+        for (int p = 0; p < 4; ++p) {
+            uint32_t ctl = rd(PLANE_CTL(p));
+            if ((rd(TRANSCONF(p)) & kEnable) && (ctl & kEnable)) { chosen = p; break; }
+        }
+    }
+    setProperty("NMIntelFBFirmwarePipeMatches", candidates, 32);
+    for (int p = chosen; p <= chosen; ++p) {
+        uint32_t ctl = rd(PLANE_CTL(p));
         if (nmifbStep(3, "plane regs")) return false;
         uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FF;
         fWidth = (size & 0xFFFF) + 1; fHeight = ((size >> 16) & 0xFFFF) + 1;
-        fRowBytes = stride * 64;                     // linear planes count the stride in 64-byte units
-        fSurf = rd(PLANE_SURF(p)) & ~0xFFFu;         // GGTT offset of the surface, 4 KiB aligned
-        if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) {
-            IFBLOG("pipe %c: plane %ux%u stride %u is not a usable surface", 'A' + p, fWidth, fHeight, fRowBytes); return false;
-        }
+        fRowBytes = stride * 64;
+        fSurf = rd(PLANE_SURF(p)) & ~0xFFFu;
+        if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) return false;
         if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen)   // only informative: BAR2 is not used for scanout
             IFBLOG("pipe %c: surface at GGTT 0x%x lies past the %llu MiB BAR2 window", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20));
         // the transcoder that feeds pipe p is p on these display versions (eDP on transcoder A in every recording)
