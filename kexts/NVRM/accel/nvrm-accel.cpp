@@ -150,7 +150,7 @@ static int gNvScanout = 0;
 #ifdef NMX_XEGFX
 // Safe baseline: the proven volatile 32-bit store loop. Explicitly enable memcpy on mapped
 // framebuffer memory after measuring it on the target machine; 0 rolls back without reboot.
-static int gXeScanoutBulkCopy = 0;
+static int gXeScanoutBulkCopy = 1;  // Intel Xe: use REP MOVSB by default; 0 restores scalar copy at runtime
 #endif
 static int gNvAperture = 0;
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
@@ -1516,7 +1516,7 @@ NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced fr
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
 #ifdef NMX_XEGFX
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_scanout_bulk_copy, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
-           &gXeScanoutBulkCopy, 0, "Xe only: 1 = memcpy scanout rows, 0 = original volatile dword copies (default)");
+           &gXeScanoutBulkCopy, 0, "Xe only: 1 = REP MOVSB row copy (default), 0 = original volatile dword copies");
 NVACCEL_CNT(nvaccel_iop_copy_frames,   gXeIopCopyFrames,  "Xe only: display transactions that copied rows");
 NVACCEL_CNT(nvaccel_iop_copy_last_us,  gXeIopCopyLastUs,  "Xe only: last display-transaction row copy, us");
 NVACCEL_CNT(nvaccel_iop_copy_max_us,   gXeIopCopyMaxUs,   "Xe only: maximum display-transaction row copy, us");

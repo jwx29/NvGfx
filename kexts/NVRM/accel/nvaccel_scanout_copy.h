@@ -2,8 +2,8 @@
  * XeGfx-only scanout row-copy primitive.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  *
- * Normal mode preserves the existing volatile dword loads/stores. Bulk mode is an
- * explicit experiment for a CPU-mapped framebuffer backed by ordinary memory.
+ * Scalar mode preserves volatile dword loads/stores. Bulk mode uses x86
+ * REP MOVSB for large linear scanout transfers without using SIMD registers.
  * Never use this on GPU MMIO registers, and don't enable bulk mode until checked
  * on the actual Intel scanout mapping. Row strides and padding are preserved.
  */
@@ -32,13 +32,25 @@ static inline void nvAccelScanoutCopyRows(volatile uint32_t *dst,
         // write-combined framebuffer memory can be very slow and changes nothing.
         if (d == s) continue;
         if (bulk) {
-            // Opt-in only: memcpy allows the compiler/kernel libc to use a
-            // wider copy than millions of individual volatile 32-bit stores.
-            memcpy(const_cast<uint32_t *>(d),
-                   const_cast<const uint32_t *>(s),
+#if defined(__x86_64__)
+            // REP MOVSB is the integer-only x86 copy primitive used by
+            // VedCloud's Meteor Lake path. Preserve the volatile/IO mapping
+            // semantics and don't use kernel SIMD/FPU state.
+            volatile unsigned char *to = (volatile unsigned char *)d;
+            const volatile unsigned char *from = (const volatile unsigned char *)s;
+            size_t count = (size_t)copyWords * sizeof(uint32_t);
+            __asm__ __volatile__("rep movsb" : "+D"(to), "+S"(from), "+c"(count) :: "memory");
+#else
+            memcpy(const_cast<uint32_t *>(d), const_cast<const uint32_t *>(s),
                    (size_t)copyWords * sizeof(uint32_t));
+#endif
         } else {
             for (unsigned x = 0; x < copyWords; ++x) d[x] = s[x];
         }
     }
+#if defined(__x86_64__)
+    // Order write-combined framebuffer stores before the caller publishes
+    // completion; this is intentionally outside the per-row loop.
+    if (bulk) __asm__ __volatile__("sfence" ::: "memory");
+#endif
 }
