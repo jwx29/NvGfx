@@ -833,6 +833,25 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     const BOOL brec = !noRecycle && _nbpk && nvmtl_bpark_take(self, bkey, &t->_i) == 0;
     if (!brec && nvmtl_vk_image_create_buffer_alias((uint32_t)w, (uint32_t)h, vkf, bpp, a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
                                            (d.usage & MTLTextureUsageRenderTarget) != 0, &_b, offset, bpr, &t->_i)) {
+        // <wtl> WindowServer's Terminal strips and iconservicesagent's icons ask for views that run past the end of their
+        // buffer (mostly NoCopy, so no spare page): give those a stand-in sized to the view, refilled from the caller's bytes
+        // at every submission it is used in (and copied back when written)
+        const size_t need = offset + (size_t)bpr * (h - 1) + w * bpp;
+        if (need > _b.size && offset < _b.size && [self contents] && !getenv("NVMTL_NO_BUFTEX_STANDIN")) {
+            NVMTLBuffer *sb = [NVMTLBuffer new];
+            if (sb && !nvmtl_vk_buffer_create((need - offset + 4095) & ~(size_t)4095, 1, &sb->_b) && sb->_b.map) {
+                sb->_storage = MTLStorageModeShared;
+                sb->_hostPtr = (char *)[self contents] + offset; sb->_hostLen = _b.size - offset;
+                memcpy(sb->_b.map, sb->_hostPtr, sb->_hostLen);
+                NVMTLBuffer *src = self;   // the caller's bytes live as long as the stand-in does
+                sb->_hostDealloc = ^(void *p, NSUInteger l) { (void)p; (void)l; (void)src; };
+                id<MTLTexture> v = [sb newTextureWithDescriptor:d offset:0 bytesPerRow:bpr];
+                { static int said; if (said++ < 8) nvlog("buffer texture: %zux%zu pitch %lu runs %zu B past the %zu-byte buffer (usage 0x%lx) -> %s",
+                      w, h, (unsigned long)bpr, need - _b.size, _b.size, (unsigned long)d.usage, v ? "view of a stand-in resynced at every submission" : "stand-in view also REFUSED"); }
+                if (v) return v;
+            }
+        }
+        // </wtl>
         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu, buffer %lu B, storage %lu) -> nil (reason above)",
               (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)_b.size, (unsigned long)_storage);
         return nil; }
