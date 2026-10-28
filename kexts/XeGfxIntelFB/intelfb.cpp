@@ -18,6 +18,16 @@
 // Boot guard as in NMIntelFB: each start counts in NVRAM, 120 s of uptime after start clears it, and two counted starts
 // in a row make probe decline so IONDRVFramebuffer drives the panel again. Boot-arg -xeintelfboff declines always.
 #define XIFB_GUARD_VAR "xeintelfb-starts"
+// About This Mac shows "model" followed by the VRAM size; name the chip generation and graphics architecture
+static const char *xifbModelName(uint16_t dev)
+{
+    switch (dev) {
+    case 0x7d67: case 0x7d41: return "Intel Arrow Lake Xe-LPG";
+    case 0x7d51: case 0x7dd1: return "Intel Arrow Lake Xe-LPG+";
+    case 0x7d40: case 0x7d45: case 0x7d55: case 0x7dd5: return "Intel Meteor Lake Xe-LPG";
+    default: return "Intel Xe Graphics";
+    }
+}
 static unsigned xifbGuardStarts(IORegistryEntry *o)
 {
     OSObject *v = o->copyProperty(XIFB_GUARD_VAR); OSData *d = OSDynamicCast(OSData, v);
@@ -50,7 +60,7 @@ static void xifbGuardClear()
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.7", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxIntelFB, "0.8", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
@@ -117,7 +127,7 @@ static bool xifbReadEdid(uint8_t *edid, int *len)
 static uint32_t xifbMeasureHz()
 {
     const uint32_t fc = 0x70040;
-    uint32_t a = xr(fc), b;
+    uint32_t a = xr(fc), b = a;
     for (int i = 0; i < 100 && (b = xr(fc)) == a; i++) IODelay(500);
     if (b == a) return 0;
     uint64_t t0 = mach_absolute_time(); IOSleep(500);
@@ -156,9 +166,11 @@ public:
     bool start(IOService *provider) override {
         xifbGuardCount();
         // System Profiler names the GPU from the PCI device's "model"; without it About This Mac shows a bare "Display"
-        static const char model[] = "Intel Xe Graphics";
-        if (!provider->getProperty("model"))
-            if (OSData *m = OSData::withBytes(model, sizeof model)) { provider->setProperty("model", m); m->release(); }
+        if (!provider->getProperty("model")) {
+            IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
+            const char *model = xifbModelName(pci ? pci->configRead16(kIOPCIConfigDeviceID) : 0);
+            if (OSData *m = OSData::withBytes(model, (unsigned)strlen(model) + 1)) { provider->setProperty("model", m); m->release(); }
+        }
         // System Profiler shows VRAM,totalMB of an Intel PCI device as "VRAM (Dynamic, Max)", else the 15 MB GOP
         // framebuffer. Same size ANV gives its heap: 3/4 of RAM above 4 GB, half below. xeintelfbvram=<MB> overrides.
         if (!provider->getProperty("VRAM,totalMB")) {

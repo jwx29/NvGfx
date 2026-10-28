@@ -670,8 +670,31 @@ static void nvmtl_install_hw_resource_pools(id dev)
     @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> %s (asked by %s)", v.UTF8String, who); } }
     return v;
 }
+// the Intel GPU's "model" from XeGfxIntelFB, so Metal and About This Mac use one name
+static NSString *nvmtl_intel_model(void)
+{
+    static NSString *model; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        io_iterator_t it = 0;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOPCIDevice"), &it) != KERN_SUCCESS) return;
+        for (io_service_t s; (s = IOIteratorNext(it)); IOObjectRelease(s)) {
+            if (model) continue;
+            CFTypeRef v = IORegistryEntryCreateCFProperty(s, CFSTR("vendor-id"), kCFAllocatorDefault, 0);
+            CFTypeRef m = IORegistryEntryCreateCFProperty(s, CFSTR("model"), kCFAllocatorDefault, 0);
+            if (v && m && CFGetTypeID(v) == CFDataGetTypeID() && CFDataGetLength(v) >= 2 && CFGetTypeID(m) == CFDataGetTypeID() &&
+                *(const uint16_t *)CFDataGetBytePtr(v) == 0x8086 && CFDataGetLength(m) > 1)
+                model = [[NSString alloc] initWithBytes:CFDataGetBytePtr(m) length:strnlen((const char *)CFDataGetBytePtr(m), CFDataGetLength(m))
+                                               encoding:NSUTF8StringEncoding];
+            if (v) CFRelease(v);
+            if (m) CFRelease(m);
+        }
+        IOObjectRelease(it);
+    });
+    return model;
+}
 - (NSString *)name {
     static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
+    if (nvmtl_vk_vendor() == 0x8086 && nvmtl_intel_model().length) return nvmtl_intel_model();
     const char *vkname = nvmtl_vk_device_name();
     NSString *full = [NSString stringWithUTF8String:(vkname ? vkname : "NVIDIA GPU")];
     NSRange cut = [full rangeOfString:@" (NVK "];
