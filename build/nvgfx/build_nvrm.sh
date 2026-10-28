@@ -5,7 +5,8 @@
 #   build/nvgfx/build_nvrm.sh [stage ...]     stages: tree rm kms completion glue link compare   (default: all)
 #
 # Environment:
-#   OGKM_SRC      NVIDIA open-gpu-kernel-modules checkout with tag 610.57.04   (default ~/src/deps/open-gpu-610.57.04)
+#   NVRM_TAG      NVIDIA open-gpu-kernel-modules tag                            (default 615.78.08, NullMoth 2.5.x)
+#   OGKM_SRC      checkout with that tag                                        (default ~/src/deps/open-gpu-$NVRM_TAG)
 #   NVGFX_OUT     output root, NVRM goes to $NVGFX_OUT/nvrm                    (default ~/src/NvGfx-build)
 #   JOBS          make parallelism                                            (default 8; keep it moderate)
 #   NVRM_PARITY   1 = reproduce the shipped 2.1.0 RM: skip 610-fsp-timer-double-destroy.patch, which 2.1.0 lacks
@@ -22,12 +23,12 @@ R=$(cd "$(dirname "$0")/../.." && pwd)
 K=$R/kexts/NVRM
 H=$R/build/nvgfx/nvrm
 O=${NVGFX_OUT:-$HOME/src/NvGfx-build}/nvrm
-OGKM_SRC=${OGKM_SRC:-$HOME/src/deps/open-gpu-610.57.04}
-TAG=610.57.04
+TAG=${NVRM_TAG:-615.78.08}
+OGKM_SRC=${OGKM_SRC:-$HOME/src/deps/open-gpu-$TAG}
 OGKM=$O/ogkm
 JOBS=${JOBS:-8}
 PARITY=${NVRM_PARITY:-0}
-REF=${NVGFX_REF_PKGROOT:-$HOME/Hackintosh/tooling/quarantine/nullmoth-release-2.3.5/x/pkgroot}
+REF=${NVGFX_REF_PKGROOT:-$HOME/Hackintosh/tooling/quarantine/nullmoth-release-2.5.3/x/pkgroot}
 CC=$(xcrun -f clang); CXX=$(xcrun -f clang++)
 export SDKROOT=$(xcrun --show-sdk-path); SDK=$SDKROOT; KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 mkdir -p "$O/logs"
@@ -49,6 +50,12 @@ stage_tree() {
     git -C "$OGKM" -c advice.detachedHead=false checkout -q "$TAG"
   fi
   [ "$(git -C "$OGKM" rev-parse HEAD)" = "$(git -C "$OGKM" rev-parse "$TAG^{commit}")" ] || { echo "STOP: $OGKM is not at $TAG"; exit 2; }
+  # the fsp/timer double destroy is fixed in NVIDIA's own 615 tree; only 610 needs our patch
+  if [ "${TAG%%.*}" != 610 ]; then
+    local dirty0; dirty0=$(git -C "$OGKM" status --porcelain --untracked-files=no)
+    [ -z "$dirty0" ] || { echo "STOP: unexpected changes in $OGKM"; exit 2; }
+    say "tree $OGKM at $TAG"; return
+  fi
   local p=$K/patches/610-fsp-timer-double-destroy.patch applied=0
   git -C "$OGKM" apply --reverse --check "$p" 2>/dev/null && applied=1
   if [ "$PARITY" = 1 ] && [ $applied = 1 ]; then git -C "$OGKM" apply --reverse "$p"; say "fsp patch removed (parity)"; fi

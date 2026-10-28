@@ -212,7 +212,7 @@ static inline void nvmtl_resref(id o, int d) {
 static BOOL nvmtl_purge_eligible(NVMTLTexture *t) {
     return !t->_parent && !t->_viewParent && !t->_backBuf && !t->_heap && !t->_subHeap && !t->_surf && !t->_vramOn && !t->_ownView
         && !t->_shareable && !t->_resid && !__atomic_load_n(&t->_nviews, __ATOMIC_ACQUIRE) && t->_i.img && !t->_i.placed
-        && t->_i.usage && !t->_i.vpair && t->_i.samples <= 1 && !(t->_i.usage & 0x20u )
+        && t->_i.usage && !t->_i.vfl && t->_i.samples <= 1 && !(t->_i.usage & 0x20u )
         // a swizzled sampling view (MTLTextureDescriptor.swizzle) is made against this VkImage; re-homing the memory
         // recreates the image and would leave that view pointing at the destroyed one
         && !t->_swzView;
@@ -326,7 +326,7 @@ static int nvmtl_res2_on(void) {
 static BOOL nvmtl_res2_movable(NVMTLTexture *t) {
     return !t->_parent && !t->_viewParent && !t->_backBuf && !t->_heap && !t->_subHeap && !t->_surf && !t->_vramOn && !t->_ownView
         && !t->_shareable && !__atomic_load_n(&t->_nviews, __ATOMIC_ACQUIRE) && t->_i.img && !t->_i.placed && t->_i.usage
-        && !t->_i.vpair && t->_i.samples <= 1 && !(t->_i.usage & 0x20u );
+        && !t->_i.vfl && t->_i.samples <= 1 && !(t->_i.usage & 0x20u );
 }
 static os_unfair_lock gRes2RegLock = OS_UNFAIR_LOCK_INIT;
 static NSHashTable *gRes2Reg;
@@ -780,6 +780,30 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
         nvlog("newTiledTextureWithDescriptor: %lux%lu bpr %lu off %lu: no linear view and no CPU copy (buffer %lu B) -> nil",
               (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset, (unsigned long)_b.size);
         return nil; }
+    // A one-time copy goes stale when the caller rewrites the bytes in place (the cursor's clear square on Intel, I-119),
+    // so read-only views get a buffer of our own that is refilled from the caller's bytes at every submission.
+    const NSUInteger ru = d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget);
+    if (d.usage != MTLTextureUsageUnknown && !ru && !getenv("NVMTL_NO_TILED_RESYNC")) {
+        NVMTLBuffer *s = [NVMTLBuffer new];
+        const size_t n = MIN((size_t)bpr * d.height, _b.size - offset);
+        if (s && !nvmtl_vk_buffer_create(n, 1, &s->_b) && s->_b.map) {
+            s->_storage = MTLStorageModeShared;
+            memcpy(s->_b.map, (char *)base + offset, n);
+            s->_hostPtr = (char *)base + offset; s->_hostLen = n;
+            NVMTLBuffer *src = self;   // the caller's bytes live as long as the stand-in does
+            s->_hostDealloc = ^(void *p, NSUInteger l) { (void)p; (void)l; (void)src; };
+            // the copy below only ever filled level 0 of slice 0, so a single-level view loses nothing
+            MTLTextureDescriptor *sd = [d copy]; sd.mipmapLevelCount = 1; sd.sampleCount = 1; sd.arrayLength = 1; sd.depth = 1;
+            id<MTLTexture> v = [s newTextureWithDescriptor:sd offset:0 bytesPerRow:bpr];
+            { static int said; if (said++ < 4) nvlog("newTiledTextureWithDescriptor: linear view refused (fmt %lu %lux%lu bpr %lu off %lu, buffer %lu B, usage 0x%lx, "
+                  "mips %lu samples %lu array %lu depth %lu storage %lu, src storage %lu) -> %s",
+                  (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset,
+                  (unsigned long)_b.size, (unsigned long)d.usage, (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount,
+                  (unsigned long)d.arrayLength, (unsigned long)d.depth, (unsigned long)d.storageMode, (unsigned long)_storage,
+                  v ? "view of a stand-in resynced at every submission" : "stand-in view also REFUSED, copied texture"); }
+            if (v) return v;
+        }
+    }
     MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
     id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
     if (c) [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
@@ -795,12 +819,12 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     if (d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 || d.sampleCount > 1 || d.arrayLength > 1 || d.depth > 1
         || !w || !h || w > UINT32_MAX || h > UINT32_MAX) {
         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu: type %lu %zux%zu (mips %lu, samples %lu, array %lu, depth %lu) "
-              "is not built - only a 2D single-level linear view -> nil", (unsigned long)offset, (unsigned long)bpr, (unsigned long)d.textureType,
+              "is not built - only a 2D single-level linear view -> nil (REFUSED)", (unsigned long)offset, (unsigned long)bpr, (unsigned long)d.textureType,
               w, h, (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount, (unsigned long)d.arrayLength, (unsigned long)d.depth);
         return nil; }
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt_public(d.pixelFormat, &vkf, &bpp, &a8)) {
-        nvlog("buffer newTextureWithDescriptor: pixelFormat %lu has no VkFormat -> nil", (unsigned long)d.pixelFormat); return nil; }
+        nvlog("buffer newTextureWithDescriptor: pixelFormat %lu has no VkFormat -> nil (REFUSED)", (unsigned long)d.pixelFormat); return nil; }
     NVMTLTexture *t = [NVMTLTexture new];
     static int noRecycle = -1; if (noRecycle < 0) { noRecycle = getenv("NVMTL_NO_BUFTEX_RECYCLE") != NULL;
         nvlog("buffer texture: dres R3 recycle %s", noRecycle ? "OFF (NVMTL_NO_BUFTEX_RECYCLE)" : "ON"); }
@@ -809,6 +833,25 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     const BOOL brec = !noRecycle && _nbpk && nvmtl_bpark_take(self, bkey, &t->_i) == 0;
     if (!brec && nvmtl_vk_image_create_buffer_alias((uint32_t)w, (uint32_t)h, vkf, bpp, a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
                                            (d.usage & MTLTextureUsageRenderTarget) != 0, &_b, offset, bpr, &t->_i)) {
+        // <wtl> WindowServer's Terminal strips and iconservicesagent's icons ask for views that run past the end of their
+        // buffer (mostly NoCopy, so no spare page): give those a stand-in sized to the view, refilled from the caller's bytes
+        // at every submission it is used in (and copied back when written)
+        const size_t need = offset + (size_t)bpr * (h - 1) + w * bpp;
+        if (need > _b.size && offset < _b.size && [self contents] && !getenv("NVMTL_NO_BUFTEX_STANDIN")) {
+            NVMTLBuffer *sb = [NVMTLBuffer new];
+            if (sb && !nvmtl_vk_buffer_create((need - offset + 4095) & ~(size_t)4095, 1, &sb->_b) && sb->_b.map) {
+                sb->_storage = MTLStorageModeShared;
+                sb->_hostPtr = (char *)[self contents] + offset; sb->_hostLen = _b.size - offset;
+                memcpy(sb->_b.map, sb->_hostPtr, sb->_hostLen);
+                NVMTLBuffer *src = self;   // the caller's bytes live as long as the stand-in does
+                sb->_hostDealloc = ^(void *p, NSUInteger l) { (void)p; (void)l; (void)src; };
+                id<MTLTexture> v = [sb newTextureWithDescriptor:d offset:0 bytesPerRow:bpr];
+                { static int said; if (said++ < 8) nvlog("buffer texture: %zux%zu pitch %lu runs %zu B past the %zu-byte buffer (usage 0x%lx) -> %s",
+                      w, h, (unsigned long)bpr, need - _b.size, _b.size, (unsigned long)d.usage, v ? "view of a stand-in resynced at every submission" : "stand-in view also REFUSED"); }
+                if (v) return v;
+            }
+        }
+        // </wtl>
         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu, buffer %lu B, storage %lu) -> nil (reason above)",
               (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)_b.size, (unsigned long)_storage);
         return nil; }
@@ -921,7 +964,11 @@ static void *nvmtl_storage_view_for(NVMTLCommandBuffer *cb, NVMTLTexture *t, BOO
         if (!t->_stTwin.img) {
             if (t->_stTwinTried) return NULL;
             t->_stTwinTried = YES;
-            if (nvmtl_vk_image_create_typed(im->w, im->h, im->fmt, im->bpp, 0, 1, 1, 2, 1, &t->_stTwin) || !t->_stTwin.storage) {
+            // An sRGB format cannot be a storage image in Vulkan at all. Its twin is half float, filled and written back by
+            // blits that decode and encode sRGB, so a kernel writes linear values and the texture ends up sRGB-encoded,
+            // as a write to an sRGB texture does on Apple GPUs (Blender's edit-mode overlay wrote RGBA8Unorm_sRGB).
+            const int srgb = nvmtl_vk_srgb_format(im->fmt);
+            if (nvmtl_vk_image_create_typed(im->w, im->h, srgb ? 97u : im->fmt, srgb ? 8u : im->bpp, 0, 1, 1, 2, 1, &t->_stTwin) || !t->_stTwin.storage) {
                 if (t->_stTwin.img) nvmtl_vk_image_destroy(&t->_stTwin);
                 memset(&t->_stTwin, 0, sizeof t->_stTwin);
                 nvlog("storage twin: VkFormat %u %ux%u cannot be a storage image in optimal tiling either - shader writes to it are LOST", im->fmt, im->w, im->h);
@@ -932,7 +979,8 @@ static void *nvmtl_storage_view_for(NVMTLCommandBuffer *cb, NVMTLTexture *t, BOO
     }
     if (!cb->_stTwins) cb->_stTwins = [NSMutableSet new];
     if (![cb->_stTwins containsObject:t]) {
-        if (nvmtl_vk_cmd_copy_image_sub(&cb->_c, im, 0, 0, 0, 0, &t->_stTwin, 0, 0, 0, 0, im->w, im->h)) return NULL;
+        if (t->_stTwin.fmt != im->fmt ? nvmtl_vk_cmd_blit_image_2d(&cb->_c, im, &t->_stTwin, im->w, im->h)
+                                      : nvmtl_vk_cmd_copy_image_sub(&cb->_c, im, 0, 0, 0, 0, &t->_stTwin, 0, 0, 0, 0, im->w, im->h)) return NULL;
         [cb->_stTwins addObject:t];
         nvmtl_retain_resource(cb, t);
     }
@@ -955,7 +1003,8 @@ static BOOL nvmtl_function_writes_texture(NVMTLFunction *fn, NSUInteger index) {
 static void nvmtl_storage_twins_out(NVMTLCommandBuffer *cb) {
     for (NVMTLTexture *t in cb->_stTwins) {
         nvk_image *im = [t nvi];
-        if (nvmtl_vk_cmd_copy_image_sub(&cb->_c, &t->_stTwin, 0, 0, 0, 0, im, 0, 0, 0, 0, im->w, im->h)) {
+        if (t->_stTwin.fmt != im->fmt ? nvmtl_vk_cmd_blit_image_2d(&cb->_c, &t->_stTwin, im, im->w, im->h)
+                                      : nvmtl_vk_cmd_copy_image_sub(&cb->_c, &t->_stTwin, 0, 0, 0, 0, im, 0, 0, 0, 0, im->w, im->h)) {
             nvlog("storage twin: copy back to the %ux%u texture FAILED", im->w, im->h); continue; }
         nvmtl_vk_cmd_prepare_sampled_image(&cb->_c, &t->_stTwin, 1);
         nvmtl_surf_dirty(cb, t);
@@ -1234,6 +1283,13 @@ static int nvmtl_surface_host_xfer(NVMTLTexture *r, size_t row, int to_image) {
     return rc;
 }
 // </wtl>
+
+// NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages
+static bool nvmtl_surfin_import(void) {
+    static int on = -1;
+    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
+    return on;
+}
 - (void)nvmtlSurfaceIn {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
@@ -1251,7 +1307,17 @@ static int nvmtl_surface_host_xfer(NVMTLTexture *r, size_t row, int to_image) {
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = !(base && row) ? -1 : !nvmtl_surface_host_xfer(r, row, 1) ? 0 : nvmtl_vk_image_write(r->_q, &r->_i, base, row);
+    int rc = -1;
+    if (base && row) {
+        // <wtl> Intel/AMD: the surface's pages are imported once per texture; NVIDIA imports them per upload
+        rc = nvmtl_surface_host_xfer(r, row, 1);
+        if (rc && nvmtl_vk_vendor() == 0x10de && nvmtl_surfin_import()) {
+            const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
+            rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off);
+        }
+        if (rc) rc = nvmtl_vk_image_write(r->_q, &r->_i, base, row);
+        // </wtl>
+    }
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
@@ -2771,7 +2837,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         // <wtl>
         // same pipeline, same sampler values as this encoder's last draw: its choice stands (no lock, no lookup; ANGLE
         // binds every draw)
-        if (_svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
+        // NVMTL_NO_SV_MEMO=1 (nvrm610.conf) looks the variant up on every draw again, to A/B a text glitch
+        static int memo = -1;
+        if (memo < 0) { const char *e = getenv("NVMTL_NO_SV_MEMO"); memo = !(e && *e && *e != '0'); }
+        if (memo && _svSel && _svFor==_ps && _svKey==key) return _svSel==[NSNull null] ? nil : _svSel;
         _svFor=_ps; _svKey=key; _svSel=nil;
         // </wtl>
         @synchronized(_ps) {
@@ -2976,7 +3045,10 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
     // at its end dumped, as NVMTL_DUMP_GROUP does, for apps that label pipelines but push no debug groups (diagnostic)
     // <wtl>
     // The same pipeline again inside a begun pass (Apple's GL renderer sets it before every draw) changes nothing.
-    if (ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
+    // NVMTL_NO_PSO_SKIP=1 (nvrm610.conf) sets it every time again, to A/B a text glitch reported against this
+    static int skip = -1;
+    if (skip < 0) { const char *e = getenv("NVMTL_NO_PSO_SKIP"); skip = !(e && *e && *e != '0'); }
+    if (skip && ps && (NVMTLRenderPipelineState *)ps == _ps && _begun && !(_cb->_c.pt_open && _cb->_c.pt_pool)) return;
     // </wtl>
     { static const char *want; static int once; static _Atomic int armed; if (!once) { once = 1; want = getenv("NVMTL_DUMP_PSO"); }
       NSString *lbl = want ? ps.label : nil;   // <wtl>
@@ -3944,6 +4016,8 @@ void nvmtl_heap_back(NVMTLHeap *h, NSUInteger size, int shared) {
     _used += len;
     atomic_fetch_add(&gHAPlaced, 1); atomic_fetch_add(&gHALive, len);
     atomic_fetch_add(rec ? &gHTRecycled : &gHTPlaced, 1); nvmtl_heaptex_census(rec ? "recycled" : "placed");
+    // automatic heaps land here, not in -newTextureWithDescriptor:offset:; without this the descriptor's swizzle was lost
+    nvmtl_texture_desc_swizzle(t, d);
     return t;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
