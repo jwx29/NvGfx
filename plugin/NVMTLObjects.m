@@ -792,10 +792,15 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
             s->_hostPtr = (char *)base + offset; s->_hostLen = n;
             NVMTLBuffer *src = self;   // the caller's bytes live as long as the stand-in does
             s->_hostDealloc = ^(void *p, NSUInteger l) { (void)p; (void)l; (void)src; };
-            id<MTLTexture> v = [s newTextureWithDescriptor:d offset:0 bytesPerRow:bpr];
-            { static int said; if (said++ < 4) nvlog("newTiledTextureWithDescriptor: linear view refused (fmt %lu %lux%lu bpr %lu off %lu, buffer %lu B, usage 0x%lx) -> %s",
+            // the copy below only ever filled level 0 of slice 0, so a single-level view loses nothing
+            MTLTextureDescriptor *sd = [d copy]; sd.mipmapLevelCount = 1; sd.sampleCount = 1; sd.arrayLength = 1; sd.depth = 1;
+            id<MTLTexture> v = [s newTextureWithDescriptor:sd offset:0 bytesPerRow:bpr];
+            { static int said; if (said++ < 4) nvlog("newTiledTextureWithDescriptor: linear view refused (fmt %lu %lux%lu bpr %lu off %lu, buffer %lu B, usage 0x%lx, "
+                  "mips %lu samples %lu array %lu depth %lu storage %lu, src storage %lu) -> %s",
                   (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr, (unsigned long)offset,
-                  (unsigned long)_b.size, (unsigned long)d.usage, v ? "view of a stand-in resynced at every submission" : "stand-in view also refused, copied texture"); }
+                  (unsigned long)_b.size, (unsigned long)d.usage, (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount,
+                  (unsigned long)d.arrayLength, (unsigned long)d.depth, (unsigned long)d.storageMode, (unsigned long)_storage,
+                  v ? "view of a stand-in resynced at every submission" : "stand-in view also REFUSED, copied texture"); }
             if (v) return v;
         }
     }
@@ -814,12 +819,12 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     if (d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 || d.sampleCount > 1 || d.arrayLength > 1 || d.depth > 1
         || !w || !h || w > UINT32_MAX || h > UINT32_MAX) {
         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu: type %lu %zux%zu (mips %lu, samples %lu, array %lu, depth %lu) "
-              "is not built - only a 2D single-level linear view -> nil", (unsigned long)offset, (unsigned long)bpr, (unsigned long)d.textureType,
+              "is not built - only a 2D single-level linear view -> nil (REFUSED)", (unsigned long)offset, (unsigned long)bpr, (unsigned long)d.textureType,
               w, h, (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount, (unsigned long)d.arrayLength, (unsigned long)d.depth);
         return nil; }
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt_public(d.pixelFormat, &vkf, &bpp, &a8)) {
-        nvlog("buffer newTextureWithDescriptor: pixelFormat %lu has no VkFormat -> nil", (unsigned long)d.pixelFormat); return nil; }
+        nvlog("buffer newTextureWithDescriptor: pixelFormat %lu has no VkFormat -> nil (REFUSED)", (unsigned long)d.pixelFormat); return nil; }
     NVMTLTexture *t = [NVMTLTexture new];
     static int noRecycle = -1; if (noRecycle < 0) { noRecycle = getenv("NVMTL_NO_BUFTEX_RECYCLE") != NULL;
         nvlog("buffer texture: dres R3 recycle %s", noRecycle ? "OFF (NVMTL_NO_BUFTEX_RECYCLE)" : "ON"); }

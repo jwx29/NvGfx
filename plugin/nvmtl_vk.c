@@ -7710,16 +7710,16 @@ int nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, u
 static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
                                        const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out)
 {
-    if (nvmtl_vk_init() || !b || !b->buf || !b->mem || !w || !h) { nvlog("buffer texture: no buffer memory to alias (%ux%u)", w, h); return -1; }
+    if (nvmtl_vk_init() || !b || !b->buf || !b->mem || !w || !h) { nvlog("buffer texture: REFUSED, no buffer memory to alias (%ux%u)", w, h); return -1; }
     { uint32_t bw = 0, bh = 0, bb = 0;
       if (nvmtl_vk_format_block(vkfmt, &bw, &bh, &bb)) { nvlog("buffer texture: VkFormat %u is block-compressed; a linear alias of it is not built", vkfmt); return -1; } }
     if (!bpp) bpp = 4;
     if (row_pitch < (size_t)w * bpp || row_pitch > UINT32_MAX || row_pitch % bpp) {
         nvlog("buffer texture: bytesPerRow %zu cannot hold %u texels of %u B", row_pitch, w, bpp); return -1; }
     if (g_linmod && row_pitch % 32) {
-        nvlog("buffer texture: bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
+        nvlog("buffer texture: REFUSED, bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
     if (offset > b->size || (size_t)row_pitch * (h - 1) + (size_t)w * bpp > b->size - offset) {
-        nvlog("buffer texture: %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer", w, h, offset, row_pitch, b->size); return -1; }
+        nvlog("buffer texture: REFUSED, %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer", w, h, offset, row_pitch, b->size); return -1; }
     PFN_vkGetPhysicalDeviceFormatProperties gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
     VkFormatProperties fp; memset(&fp, 0, sizeof fp);
     if (gfp) gfp(g_pdev, (VkFormat)vkfmt, &fp);
@@ -7743,7 +7743,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
     // <wtl> host-pointer memory (an IOSurface's pages on Intel/AMD) takes only images that say so; ANV wants the explicit layout too
     VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, ici.pNext, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
     if (b->imported) {
-        if (!g_linmod) { nvlog("buffer texture: host-pointer memory needs an explicit layout (no VK_EXT_image_drm_format_modifier)"); return -1; }
+        if (!g_linmod) { nvlog("buffer texture: REFUSED, host-pointer memory needs an explicit layout (no VK_EXT_image_drm_format_modifier)"); return -1; }
         ici.pNext = &emi;
     }
     // </wtl>
