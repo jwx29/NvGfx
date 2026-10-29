@@ -24,7 +24,6 @@
 #include "i915_gem.h"
 #include "i915_vma.h"
 #include "gem/i915_gem_object.h"
-#include "gem/i915_gem_shmem.h"
 
 #include "xg_i915.h"
 
