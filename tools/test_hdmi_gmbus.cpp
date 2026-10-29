@@ -9,16 +9,29 @@
 struct Fake {
     uint8_t edid[256]={};
     unsigned pos=0, words=0, delays=0, resets=0, starts=0, stops=0;
+    unsigned claims=0, releases=0, gmbus2Reads=0;
     uint32_t pin=0;
-    bool missing=false, busy=false, stalled=false, inaccessible=false;
+    bool missing=false, busy=false, active=false, acquired=false;
+    bool stalled=false, inaccessible=false;
+    // Reset controller and test bookkeeping without erasing the EDID.
+    void resetTransfer() {
+        pos=words=delays=resets=starts=stops=claims=releases=gmbus2Reads=0;
+        pin=0; missing=busy=active=acquired=stalled=inaccessible=false;
+    }
     uint32_t read32(uint32_t addr) {
         if (addr==nm_hdmi::kGMBUS0) return pin;
         if (addr==nm_hdmi::kGMBUS2) {
+            ++gmbus2Reads;
             if (inaccessible) return 0xffffffffu;
-            if (stalled) return 0;
-            if (busy && !starts) return nm_hdmi::kInUse;
-            if (missing) return nm_hdmi::kNAK;
-            return nm_hdmi::kReady | nm_hdmi::kWaitPhase;
+            // Intel GMBUS2.INUSE: first read of 0 ACQUIRES the semaphore;
+            // every subsequent read returns 1 until someone writes 1.
+            const bool inUse=busy || acquired;
+            if (!inUse) { acquired=true; ++claims; }
+            uint32_t v=inUse ? nm_hdmi::kInUse : 0;
+            if (active) v |= nm_hdmi::kActive;
+            if (stalled) return v;
+            if (missing) return v | nm_hdmi::kNAK;
+            return v | nm_hdmi::kReady | nm_hdmi::kWaitPhase;
         }
         if (addr==nm_hdmi::kGMBUS3) {
             uint32_t v=0;
@@ -28,11 +41,19 @@ struct Fake {
         return 0;
     }
     void write32(uint32_t addr,uint32_t v) {
-        if(addr==nm_hdmi::kGMBUS0) pin=v;
-        if(addr==nm_hdmi::kGMBUS1) {
-            if(v & nm_hdmi::kCycleIndex) { ++starts; pos=(v>>8)&255; }
-            if(v & nm_hdmi::kCycleStop) ++stops;
-            if(v & nm_hdmi::kClearError) ++resets;
+        if (addr==nm_hdmi::kGMBUS0) pin=v;
+        if (addr==nm_hdmi::kGMBUS2 && (v & nm_hdmi::kInUse)) {
+            // A driver may only release a semaphore it acquired.
+            assert(acquired && !busy);
+            acquired=false; ++releases;
+        }
+        if (addr==nm_hdmi::kGMBUS1) {
+            if (v & nm_hdmi::kCycleIndex) {
+                assert(v & nm_hdmi::kCycleWait);
+                ++starts; pos=(v>>8)&255;
+            }
+            if (v & nm_hdmi::kCycleStop) ++stops;
+            if (v & nm_hdmi::kClearError) ++resets;
         }
     }
     void delayUs(unsigned) { ++delays; }
@@ -52,25 +73,47 @@ int main() {
     uint8_t out[256]={};size_t len=0;uint32_t status=0;
     assert(nm_hdmi::readEDID(io,out,len,status)==nm_hdmi::Status::ok);
     assert(len==256 && io.starts==2 && io.stops==2 && io.pin==0 && io.words==64);
+    assert(io.claims==2 && io.releases==2 && !io.acquired);
     assert(std::memcmp(out,io.edid,256)==0);
-    Fake bad=io; bad.edid[16] ^= 1; bad.pin=0; bad.starts=0; bad.words=0; bad.stops=0;
+    // Repeat immediately to catch forgotten release after successful read.
+    io.resetTransfer();
+    assert(nm_hdmi::readEDID(io,out,len,status)==nm_hdmi::Status::ok);
+    assert(io.claims==2 && io.releases==2 && !io.acquired);
+
+    Fake bad=io;bad.resetTransfer();bad.edid[16]^=1;
     assert(nm_hdmi::readEDID(bad,out,len,status)==nm_hdmi::Status::checksum);
-    assert(len==0 && bad.pin==0 && bad.stops==1);
-    Fake busy=io; busy.pin=0; busy.starts=0;busy.busy=true;
+    assert(len==0 && bad.stops==1 && bad.claims==1 && bad.releases==1);
+
+    Fake busy=io;busy.resetTransfer();busy.busy=true;
     assert(nm_hdmi::readEDID(busy,out,len,status)==nm_hdmi::Status::busy);
-    assert(busy.starts==0 && busy.pin==0);
-    Fake empty=io; empty.pin=0;empty.starts=0;empty.missing=true;
+    assert(busy.starts==0 && busy.claims==0 && busy.releases==0 && busy.pin==0);
+
+    Fake selected=io;selected.resetTransfer();selected.pin=4;
+    assert(nm_hdmi::readEDID(selected,out,len,status)==nm_hdmi::Status::busy);
+    assert(selected.pin==4 && selected.claims==1 && selected.releases==1 && !selected.acquired);
+
+    Fake running=io;running.resetTransfer();running.active=true;
+    assert(nm_hdmi::readEDID(running,out,len,status)==nm_hdmi::Status::busy);
+    assert(running.claims==1 && running.releases==1 && !running.acquired);
+
+    Fake empty=io;empty.resetTransfer();empty.missing=true;
     assert(nm_hdmi::readEDID(empty,out,len,status)==nm_hdmi::Status::nak);
-    assert(empty.pin==0 && empty.resets==1);
-    Fake single=io; single.pin=0;single.starts=0;single.words=0;single.stops=0;
+    assert(empty.pin==0 && empty.resets==1 && empty.claims==1 && empty.releases==1);
+
+    Fake single=io;single.resetTransfer();
     single.edid[126]=0;fixChecksum(single.edid);
     assert(nm_hdmi::readEDID(single,out,len,status)==nm_hdmi::Status::ok);
-    assert(len==128 && single.starts==1 && single.stops==1);
-    Fake timeout=io; timeout.pin=0;timeout.starts=0;timeout.stalled=true;
+    assert(len==128 && single.starts==1 && single.stops==1 &&
+           single.claims==1 && single.releases==1);
+
+    Fake timeout=io;timeout.resetTransfer();timeout.stalled=true;
     assert(nm_hdmi::readEDID(timeout,out,len,status)==nm_hdmi::Status::timeout);
-    assert(timeout.pin==0 && timeout.delays>=400);
-    Fake unavailable=io; unavailable.pin=0;unavailable.starts=0;unavailable.inaccessible=true;
+    assert(timeout.pin==0 && timeout.delays>=400 &&
+           timeout.claims==1 && timeout.releases==1);
+
+    Fake unavailable=io;unavailable.resetTransfer();unavailable.inaccessible=true;
     assert(nm_hdmi::readEDID(unavailable,out,len,status)==nm_hdmi::Status::inaccessible);
-    assert(unavailable.pin==0 && unavailable.starts==0);
-    std::puts("PASS: EDID base/CTA, checksum fail, busy, NAK, timeout, inaccessible, base-only");
+    assert(unavailable.pin==0 && unavailable.starts==0 &&
+           unavailable.claims==0 && unavailable.releases==0);
+    std::puts("PASS: read-to-acquire GMBUS semaphore and release on success/error; EDID/NAK/timeout/busy cases");
 }

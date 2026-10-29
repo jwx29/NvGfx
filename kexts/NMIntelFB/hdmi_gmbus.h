@@ -14,6 +14,7 @@ constexpr uint32_t kGMBUS2 = 0xC5108u;
 constexpr uint32_t kGMBUS3 = 0xC510Cu;
 constexpr uint32_t kDPBPin = 2u; // Lenovo EFP1, VBT BDB child DDC pin 0x02
 constexpr uint32_t kSWReady = 1u << 30;
+constexpr uint32_t kCycleWait = 1u << 25;
 constexpr uint32_t kCycleIndex = 2u << 25;
 constexpr uint32_t kCycleStop = 4u << 25;
 constexpr uint32_t kReady = 1u << 11;
@@ -49,18 +50,31 @@ inline bool validChecksum(const uint8_t *b) {
 }
 template <typename IO> Status readBlock(IO &io, uint8_t offset, uint8_t *dst,
                                         uint32_t &lastStatus) {
-    // GMBUS0 is shared with other possible hardware users. Refuse to seize
-    // a non-idle controller and never alter its state in that case.
+    // Intel GMBUS2.INUSE is a READ-TO-ACQUIRE semaphore (not an
+    // ordinary status bit). The FIRST read returning 0 acquires ownership;
+    // subsequent status reads report INUSE=1 even for the SAME owner.
+    // Never read GMBUS2 speculatively, never mistake subsequent INUSE=1
+    // for a second owner, and release by writing ONE to GMBUS2.INUSE.
     const uint32_t old0 = io.read32(kGMBUS0);
-    lastStatus = io.read32(kGMBUS2);
-    if (old0 == 0xffffffffu || lastStatus == 0xffffffffu)
+    if (old0 == 0xffffffffu) {
+        lastStatus = old0;
         return Status::inaccessible;
-    if (old0 != 0 || (lastStatus & (kInUse | kActive)))
+    }
+    lastStatus = io.read32(kGMBUS2); // exactly one acquisition read
+    if (lastStatus == 0xffffffffu)
+        return Status::inaccessible;
+    if (lastStatus & kInUse)
+        return Status::busy; // another owner; MUST NOT release its lock
+    // We own the software semaphore now. An existing selection or active
+    // hardware transfer is not ours: release only our semaphore, no reset.
+    if (old0 != 0 || (lastStatus & kActive)) {
+        io.write32(kGMBUS2, kInUse);
         return Status::busy;
+    }
     Status result=Status::ok;
     io.write32(kGMBUS0, kDPBPin); // 100 kHz, no unrelated DDI or pipe changes
     // Single-byte index read: slave 0x50, 128 bytes, INDEX cycle.
-    io.write32(kGMBUS1, kSWReady | kCycleIndex | (128u << 16) |
+    io.write32(kGMBUS1, kSWReady | kCycleIndex | kCycleWait | (128u << 16) |
                            (uint32_t(offset) << 8) | (0x50u << 1) | 1u);
     for (unsigned word=0; word<32; ++word) {
         bool ready=false;
@@ -107,6 +121,9 @@ template <typename IO> Status readBlock(IO &io, uint8_t offset, uint8_t *dst,
         io.write32(kGMBUS1, 0);
     }
     io.write32(kGMBUS0, 0);
+    // Every successful semaphore acquisition MUST be paired with release,
+    // including NAK, timeout and MMIO read failure inside the transfer.
+    io.write32(kGMBUS2, kInUse);
     return result;
 }
 template <typename IO> Status readEDID(IO &io, uint8_t *out, size_t &length,

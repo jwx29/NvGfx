@@ -45,6 +45,38 @@ the first 128-byte block contains 1080p60 and the CTA extension describes 1080p1
 Compare the resulting binary with the known-good Linux `hdmi-monitor-edid.bin`.
 Output created by sudo may be root-owned. Raw EDID is not logged or committed.
 
+## GMBUS2.INUSE hardware semaphore (fixed after first macOS probe)
+
+The first hardware probe returned `NMIntelFBHDMIEDIDStatus=busy`,
+`NMIntelFBHDMIEDIDGMBUS2=0x8000`. The initial probe implementation
+read `GMBUS2` twice during preflight. **Intel documents bit 15 as a
+read-to-acquire software semaphore**, not simply a snapshot of another
+driver using the bus: the first read returning bit 15 = 0 acquires the
+semaphore; all subsequent reads report bit 15 = 1 until software
+relinquishes it by writing `GMBUS2 = (1 << 15)`. The old code was
+therefore able to acquire its own lock, misdiagnose the next read as
+`busy`, and **return without releasing** that lock.
+
+The corrected code reads `GMBUS2` once to acquire. If that first
+read reports `INUSE=1`, it refuses to interfere with another owner
+and does **not** release. If it acquired successfully, it releases
+`INUSE` on **every** completion/error path, including a nonzero
+GMBUS0 selection and active-controller refusal. Status polling after
+acquisition must ignore the owner bit. The indexed EDID command also
+uses `GMBUS_CYCLE_INDEX | GMBUS_CYCLE_WAIT`, matching Linux i915.
+
+**Reboot before repeating the probe with the corrected kext.** A
+previous invocation may have left its software semaphore claimed.
+Do not write to GMBUS2 to force-clear unknown ownership while any
+other driver could be using it; the fixed code intentionally refuses
+a genuinely busy owner. If `busy` persists after reboot, inspect
+the GMBUS0 selection and whether some other component controls DDC.
+
+Intel reference: GMBUS2.INUSE read-to-acquire/one-to-clear,
+<https://www.x.org/docs/intel/IVB/IHD_OS_Vol3_Part4.pdf>,
+section 2.2.6. Linux source:
+<https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/display/intel_gmbus.c.html>.
+
 ## Failure codes
 
 - `busy`: GMBUS0 nonzero or controller INUSE/ACTIVE; refuse to seize another user's bus.
