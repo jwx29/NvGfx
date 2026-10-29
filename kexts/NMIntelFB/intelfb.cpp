@@ -303,7 +303,8 @@ struct NMHDMIMMIO {
     }
     void write32(uint32_t offset, uint32_t value) const {
         *(volatile uint32_t *)(regs + offset) = value;
-        OSMemoryBarrier();
+        // Clang builtin: full compiler/CPU fence; available without IOKit symbols.
+        __sync_synchronize();
     }
     void delayUs(unsigned us) const { IODelay(us); }
 };
