@@ -10,10 +10,12 @@ struct Fake {
     uint8_t edid[256]={};
     unsigned pos=0, words=0, delays=0, resets=0, starts=0, stops=0;
     uint32_t pin=0;
-    bool missing=false, busy=false;
+    bool missing=false, busy=false, stalled=false, inaccessible=false;
     uint32_t read32(uint32_t addr) {
         if (addr==nm_hdmi::kGMBUS0) return pin;
         if (addr==nm_hdmi::kGMBUS2) {
+            if (inaccessible) return 0xffffffffu;
+            if (stalled) return 0;
             if (busy && !starts) return nm_hdmi::kInUse;
             if (missing) return nm_hdmi::kNAK;
             return nm_hdmi::kReady | nm_hdmi::kWaitPhase;
@@ -51,7 +53,7 @@ int main() {
     assert(nm_hdmi::readEDID(io,out,len,status)==nm_hdmi::Status::ok);
     assert(len==256 && io.starts==2 && io.stops==2 && io.pin==0 && io.words==64);
     assert(std::memcmp(out,io.edid,256)==0);
-    Fake bad=io; bad.edid[16] ^= 1; bad.pin=0; bad.starts=0; bad.words=0;
+    Fake bad=io; bad.edid[16] ^= 1; bad.pin=0; bad.starts=0; bad.words=0; bad.stops=0;
     assert(nm_hdmi::readEDID(bad,out,len,status)==nm_hdmi::Status::checksum);
     assert(len==0 && bad.pin==0 && bad.stops==1);
     Fake busy=io; busy.pin=0; busy.starts=0;busy.busy=true;
@@ -60,9 +62,15 @@ int main() {
     Fake empty=io; empty.pin=0;empty.starts=0;empty.missing=true;
     assert(nm_hdmi::readEDID(empty,out,len,status)==nm_hdmi::Status::nak);
     assert(empty.pin==0 && empty.resets==1);
-    Fake single=io; single.pin=0;single.starts=0;single.words=0;
+    Fake single=io; single.pin=0;single.starts=0;single.words=0;single.stops=0;
     single.edid[126]=0;fixChecksum(single.edid);
     assert(nm_hdmi::readEDID(single,out,len,status)==nm_hdmi::Status::ok);
     assert(len==128 && single.starts==1 && single.stops==1);
-    std::puts("PASS: EDID base/CTA, checksum fail, bus busy, NAK, base-only");
+    Fake timeout=io; timeout.pin=0;timeout.starts=0;timeout.stalled=true;
+    assert(nm_hdmi::readEDID(timeout,out,len,status)==nm_hdmi::Status::timeout);
+    assert(timeout.pin==0 && timeout.delays>=400);
+    Fake unavailable=io; unavailable.pin=0;unavailable.starts=0;unavailable.inaccessible=true;
+    assert(nm_hdmi::readEDID(unavailable,out,len,status)==nm_hdmi::Status::inaccessible);
+    assert(unavailable.pin==0 && unavailable.starts==0);
+    std::puts("PASS: EDID base/CTA, checksum fail, busy, NAK, timeout, inaccessible, base-only");
 }
