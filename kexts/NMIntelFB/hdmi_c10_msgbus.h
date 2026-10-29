@@ -68,6 +68,15 @@ struct C10Bus {
         }
         return false;
     }
+    // MTL i915 resets the C10 message bus after each completed
+    // read/write to settle the PHY, then clears response W1C flags.
+    C10Result settle(unsigned lane) {
+        io.write32(control(lane),kC10Reset);
+        if(!pollClear(control(lane),kC10Reset))
+            return C10Result::timeout;
+        io.write32(status(lane),kC10ResponseClear);
+        return C10Result::ok;
+    }
     C10Result transact(unsigned lane, uint16_t address, uint8_t value,
                        uint32_t cmd, uint8_t *result) {
         if(lane>1u || address>0xfffu || cmd<1 || cmd>3)
@@ -81,7 +90,10 @@ struct C10Bus {
         uint32_t v=kC10Pending|(cmd<<kC10CommandShift)|
                    (uint32_t(value)<<16)|uint32_t(address);
         io.write32(ctl,v);
-        if(!pollClear(ctl,kC10Pending)) return C10Result::timeout;
+        // Linux reads wait for a READ_ACK directly. Committed and
+        // uncommitted writes wait for the pending bit to deassert.
+        if(cmd!=kC10Read && !pollClear(ctl,kC10Pending))
+            return C10Result::timeout;
         const uint32_t ackCmd=cmd==kC10Read ? kC10ReadAck :
                                cmd==kC10WriteCommitted ? kC10WriteAck : 0;
         if(ackCmd) {
@@ -97,7 +109,7 @@ struct C10Bus {
             if(ack&kC10Error) return C10Result::ackError;
         }
         io.write32(sta,kC10ResponseClear);
-        return C10Result::ok;
+        return settle(lane);
     }
     C10Result read(unsigned lane, uint16_t address, uint8_t &result) {
         return transact(lane,address,0u,kC10Read,&result);

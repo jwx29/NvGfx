@@ -6,7 +6,7 @@
 struct C10Fake {
     uint32_t cmd[2]={}, ack[2]={};
     uint8_t vdr[4096]={};
-    unsigned words=0,writes=0,delays=0;
+    unsigned words=0,writes=0,delays=0,resets=0;
     bool wrong=false,error=false,stuck=false,missing=false;
     uint32_t read32(uint32_t reg) {
         if(missing) return 0xffffffffu;
@@ -31,6 +31,11 @@ struct C10Fake {
         }
         if(reg==nm_hdmi::kC10BControl0||reg==nm_hdmi::kC10BControl0+4) {
             const unsigned i=(reg-nm_hdmi::kC10BControl0)/4;
+            if(value==nm_hdmi::kC10Reset) {
+                cmd[i]=0;
+                ++resets;
+                return;
+            }
             const uint32_t cmdType=(value>>27)&15u;
             const uint32_t address=value&0xfffu;
             cmd[i]=0; // emulate pending completion
@@ -57,6 +62,7 @@ int main() {
     assert(bus.read(0,0xc70u,out)==C10Result::ok && out==4u);
     assert(bus.update(1,0xc70u,0,2u,true)==C10Result::ok);
     assert(bus.read(1,0xc70u,out)==C10Result::ok && out==6u);
+    assert(f.resets==5u); // each successful MTL transaction settles bus
     assert(bus.read(2,0xc70u,out)==C10Result::badArgs);
     f.wrong=true;
     assert(bus.read(0,0xc70u,out)==C10Result::ackType);
