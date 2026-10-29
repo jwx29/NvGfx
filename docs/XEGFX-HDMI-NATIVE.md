@@ -216,3 +216,16 @@ controller must:
    experimental hardware modesets automatic at boot.
 
 None of these display writes is enabled by the stage-3 preflight.
+
+Run all portable HDMI tests before rebuilding kernel components:
+
+```sh
+bash tools/test-hdmi-portable.sh
+# Optional: also validate the preferred DTD against the original monitor EDID:
+HDMI_MONITOR_EDID=/path/to/hdmi-monitor-edid.bin bash tools/test-hdmi-portable.sh
+```
+
+The macOS kernel kext has **not been built on the developer's target
+machine by this commit**. Passing portable unit tests does not prove
+the Intel power/PHY/display programming will work; that part is still
+unimplemented.
