@@ -31,6 +31,38 @@ The Linux connector numbers are not hardware port IDs.
 `NMIntelFB` firmware-console takeover cannot light HDMI, which needs
 native i915 KMS or a correctly integrated Intel modesetting bridge.
 
+### Confirmed HDMI DDC/GMBUS routing (Linux, 2026-10-29)
+
+```text
+/sys/class/drm/card1-HDMI-A-1/ddc
+  -> /sys/devices/pci0000:00/0000:00:02.0/i2c-3
+/sys/class/drm/card1-HDMI-A-1/ddc/name
+  -> i915 gmbus dpb
+```
+
+For the **Meteor Lake** PCH, the i915 `gmbus_pins_mtp` table maps
+**`dpb` to `GMBUS_PIN_2`** (hardware GMBUS selection **2**,
+GPIO_2). The `i2c-3` Linux adapter index is merely an assigned I2C
+adapter number, not the GMBUS pin ID.
+
+Older WhateverGreen Apple framebuffer documentation identifies
+`busId=5` with the *older* GMBUS_PIN_DPB convention; that is **not**
+evidence that 5 is correct for the new Meteor Lake/GMBUS implementation.
+WhateverGreen framebuffer patch properties apply to Apple's framebuffer
+tables and are not consumed by the custom `NMIntelFB` driver.
+
+Relevant upstream code:
+https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_gmbus.c
+
+The running Nobara Linux kernel does not expose `i915_vbt` under
+`/sys/kernel/debug/dri/*`, though `i915_display_info` works.
+This does not mean the firmware lacks a VBT. Optional alternatives:
+`i915_opregion` (if exported) or `intel_bios_dumper` (if compatible
+with firmware). The known pin/path information suffices to move forward
+on a dedicated, **read-only** HDMI EDID/DDC probe stage. It does not
+suffice to enable pipe B and switch on HDMI without display-engine
+power/PLL/PHY programming.
+
 ### Key blockers in the XeGfx branch
 
 - `gpu/xegfx/shim/src/xnu/xg_kext.cpp` sets
