@@ -133,6 +133,10 @@ class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
     IOLock *fDDCLock = nullptr; // protects opt-in GMBUS probe against stop()
+    // This is diagnostic connector state, NOT an IOFramebuffer connection.
+    // -1=unknown, 0=DDC NAK (unresponsive), 1=valid EDID read.
+    int fHDMIDDCState = -1;
+    uint32_t fHDMIDDCGeneration = 0, fHDMIDDCProbeCount = 0;
     IOMemoryMap *fMMIO = nullptr;
     IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out surface (NVIDIA frames land here)
     // WindowServer paces an accelerated display on its VBL interrupt: the NVIDIA display pipe completes each frame on it.
@@ -331,7 +335,9 @@ IOReturn NMIntelFB::probeHDMIEDID()
         return kIOReturnNotReady;
     }
 
-    // Do not expose stale EDID if a later probe fails or the cable is removed.
+    // Revalidate the HDMI EDID every time; do not serve stale display
+    // identity after a disconnect. The connector is not advertised to
+    // WindowServer until a native DDI B scanout actually exists.
     removeProperty("NMIntelFBHDMIEDID");
     setProperty("NMIntelFBHDMIEDIDStatus", "reading");
     uint8_t edid[256] = {};
@@ -352,8 +358,30 @@ IOReturn NMIntelFB::probeHDMIEDID()
     const char *status = result == nm_hdmi::Status::ok && !published ?
         "allocation-failed" : nm_hdmi::statusName(result);
     setProperty("NMIntelFBHDMIEDIDStatus", status);
-    IFBLOG("HDMI DDC/GMBUS2 one-shot probe on DDI B: %s, %lu validated bytes, GMBUS2=0x%08x (no modeset)",
-           status, (unsigned long)(published ? length : 0), gmbus2);
+
+    // EDID is direct evidence of a responding HDMI sink. NAK means DDC
+    // did not acknowledge: report "unresponsive" instead of claiming an
+    // HPD-level physical disconnection. Busy, timeouts and invalid bytes
+    // are "unknown", never proof the monitor was unplugged.
+    const int nextState = published ? 1 :
+        result == nm_hdmi::Status::nak ? 0 : -1;
+    if (nextState != fHDMIDDCState) ++fHDMIDDCGeneration;
+    fHDMIDDCState = nextState;
+    ++fHDMIDDCProbeCount;
+    setProperty("NMIntelFBHDMIDDCState", nextState == 1 ? "connected" :
+                nextState == 0 ? "unresponsive" : "unknown");
+    setProperty("NMIntelFBHDMIDDCGeneration", (uint64_t)fHDMIDDCGeneration, 32);
+    setProperty("NMIntelFBHDMIDDCProbeCount", (uint64_t)fHDMIDDCProbeCount, 32);
+    // Never signal kIOFBConnectInterruptType here: this class still owns
+    // only eDP pipe A, not an independent HDMI IOFramebuffer.
+    if (fHDMIDDCProbeCount <= 8 || (fHDMIDDCProbeCount % 32) == 0 ||
+        (nextState != -1 && fHDMIDDCGeneration != 0 &&
+         nextState != 1)) {
+        IFBLOG("HDMI DDC/GMBUS2 probe on DDI B: %s, state=%s, generation=%u, %lu bytes, GMBUS2=0x%08x (no modeset)",
+               status, nextState == 1 ? "connected" :
+                       nextState == 0 ? "unresponsive" : "unknown",
+               fHDMIDDCGeneration, (unsigned long)(published ? length : 0), gmbus2);
+    }
     IOLockUnlock(fDDCLock);
     bzero(edid, sizeof(edid)); // limit lifetime of monitor's serial/EDID
     return published ? kIOReturnSuccess : kIOReturnError;
@@ -681,6 +709,9 @@ bool NMIntelFB::start(IOService *provider)
     // setProperties. Do not fail boot if the diagnostic lock is unavailable.
     fDDCLock = IOLockAlloc();
     setProperty("NMIntelFBHDMIEDIDStatus", fDDCLock ? "not-requested" : "unavailable");
+    setProperty("NMIntelFBHDMIDDCState", "unknown");
+    setProperty("NMIntelFBHDMIDDCGeneration", 0ull, 32);
+    setProperty("NMIntelFBHDMIDDCProbeCount", 0ull, 32);
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);

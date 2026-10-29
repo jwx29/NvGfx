@@ -101,9 +101,14 @@ SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CT
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
            "1 = no NVIDIA display: Metal device for apps only, WindowServer on the GPU that owns the display");
 #endif
-// 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, IOFBDependentIndex 4): WindowServer composites
-// that panel on the NVIDIA card and the display-pipe copy path below writes each frame into the Intel scan-out surface.
+// Four NVIDIA head slots plus the Intel built-in panel in slot 4.
+// XeGfx additionally reserves slot 5 for a *future* native HDMI framebuffer.
+// Reserving a slot does NOT publish a display or initialise DDI B.
+#ifdef NMX_XEGFX
+static const unsigned kNvMaxFB = 6;
+#else
 static const unsigned kNvMaxFB = 5;
+#endif
 static unsigned gNvHeadsPublished = 0, gNvHeadsRegistered = 0;
 static unsigned gNvHeadsPiped = 0;
 // The Intel built-in panel (head 4) joins only when this is 1. Off by default while the path is proven: a write at run
@@ -354,7 +359,13 @@ public:
             ALOG("%s is on another device -- not ours", newService->getName());
             return true;
         }
-        idx = 4;
+        // Preserve the current built-in head 4 routing. Only an explicit
+        // second-framebuffer marker AND dependent index 5 can select HDMI
+        // head 5; never reinterpret the existing NMIntelFB's index 0.
+        const bool hdmiHead =
+            newService->getProperty("XeGfxNativeHDMIFramebuffer") == kOSBooleanTrue &&
+            num && num->unsigned32BitValue() == 5u;
+        idx = hdmiHead ? 5u : 4u;
 #endif
         const char *what = "kept";
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
@@ -546,7 +557,7 @@ public:
                 break;
             }
             if (fFBRegistered & (1u << i)) continue;
-            if (i == 4 && !gNvIgpu) break;   // the Intel panel waits for debug.nvaccel_igpu=1
+            if (i >= 4 && !gNvIgpu) break;   // all Intel heads wait for nvaccel_igpu=1
             unsigned b = fDM->getFramebufferCount();
             ALOG("  %s: calling found_framebuffer(%s index %u) -- count before %u", why, fb->getName(), i, b);
             fDM->found_framebuffer((IOFramebuffer *)fb);

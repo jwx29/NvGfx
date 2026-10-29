@@ -40,3 +40,52 @@ Native implementation milestones:
 
 Linux i915 hotplug design: https://origin.kernel.org/doc/html/latest/gpu/intel-display/hotplug.html
 XeGfx internal architecture: gpu/xegfx/docs/HOW-IT-WORKS.md.
+
+## HDMI bring-up stage 2: DDC state and second-head routing (opt-in)
+
+The macOS DDI B GMBUS pin 2 path has produced an **exact 256-byte match**
+against the Linux EDID of the HP 25x monitor. That proves DDC, not HDMI
+video. Two follow-on, safely dormant infrastructure changes are now present:
+
+- NMIntelFB records every manually requested DDC probe as
+  `NMIntelFBHDMIDDCState = connected | unresponsive | unknown`,
+  plus `NMIntelFBHDMIDDCGeneration` and `NMIntelFBHDMIDDCProbeCount`.
+  `connected` means valid EDID; `unresponsive` means GMBUS NAK;
+  power-gated, busy and checksum errors are `unknown`, **not** unplug proof.
+  No IOFramebuffer connect notification is issued on this single eDP FB.
+- NVAccel reserves **index 5** for a future HDMI native framebuffer
+  while preserving the existing **index 4** eDP path. Head 5 is selected
+  only when a genuinely separate IOFramebuffer publishes both
+  `XeGfxNativeHDMIFramebuffer = true` and `IOFBDependentIndex = 5`.
+  The new head is NOT created or registered by this stage and cannot
+  produce HDMI video on its own.
+
+To poll explicit DDC connectivity on macOS (no boot-time polling):
+
+```sh
+cd ~/src/NvGfx-merge-test
+xcrun clang -Wall -Wextra -Werror -framework IOKit -framework CoreFoundation \
+  tools/hdmi-edid-probe.c -o hdmi-edid-probe
+sudo ./hdmi-edid-probe --watch 5
+```
+
+Stop with Ctrl-C. Connect/disconnect an HDMI monitor to observe the DDC
+state and generation. Keep the poll interval >= 2 s. Polling is diagnostic
+and should not be left running unnecessarily; monitor power-save behavior
+can cause occasional NAK/unknown results even with a physically plugged cable.
+
+Remaining critical HDMI video work:
+
+1. Implement proper, coordinated Intel MTL display-power wells, DDI B
+   clock/PHY and TMDS transmitter configuration using the version-matched
+   Linux i915 sequences, preserving firmware eDP A, its PLL and CDCLK.
+2. Allocate and pin a second genuine GPU-scanout surface in GGTT and
+   initialise free pipe/transcoder/plane with EDID-validated 1080p60 timings.
+3. Create a separately owned IOFramebuffer using the explicit head-5
+   marker, independent VBL, lifecycle and NVAccel copy destination.
+4. Add real HPD IRQ handling, encoder shutdown, resume and rollback.
+
+Do NOT toggle TRANS_CONF_B bit31 as a shortcut. In particular, recent
+i915 MTL+ HDMI enable ordering configures/enables the port before
+the transcoder; a partial register sequence risks hanging the desktop.
+Source: https://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg385935.html
