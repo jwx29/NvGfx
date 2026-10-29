@@ -527,8 +527,19 @@ IOReturn NMIntelFB::dryRunHDMINative()
     IOSleep(40);
     const uint32_t after=rd(FRMCOUNT(0));
     NMHDMIMMIO powerIO={fRegs};
+    const nm_hdmi::MtlPowerSnapshot wells = nm_hdmi::inspectMtlBPower(powerIO);
+    // MTL DC_STATE_EN (Linux i915 intel_display_regs.h): this is a
+    // read-only report, NOT a DC_OFF wakeref. A future write backend must
+    // coordinate display DMC/PSR and acquire DC_OFF separately.
+    const uint32_t dcState = rd(0x45504u);
+    setProperty("NMIntelFBHDMIPowerWellStatus", nm_hdmi::mtlPowerName(wells.status));
+    setProperty("NMIntelFBHDMIDCStateEnable", dcState, 32);
+    setProperty("NMIntelFBHDMIDCPolicyStatus",
+                dcState == 0xffffffffu ? "dc-state-inaccessible" :
+                (dcState & ((1u<<30) | 0xbu)) ? "dc-states-enabled-no-dc-off-ownership" :
+                "dc-states-disabled-wakeref-still-required");
     if (after-before == 0 || after-before >= 16 ||
-        nm_hdmi::inspectMtlBPower(powerIO).status != nm_hdmi::MtlPowerStatus::on ||
+        wells.status != nm_hdmi::MtlPowerStatus::on ||
         (rd(TRANSCONF(1)) & kEnable) ||
         (rd(PLANE_CTL(1)) & kEnable) ||
         (rd(0x61400u) & kEnable) ||

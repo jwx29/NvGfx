@@ -38,6 +38,9 @@ int main(void) {
     show(fb,CFSTR("NMIntelFBHDMINativeStatus"),"Native HDMI state");
     show(fb,CFSTR("NMIntelFBHDMINativeMissingStage"),"First missing backend stage");
     show(fb,CFSTR("NMIntelFBHDMINativeStagesApplied"),"Hardware stages applied");
+    show(fb,CFSTR("NMIntelFBHDMIPowerWellStatus"),"PW_2/PW_B power");
+    show(fb,CFSTR("NMIntelFBHDMIDCStateEnable"),"DC_STATE_EN raw");
+    show(fb,CFSTR("NMIntelFBHDMIDCPolicyStatus"),"DC state policy");
     puts("This diagnostic has not enabled an HDMI display.");
     IOObjectRelease(fb);
     return 0;
