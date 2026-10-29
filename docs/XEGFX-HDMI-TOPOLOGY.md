@@ -8,13 +8,24 @@ Linux data supplied 2026-10-29, Nobara Linux kernel 7.2.9, Intel i915 DRM:
 - `card1-HDMI-A-1`: connected/enabled, 1920×1080 and other modes,
   256-byte EDID.
 - `card1-DP-1` through `card1-DP-4`: disconnected.
-- The Linux diagnostic had no available `i915_display_info` output, so
-  the exact DDI port, encoder, CRTC and active transcoder remain unknown.
+- **eDP-1 uses DDI A / PHY A, CRTC pipe A**, 1920×1200 @ 60 Hz,
+  encoder 507 and connector 508 (Linux-assigned IDs).
+- **HDMI-A-1 uses DDI B / PHY B, CRTC pipe B**, 1920×1080 @
+  **144 Hz**, encoder 516 and connector 517 (Linux-assigned IDs).
+- HDMI mode on pipe B: pixel clock 346500 kHz, htotal 2080,
+  hsync 1968..2000, vtotal 1157, vsync 1083..1088,
+  active output 1920×1080 at 8 bits per component.
+- Also advertised: 1920×1080 @ 60 Hz with 148500 kHz pixel clock;
+  prefer this conservative mode for the first *future* hardware test.
+- `i915_display_info` names DDI B/PHY B explicitly. The running pipe
+  B assignment is an observed choice of the Linux DRM driver, **not**
+  a permanent physical relationship that macOS should assume.
 
 This confirms HDMI is physically driven by Intel i915, **not** a discrete
-GPU. It does *not* prove which DDI/HPD registers, retimers, PLLs, and PHYs
-a macOS driver must initialise. The connector number HDMI-A-1 is a Linux
-enumeration, not a hardware port ID.
+GPU, and establishes the HDMI **DDI B / PHY B** route. It does *not*
+prove that macOS has powered the same PHY, that HDMI hotplug is active,
+or which VBT, PLL, power-domain and PHY programming sequence is safe.
+The Linux connector numbers are not hardware port IDs.
 
 **The firmware only initialises the internal panel.** Thus an
 `NMIntelFB` firmware-console takeover cannot light HDMI, which needs
@@ -35,20 +46,25 @@ native i915 KMS or a correctly integrated Intel modesetting bridge.
 - Disabling both i915 guards with no ownership coordination risks
   resetting the functional internal eDP panel and its firmware scanout.
 
-### Linux evidence needed for a safe port
+### Read-only macOS hardware-reference diagnostics
 
-The updated `tools/hdmi-linux-probe.sh` now also reads Linux DRM
-`/sys/kernel/debug/dri/*/state` and optionally runs `modetest -M i915`
-or `drm_info`. These show connector → encoder → CRTC/pipe associations
-and the running mode. They do not modify DRM state.
+With this evidence, `NMIntelFB` publishes the hardware-specific
+reference only when the PCI identity exactly matches Intel 8086:7d55,
+Lenovo 17aa:3813. It snapshots the raw pipe B transcoder/primary plane
+registers without claiming that HDMI is connected or switching modes:
 
 ```sh
-sudo mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
-sudo bash tools/hdmi-linux-probe.sh > hdmi-linux-details.txt
+ioreg -p IOService -l -w0 -c NMIntelFB | grep 'NMIntelFBHDMI'
 ```
 
-Test with HDMI connected and active. No OpenCore connector patch is
-required for evidence collection.
+The register snapshot is taken during framebuffer startup and is
+**not a hotplug detector**. The Linux evidence is sufficient to avoid
+guessing the physical DDI route; further Linux probe captures are not
+needed for this mapping.
+
+No new OpenCore connector patch is needed for this diagnostic.
+Do not enable `i915_disable_display=0` or force `xegfx_no_display=0`
+on the accelerated desktop: those bypass the eDP preservation guards.
 
 ### Proposed native implementation stages
 

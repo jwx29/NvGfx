@@ -435,10 +435,14 @@ bool NMIntelFB::adoptFirmwareMode()
         return false;
     }
     if (candidates > 1) {
-        IFBLOG("%d lit planes match console geometry; selecting first as before (cannot disambiguate eDP/HDMI from size alone)", candidates);
+        IFBLOG("%d lit planes match console geometry; ambiguous eDP/HDMI selection, using first matching pipe", candidates);
         for (int p = 0; p < 4; ++p) {
-            uint32_t ctl = rd(PLANE_CTL(p));
-            if ((rd(TRANSCONF(p)) & kEnable) && (ctl & kEnable)) { chosen = p; break; }
+            const uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
+            if (!(conf & kEnable) || !(ctl & kEnable) || fmtOf(ctl) != 8 || tileOf(ctl) != 0) continue;
+            const uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FFu;
+            const uint32_t width = (size & 0xFFFFu) + 1u, height = (size >> 16) + 1u;
+            if (width == console.v_width && height == console.v_height &&
+                stride * 64u == console.v_rowBytes) { chosen = p; break; }
         }
     }
     setProperty("NMIntelFBFirmwarePipeMatches", candidates, 32);
@@ -514,7 +518,22 @@ bool NMIntelFB::start(IOService *provider)
     if (!fMMIO || !ap) { IFBLOG("BAR0 or BAR2 is not mapped - leaving the firmware screen"); OSSafeReleaseNULL(fMMIO); return false; }
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
-    if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    // Verified on Linux i915 for Lenovo 17aa:3813 / Intel 8086:7d55:
+    // eDP-1 = DDI A / PHY A / pipe A, HDMI-A-1 = DDI B / PHY B / pipe B.
+    // A read-only snapshot, NOT HDMI link training or a second framebuffer.
+    // Do not infer hotplug/EDID from these raw registers while power wells
+    // may be off. Never touch DDI/pipe B display state from this path.
+    if (fPCI->configRead16(kIOPCIConfigDeviceID) == 0x7d55u &&
+        fPCI->configRead16(0x2cu) == 0x17aau &&
+        fPCI->configRead16(0x2eu) == 0x3813u) {
+        setProperty("NMIntelFBHDMIReferenceDDI", 1ull, 32);
+        setProperty("NMIntelFBHDMIReferencePipe", 1ull, 32);
+        setProperty("NMIntelFBHDMITransconfB", rd(TRANSCONF(1)), 32);
+        setProperty("NMIntelFBHDMIPlaneCtlB", rd(PLANE_CTL(1)), 32);
+        IFBLOG("Linux-confirmed HDMI reference: DDI B/PHY B, pipe B; raw firmware TRANSCONF_B=0x%08x PLANE_CTL_B=0x%08x (read only, no modeset)",
+               rd(TRANSCONF(1)), rd(PLANE_CTL(1)));
+    }
+    if (!adoptFirmwareMode() { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Scan out at the boot console's address (what IONDRV uses), never BAR2 + PLANE_SURF: on display 14 CPU access to
     // stolen memory through the BAR can hang the machine (Linux i915 Wa_22018444074).
     {

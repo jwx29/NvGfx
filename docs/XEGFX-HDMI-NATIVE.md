@@ -10,7 +10,13 @@ deliberately reserves the firmware console's stolen-memory allocation and
 checks that i915 has left its scanout alone. i915's native KMS must first
 be isolated and integrated with NMIntelFB, NVAccel and AGDC.
 
-To find the actual DDI/port mapping, boot Linux with HDMI plugged in, then:
+The Linux i915 capture now confirms a physical **DDI B / PHY B** HDMI
+connector (HDMI-A-1), using **pipe B** in that particular session at
+1920×1080/144 Hz. Internal eDP is on DDI A/PHY A and pipe A. The same
+HDMI monitor advertises 1920×1080/60 Hz, a better initial test mode.
+See `docs/XEGFX-HDMI-TOPOLOGY.md`.
+
+For additional kernel display diagnostics, Linux can still report:
 
 ```bash
 sudo mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
@@ -19,12 +25,13 @@ bash tools/hdmi-linux-probe.sh | tee hdmi-linux.txt
 
 Optionally re-run with `sudo bash tools/hdmi-linux-probe.sh` to collect
 i915 display debugfs details (but don't run elevated if not needed).
-Run once with HDMI connected and, if necessary, once disconnected; send
-`hdmi-linux.txt` for port-specific integration.
+The DDI port mapping has already been established. Native HDMI output is
+still unavailable on macOS until the display-engine ownership, DDC/EDID,
+PLL/PHY programming and independent framebuffer/accelerator path exist.
 
 Native implementation milestones:
-- Identify physical HDMI connector, DDI/HPD pin and whether output uses
-  native HDMI TMDS, a DP-to-HDMI protocol converter or USB-C alt-mode.
+- Confirm HDMI HPD/DDC and transmitter configuration on DDI B; port B is
+  identified, but its safe power-domain/PHY sequence still needs porting.
 - Use/port i915 connector handling, DDC/EDID, encoder/PLL/PHY modesetting,
   hotplug and modeset lifecycle without resetting firmware eDP pipe A.
 - Provide second validated scanout aperture/framebuffer instance, independent
