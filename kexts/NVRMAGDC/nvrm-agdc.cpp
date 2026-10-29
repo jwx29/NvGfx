@@ -18,7 +18,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 // the same AGDC for the Intel GPU over XeGfx (branch xe): IOPresentment pairs a framebuffer with its display pipe only
 // through an AGDC service on the GPU, so without one WindowServer finds no pipe for the boot framebuffer (N-249).
 // Own class, bundle and sysctl names, because NVRMAGDC loads on the same machine.
-extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxAGDC, "0.1", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxAGDC, "0.1.1", _start, _stop) }
 #define NVDADeviceControl XeGfxDeviceControl
 #define NVDAGDCLoader     XeGfxAGDCLoader
 #define AGDC_FB_CLASS     "NMIntelFB"
@@ -58,6 +58,12 @@ extern "C" { KMOD_EXPLICIT_DECL(org.watchthelight.XeGfxAGDC, "0.1", _start, _sto
 #define sysctl__debug_nvrmfb_agdc_client_ack sysctl__debug_xegfx_agdc_client_ack
 #define nvrmfb_agdc_client_set xegfx_agdc_client_set
 #define sysctl__debug_nvrmfb_agdc_client_set sysctl__debug_xegfx_agdc_client_set
+#define nvrmfb_agdc_fbcapex xegfx_agdc_fbcapex
+#define sysctl__debug_nvrmfb_agdc_fbcapex sysctl__debug_xegfx_agdc_fbcapex
+#define nvrmfb_agdc_fbcapex_asked xegfx_agdc_fbcapex_asked
+#define sysctl__debug_nvrmfb_agdc_fbcapex_asked sysctl__debug_xegfx_agdc_fbcapex_asked
+#define nvrmfb_agdc_fbcapex_served xegfx_agdc_fbcapex_served
+#define sysctl__debug_nvrmfb_agdc_fbcapex_served sysctl__debug_xegfx_agdc_fbcapex_served
 #else
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "0.1", _start, _stop) }
 #define AGDC_FB_CLASS     "NVRMNVDAFramebuffer"
@@ -103,6 +109,12 @@ static int    gAgdcClientAck = 1;
 static int    gAgdcClientAck = 0;
 #endif
 static SInt64 gAgdcClientSet = 0;
+#ifdef NMX_XEGFX
+// <wtl> Switch for the extra 0x711 answers below (xegfxagdc_fbcapex=1 or debug.xegfx_agdc_fbcapex=1); off, the replies are
+// the plane-scaler one alone. The masks show which types WindowServer asked for (bit t = type t) and which we served. </wtl>
+static int    gAgdcFbcapex = 0;
+static int    gAgdcFbcapexAsked = 0, gAgdcFbcapexServed = 0;
+#endif
 // Slot-table rescans done while answering 0x980 (see nvdaAgdcRescanForReply).
 static SInt64 gAgdcRescans = 0;
 
@@ -183,41 +195,45 @@ static void nvdaAgdcRescanForReply(IOService *pci)
         FBLOG("AGDC: 0x980 rescan -> %u framebuffer slot(s) (was %u)", gAgdcNFB, before);
 }
 
+#ifdef NMX_XEGFX
+// <wtl>
+// 0x711 types 1 (colour matrix), 2 (gamma), 4 (linearization) and 8 (pipeline scaler) for framebuffer 0, entries as in
+// jwx29's meteor-lake-local fork of this driver (9721b2fd82, 49051fa92b). Needs K5 and the switch; the scaler caps
+// only advertise, XeGfxAccel does no scaling. Anything else goes on to nvdaK5Answer.
+// </wtl>
+static bool xegfxFbcapexAnswer(unsigned long *in, unsigned long inSize, unsigned long *out, unsigned long *outSize)
+{
+    if (!in || !out || !outSize || inSize != sizeof(NVAGDCFBExtCap) || *outSize != sizeof(NVAGDCFBExtCap)) return false;
+    const uint32_t idx = ((const NVAGDCFBExtCap *)in)->fbIndex, type = ((const NVAGDCFBExtCap *)in)->type;
+    if (type < 32) OSBitOrAtomic(1u << type, (volatile UInt32 *)&gAgdcFbcapexAsked);
+    if (!gAgdcK5 || !gAgdcFbcapex || idx != 0 || (type != 1 && type != 2 && type != 4 && type != 8)) return false;
+    NVAGDCFBExtCap *c = (NVAGDCFBExtCap *)out; nvk5_zero(c, sizeof *c);   // in may be out: idx and type are read already
+    c->fbIndex = idx; c->type = type; c->count = 1;
+    uint8_t *e = c->entry[0];
+    nvk5_put32(e, 0x000, 0x80004); nvk5_put32(e, 0x004, 1);   // plane 0
+    if (type == 1) {
+        nvk5_put32(e, 0x010, 1); nvk5_put32(e, 0x024, 0xc0000000); nvk5_put32(e, 0x028, 0x40000000);   // floats -2.0 and 2.0
+    } else if (type == 2) {
+        nvk5_put32(e, 0x010, 0x200); nvk5_put32(e, 0x024, 0x3f800000); nvk5_put32(e, 0x028, 1024);   // 1024 entries, max 1.0
+    } else if (type == 4) {
+        nvk5_put32(e, 0x000, 0x00100000); nvk5_put32(e, 0x00c, 0x41855555);   // non-atomic apply period 16.67 ms
+        nvk5_put32(e, 0x010, 8); nvk5_put32(e, 0x024, 0x3f800000); nvk5_put32(e, 0x028, 1024);   // table type 8, max 1.0, 1024 entries
+    } else {
+        nvk5_put32(e, 0x000, 0xc5); nvk5_put32(e, 0x01c, 1);
+        nvk5_put32(e, 0x024, 64); nvk5_put32(e, 0x028, 64); nvk5_put32(e, 0x02c, 4096); nvk5_put32(e, 0x030, 4096);   // 64 and 4096, as he has them
+        nvk5_put32(e, 0x034, 0x301); nvk5_put32(e, 0x038, 2);
+        nvk5_put32(e, 0x1a4, 1); nvk5_put32(e, 0x1ac, 64); nvk5_put32(e, 0x1b0, 64); nvk5_put32(e, 0x1b4, 4096); nvk5_put32(e, 0x1b8, 4096);
+        nvk5_put32(e, 0x1bc, 0x301); nvk5_put32(e, 0x1c0, 2);
+    }
+    OSBitOrAtomic(1u << type, (volatile UInt32 *)&gAgdcFbcapexServed);
+    return true;
+}
+#endif
+
 IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned long *in, unsigned long inSize,
                                                      unsigned long *out, unsigned long *outSize, IOExternalMethodArguments *args)
 {
     OSAddAtomic64(1, &gAgdcCmds);
-    #ifdef NMX_XEGFX
-        // Diagnostic: log the first 64 AGDC extended-capability requests.
-        static SInt32 g711DebugCount = 0;
-
-        if (cmd == NVK5_CMD_FBCAPEX &&
-            OSIncrementAtomic(&g711DebugCount) <= 64) {
-
-            if (in && inSize == sizeof(NVAGDCFBExtCap)) {
-                const NVAGDCFBExtCap *req =
-                    reinterpret_cast<const NVAGDCFBExtCap *>(in);
-
-                FBLOG(
-                    "X711: fbIndex=%u type=0x%x "
-                    "inSize=%lu outSize=%lu K5=%d",
-                    req->fbIndex,
-                    req->type,
-                    inSize,
-                    outSize ? *outSize : 0UL,
-                    gAgdcK5
-                );
-            } else {
-                FBLOG(
-                    "X711: invalid request "
-                    "in=%p inSize=%lu outSize=%lu",
-                    in,
-                    inSize,
-                    outSize ? *outSize : 0UL
-                );
-            }
-        }
-    #endif
     if (cmd == 1) {
         if (!out || !outSize || *outSize != sizeof(NVAGDCVendorInfo)) return kIOReturnBadArgument;
         NVAGDCVendorInfo *v = (NVAGDCVendorInfo *)out; bzero(v, sizeof *v);
@@ -246,104 +262,9 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
         OSAddAtomic64(1, &gAgdcClientSet);
         return kIOReturnSuccess;
     }
-    #ifdef NMX_XEGFX
-        // Extended colour capabilities for framebuffer slot 0.
-        // Based on the Meteor Lake NMXAGDC implementation.
-        if (gAgdcK5 &&
-            cmd == NVK5_CMD_FBCAPEX &&
-            in && out && outSize &&
-            inSize == sizeof(NVAGDCFBExtCap) &&
-            *outSize == sizeof(NVAGDCFBExtCap)) {
-
-            const NVAGDCFBExtCap *req =
-                reinterpret_cast<const NVAGDCFBExtCap *>(in);
-
-            const uint32_t type = req->type;
-            const uint32_t index = req->fbIndex;
-
-            if (index == 0 &&
-                (type == 1 || type == 2 || type == 4)) {
-
-                NVAGDCFBExtCap *c =
-                    reinterpret_cast<NVAGDCFBExtCap *>(out);
-
-                nvk5_zero(c, sizeof(*c));
-                c->fbIndex = index;
-                c->type = type;
-                c->count = 1;
-
-            uint8_t *e = c->entry[0];
-
-                nvk5_put32(e, 0x000, 0x80004);
-                nvk5_put32(e, 0x004, 1);   // plane 0 mask
-                nvk5_put32(e, 0x008, 0);
-
-                if (type == 2) {
-                    // Gamma: 1024-entry, 3-channel 16-bit table.
-                    nvk5_put32(e, 0x010, 0x200);
-                    nvk5_put32(e, 0x020, 0x00000000);
-                    nvk5_put32(e, 0x024, 0x3f800000);
-                    nvk5_put32(e, 0x028, 1024);
-
-                } else if (type == 4) {
-                    // Linearization capability based on Intel's AGDC response.
-                    // One capability entry, associated with plane 0.
-                    c->count = 1;
-
-                    nvk5_put32(e, 0x000, 0x00100000);
-
-                    // Plane mask (uint64_t): plane 0
-                    nvk5_put32(e, 0x004, 1);
-                    nvk5_put32(e, 0x008, 0);
-
-                    // Non-atomic application period: approximately 16.67 ms
-                    nvk5_put32(e, 0x00c, 0x41855555);
-
-                    // Linearization capability type: uint64_t 8
-                    nvk5_put32(e, 0x010, 8);
-                    nvk5_put32(e, 0x014, 0);
-
-                    // Maximum value: float 1.0
-                    nvk5_put32(e, 0x024, 0x3f800000);
-
-                    // Maximum table size: uint64_t 1024
-                    nvk5_put32(e, 0x028, 1024);
-                    nvk5_put32(e, 0x02c, 0);
-                } else if (type == 8) {
-                    // Pipeline scaler capability, using Intel-derived fields.
-                    // These values advertise capabilities; they don't implement
-                    // scaling in XeGfxAccel.
-                    nvk5_put32(e, 0x000, 0xC5);
-
-                    nvk5_put32(e, 0x01c, 1);
-                    nvk5_put32(e, 0x020, 0);
-
-                    nvk5_put32(e, 0x024, 64);
-                    nvk5_put32(e, 0x028, 64);
-                    nvk5_put32(e, 0x02c, 4096);
-                    nvk5_put32(e, 0x030, 4096);
-                    nvk5_put32(e, 0x034, 0x301);
-                    nvk5_put32(e, 0x038, 2);
-
-                    nvk5_put32(e, 0x1a4, 1);
-                    nvk5_put32(e, 0x1a8, 0);
-                    nvk5_put32(e, 0x1ac, 64);
-                    nvk5_put32(e, 0x1b0, 64);
-                    nvk5_put32(e, 0x1b4, 4096);
-                    nvk5_put32(e, 0x1b8, 4096);
-                    nvk5_put32(e, 0x1bc, 0x301);
-                    nvk5_put32(e, 0x1c0, 2);
-                } else {
-                    // CSC: 3x3 colour-conversion matrix.
-                    nvk5_put32(e, 0x010, 1);
-                    nvk5_put32(e, 0x024, 0xc0000000);
-                    nvk5_put32(e, 0x028, 0x40000000);
-                }
-
-                return kIOReturnSuccess;
-            }
-        }
-    #endif
+#ifdef NMX_XEGFX
+    if (cmd == NVK5_CMD_FBCAPEX && xegfxFbcapexAnswer(in, inSize, out, outSize)) return kIOReturnSuccess;
+#endif
     if (gAgdcK5 && (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX)) {
         IOReturn k5 = nvdaK5Answer(fFB, cmd, in, inSize, out, outSize);
         if (k5 != kIOReturnUnsupported) return k5;
@@ -513,6 +434,11 @@ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_why,  CTLFLAG_RD | CTLFLAG_LOCKED, 
 SYSCTL_STRING(_debug, OID_AUTO, nvrmfb_agdc_fbmap, CTLFLAG_RD | CTLFLAG_LOCKED, gAgdcFBMap, sizeof gAgdcFBMap, "the slot table our 0x980 reports: n, then [i]id per IOFBDependentIndex");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_client_ack, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gAgdcClientAck, 0, "1 = accept WindowServer's 0x2001 client set");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_client_set, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcClientSet, "0x2001 client-set calls accepted");
+#ifdef NMX_XEGFX
+SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_fbcapex, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gAgdcFbcapex, 0, "1 = also answer 0x711 types 1, 2, 4, 8 (needs K5; boot-arg xegfxagdc_fbcapex sets it at load)");
+SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_fbcapex_asked, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcFbcapexAsked, 0, "bit t = a 0x711 request named type t");
+SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_fbcapex_served, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcFbcapexServed, 0, "bit t = a 0x711 request for type t answered by the fbcapex switch");
+#endif
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_rescans, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcRescans, "slot-table rescans done while answering 0x980 (a framebuffer that started after boot)");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_maxfb,   CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcMaxFBOut, 0, "maxFramebuffers in our last 0x980 reply (0 = never asked)");
 SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_asked, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Asked, 0, "bit i = a 0x921/0x711 named index i");
@@ -530,6 +456,10 @@ static void nvdaAgdcRemoveSysctl(void)
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_asked); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_link_mask);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_caps_mask); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_last_refused_idx);
     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_ack); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_set);
+#ifdef NMX_XEGFX
+    sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_fbcapex); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_fbcapex_asked);
+    sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_fbcapex_served);
+#endif
 }
 static void nvdaAgdcInstallSysctl(void)
 {
@@ -542,6 +472,10 @@ static void nvdaAgdcInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_asked); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_link_mask);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_caps_mask); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_last_refused_idx);
     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_ack); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_set);
+#ifdef NMX_XEGFX
+    sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_fbcapex); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_fbcapex_asked);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_fbcapex_served);
+#endif
 }
 
 class NVDAGDCLoader : public IOService {
@@ -557,6 +491,9 @@ bool NVDAGDCLoader::start(IOService *provider)
     { if (nvrm_driver_off()) return false; }
 #endif
     if (!IOService::start(provider)) return false;
+#ifdef NMX_XEGFX
+    { int v = 0; if (PE_parse_boot_argn("xegfxagdc_fbcapex", &v, sizeof v)) gAgdcFbcapex = v != 0; }   // <wtl> A/B switch, off by default </wtl>
+#endif
     nvdaAgdcInstallSysctl(); FBLOG("loaded; idle until `sysctl debug.%s=1`", sysctl__debug_nvrmfb_agdc.oid_name); return true;
 }
 void NVDAGDCLoader::stop(IOService *provider)

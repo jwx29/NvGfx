@@ -65,6 +65,8 @@ Around a userspace check, `debug.xegfx_hold=N` arms a second watchdog that panic
 
 A whole-machine hang leaves neither a panic nor a log. With `xegfx.nvram_trace=1` in `debug.xegfx_env`, a timer writes the running stage, the breadcrumb (`xg_progress`, which names the SYSINIT entry during stage 4) and the newest console line to the NVRAM variable `xegfx-step` every 250 ms while something changed, and syncs it; the previous boot's value moves to `xegfx-step-prev`. It is off by default because it writes NVRAM.
 
+Two switches in `debug.xegfx_env` exist only to A/B the whole-machine stall under heavy I/O (I-116). `xegfx.irqoff_check=0` turns off the interrupts-off checker and its 20 ms wakeup. `xegfx.gtawake=1` takes every GT's power reference after stage 4's GT check, as i915's `forcewake_user` debugfs file does, and `xegfx.gtawake=2` also holds forcewake on all domains, so the GT never enters RC6; both stay held until the next restart and cost iGPU power. zep245's Tiger Lake port stopped its whole-Mac freezes only at the second level. `XeGfxGt` in the registry reports `gtawake-gts`.
+
 `tools/xgprobe.c` is the first client: it opens the render node, reads the DRM version and i915 params, queries the engines, creates a context and, on every legacy ring, runs a softpinned batch that stores a dword into a second buffer, both mapped through the ioctl. i915 refuses pread, pwrite and relocations after Tiger Lake, so the mapping is the only way to get a batch to the GPU.
 
 ## Fences without file descriptors

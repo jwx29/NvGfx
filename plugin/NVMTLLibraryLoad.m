@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
+#include <os/lock.h>   // <wtl>
 extern char **environ;
 
 void nvlog(const char *fmt, ...);
@@ -45,6 +46,8 @@ typedef int (*nvmtl_lower_fn)(const uint8_t *, size_t, uint8_t **, size_t *, cha
 static nvmtl_lower_fn xlate_lower;
 typedef int (*nvmtl_lower_ex_fn)(const uint8_t *, size_t, uint32_t, uint8_t **, size_t *, uint32_t *, char *, size_t);
 static nvmtl_lower_ex_fn xlate_lower_ex;
+typedef int (*nvmtl_to_uniform_fn)(const uint8_t *, size_t, uint8_t **, size_t *, char *, size_t);
+static nvmtl_to_uniform_fn xlate_to_uniform;   /* the table of an unlowered module moved to a Uniform block */
 static nvmtl_translate_fn xlate;
 static char gXlateTag[80] = "untagged";
 static void nvmtl_translator_cache_tag(const char *path, char *tag, size_t capacity) {
@@ -113,6 +116,8 @@ static int nvmtl_xlate_ready(void) {
                 xlate ? "" : " - it has NO nvmtl_translate"); }
         xlate_lower = (nvmtl_lower_fn)dlsym(h, "nvmtl_lower_buffer_addresses");
         xlate_lower_ex = (nvmtl_lower_ex_fn)dlsym(h, "nvmtl_lower_buffer_addresses_ex");
+        xlate_to_uniform = (nvmtl_to_uniform_fn)dlsym(h, "nvmtl_table_to_uniform");
+        if (!xlate_to_uniform) nvlog("translate: no nvmtl_table_to_uniform in this translator - a module that address lowering refuses is refused outright while the table is Uniform");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
@@ -171,6 +176,63 @@ static NSString *nvmtl_aircache_dir(void) {
 }
 static _Atomic unsigned long gSpvHit, gSpvMiss, gSpvStored;
 static _Atomic unsigned long gFcHit, gFcMiss, gFcStored;
+// <wtl>
+static _Atomic unsigned long gFcMemoHit, gFcLookups;
+
+// Cache files are written, and their last-use time touched, on one serial utility queue. These ran on the caller's
+// thread: WindowServer's coreanimation.pipelines thread translates shaders on first use and paid an fsync (the atomic
+// write) for each one while a window drag waited on it (upstream nullmoth/nvidia-macos-driver#370). Reads stay on the
+// caller, and so does every memo fill, so a process never reads or translates the same thing twice. NVMTL_CACHE_SYNC_IO=1
+// (or nvrm610.conf) runs the work on the caller again, for an A/B.
+static int nvmtl_cache_sync_io(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_CACHE_SYNC_IO"); on = (e && *e && *e != '0') ? 1 : 0; }
+    return on;
+}
+static dispatch_queue_t gCacheIoQueue;
+// A short-lived process (a tool, a test) can exit with writes still queued; give them up to 2 s to land.
+static void nvmtl_cache_io_drain(void) {
+    if (!gCacheIoQueue) return;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(gCacheIoQueue, ^{ dispatch_semaphore_signal(done); });
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+}
+static dispatch_queue_t nvmtl_cache_io_queue(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gCacheIoQueue = dispatch_queue_create("nvmtl.cache-io", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+        atexit(nvmtl_cache_io_drain);
+        nvlog("cache io: %s", nvmtl_cache_sync_io() ? "synchronous (NVMTL_CACHE_SYNC_IO)" : "cache writes and touches run on nvmtl.cache-io");
+    });
+    return gCacheIoQueue;
+}
+static void nvmtl_cache_io(dispatch_block_t work) {
+    if (nvmtl_cache_sync_io()) { work(); return; }
+    dispatch_async(nvmtl_cache_io_queue(), work);
+}
+// The touch only keeps the trimmer's age order, so once per file per process is enough; memo hits would otherwise
+// queue a block on every lookup.
+static void nvmtl_cache_touch(NSString *path) {
+    if (!path) return;
+    static NSMutableSet<NSString *> *touched; static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    NSString *p = [path copy];
+    os_unfair_lock_lock(&lock);
+    if (!touched) touched = [NSMutableSet set];
+    const BOOL first = ![touched containsObject:p];
+    if (first) [touched addObject:p];
+    os_unfair_lock_unlock(&lock);
+    if (first) nvmtl_cache_io(^{ utimes(p.fileSystemRepresentation, NULL); });
+}
+// One line after the first 500 function-constant lookups and every 2000 after: a boot log then shows whether the
+// process (WindowServer above all) is translating or reading. Disk hits are the hits the memo did not serve.
+static void nvmtl_fc_note_lookup(void) {
+    const unsigned long n = atomic_fetch_add(&gFcLookups, 1) + 1;
+    if (n != 500 && !(n > 500 && (n - 500) % 2000 == 0)) return;
+    const unsigned long hit = gFcHit, memo = gFcMemoHit;
+    nvlog("fc cache: %lu lookups: %lu memo hit, %lu disk hit, %lu miss, %lu stored", n, memo, hit > memo ? hit - memo : 0,
+          (unsigned long)gFcMiss, (unsigned long)gFcStored);
+}
+// </wtl>
 
 static _Atomic unsigned long long gSpvAdded;
 static _Atomic int gSpvTrimRunning;
@@ -348,7 +410,7 @@ static NSString *nvmtl_spvcache_dir(void) {
         NSString *own = nil;
         { char ucd[PATH_MAX]; const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
           if (n > 0 && n <= sizeof ucd) own = [[@(ucd) stringByAppendingPathComponent:@(getprogname())] stringByAppendingPathComponent:@"nvmtl/spvcache"]; }
-        if (nvmtl_dir_writable(beside)) dir = beside;
+        if (nvmtl_dir_writable(beside)) { dir = beside; nvlog("spvcache: caching in %s", beside.UTF8String); }   // <wtl>
         else if (nvmtl_dir_writable(own)) { dir = own; nvlog("spvcache: %s is not writable here - caching in %s", beside.UTF8String, own.UTF8String); }
         // </wtl>
         else if (nvmtl_dir_writable(tmp)) { dir = tmp; nvlog("spvcache: %s is not writable here - caching in %s", beside.UTF8String, tmp.UTF8String); }
@@ -674,7 +736,10 @@ static NSString *nvmtl_air_to_text(NSData *air) {
     gAirMiss++;
     NSString *memoryIR = nvmtl_air_in_memory(air);
     if (memoryIR.length) {
-        if ([memoryIR writeToFile:cache atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++;
+        // <wtl>
+        NSString *text = [memoryIR copy], *file = [cache copy];
+        nvmtl_cache_io(^{ if ([text writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++; });
+        // </wtl>
         return nvmtl_air_text_made(memoryIR);   // <wtl>
     }
 
@@ -691,7 +756,10 @@ static NSString *nvmtl_air_to_text(NSData *air) {
         NSError *mkerr = nil;
         [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir()
                                   withIntermediateDirectories:YES attributes:nil error:&mkerr];
-        if ([ll writeToFile:cache atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++;
+        // <wtl>
+        NSString *text = [ll copy], *file = [cache copy];
+        nvmtl_cache_io(^{ if ([text writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++; });
+        // </wtl>
     }
     return nvmtl_air_text_made(ll);   // <wtl>
 }
@@ -893,21 +961,28 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
         NSData *spvData = getenv("NVMTL_SPVCACHE_OFF") ? nil : [NSData dataWithContentsOfFile:spvp];
         int hit = spvData.length >= 20 && *(const uint32_t *)spvData.bytes == 0x07230203u;
         uint8_t *spv = NULL; size_t spvn = 0; char err[512] = { 0 };
-        if (hit) { gSpvHit++; utimes(spvp.fileSystemRepresentation, NULL); }
+        if (hit) { gSpvHit++; nvmtl_cache_touch(spvp); }   // <wtl>
         else {
             gSpvMiss++;
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
                 nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
-            { NSError *werr = nil;
-              if (spvp && [spvData writeToFile:spvp options:NSDataWritingAtomic error:&werr]) {
-                  gSpvStored++;
-                  atomic_fetch_add_explicit(&gSpvAdded, (unsigned long long)spvData.length, memory_order_relaxed);
-              } else if (spvp) {
-                  nvlog("spvcache: STORE FAILED %s (%zu bytes): %s", spvp.lastPathComponent.UTF8String,
-                        (size_t)spvData.length, werr.localizedDescription.UTF8String ?: "?");
-              } }
+            // <wtl>
+            if (spvp) {
+                NSData *stored = [spvData copy]; NSString *file = [spvp copy];
+                nvmtl_cache_io(^{
+                    NSError *werr = nil;
+                    if ([stored writeToFile:file options:NSDataWritingAtomic error:&werr]) {
+                        gSpvStored++;
+                        atomic_fetch_add_explicit(&gSpvAdded, (unsigned long long)stored.length, memory_order_relaxed);
+                    } else {
+                        nvlog("spvcache: STORE FAILED %s (%zu bytes): %s", file.lastPathComponent.UTF8String,
+                              (size_t)stored.length, werr.localizedDescription.UTF8String ?: "?");
+                    }
+                });
+            }
+            // </wtl>
         }
         if (spv && xlate_free) xlate_free(spv, spvn);
         { double ms = (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6;
@@ -1082,10 +1157,15 @@ static NSDictionary *nvmtl_index_metallib_disk(NSData *lib, NSData *key, NSDicti
         NSArray *ext = nvmtl_externs_of_airs(ai) ?: @[];
         NSData *out = [NSPropertyListSerialization dataWithPropertyList:@{@"v": @1, @"length": @(lib.length), @"blobs": rec, @"externs": ext}
                                                                  format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
-        NSString *tmp = [p stringByAppendingFormat:@".%d.tmp", getpid()];
-        if (out && [out writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, p.fileSystemRepresentation) == 0)
-            nvlog("library index: disk record stored (%lu blobs, %lu externs) %s", (unsigned long)rec.count, (unsigned long)ext.count, p.lastPathComponent.UTF8String);
-        else { unlink(tmp.fileSystemRepresentation); nvlog("library index: could not store the disk record %s", p.lastPathComponent.UTF8String); }
+        // <wtl>
+        NSString *file = [p copy], *tmp = [p stringByAppendingFormat:@".%d.tmp", getpid()];
+        const unsigned long blobs = (unsigned long)rec.count, externs = (unsigned long)ext.count;
+        nvmtl_cache_io(^{
+            if (out && [out writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, file.fileSystemRepresentation) == 0)
+                nvlog("library index: disk record stored (%lu blobs, %lu externs) %s", blobs, externs, file.lastPathComponent.UTF8String);
+            else { unlink(tmp.fileSystemRepresentation); nvlog("library index: could not store the disk record %s", file.lastPathComponent.UTF8String); }
+        });
+        // </wtl>
     }
     return fns;
 }
@@ -1149,11 +1229,17 @@ NSData *nvmtl_libkey_for_file(NSString *path, NSData *lib, const struct stat *be
     r.mts = now.st_mtimespec.tv_sec; r.mtn = now.st_mtimespec.tv_nsec; r.cts = now.st_ctimespec.tv_sec; r.ctn = now.st_ctimespec.tv_nsec;
     memcpy(r.edge, edge, sizeof edge); memcpy(r.key, key.bytes, sizeof r.key);
     [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir() withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *tmp = [rp stringByAppendingFormat:@".%d.tmp", getpid()];
-    if ([[NSData dataWithBytes:&r length:sizeof r] writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, rp.fileSystemRepresentation) == 0) {
-        const unsigned long st = atomic_fetch_add(&gLkStored, 1) + 1;
-        if (!(st & (st - 1))) nvlog("library key memo: stored %lu (%lu B %s)", st, (unsigned long)lib.length, path.lastPathComponent.UTF8String);
-    } else { unlink(tmp.fileSystemRepresentation); nvlog("library key memo: could not store %s", name); }
+    // <wtl>
+    NSString *tmp = [rp stringByAppendingFormat:@".%d.tmp", getpid()], *file = [rp copy], *base = [path.lastPathComponent copy], *entry = @(name);
+    NSData *record = [NSData dataWithBytes:&r length:sizeof r];
+    const unsigned long libBytes = (unsigned long)lib.length;
+    nvmtl_cache_io(^{
+        if ([record writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, file.fileSystemRepresentation) == 0) {
+            const unsigned long st = atomic_fetch_add(&gLkStored, 1) + 1;
+            if (!(st & (st - 1))) nvlog("library key memo: stored %lu (%lu B %s)", st, libBytes, base.UTF8String);
+        } else { unlink(tmp.fileSystemRepresentation); nvlog("library key memo: could not store %s", entry.UTF8String); }
+    });
+    // </wtl>
     return key;
 }
 NSDictionary<NSString *, NSData *> *nvmtl_translate_metallib_k(NSData *lib, NSData *knownKey, NSDictionary **stageOut, NSDictionary **airOut);
@@ -1229,6 +1315,24 @@ static NSString *nvmtl_link_dump_dir(void) {
 static __thread int g_fc_expect_link;
 void nvmtl_fc_expect_link(int on) { g_fc_expect_link = on; }
 BOOL nvmtl_needs_visible_link(NSString *air, NSString *why);
+// Writes the module handed to the translator (AIR text after linking, stage, constant values, error) to <dir>/fc-<pid>-<n>,
+// so a translation can be replayed offline with the same input. Nothing is written when dir is unset.
+static void nvmtl_fc_dump(const char *dd, NSString *ll, NSString *stage, const uint32_t *idx, const uint32_t *sizes,
+                          const uint8_t *const *payloads, size_t n, const char *e)
+{
+    if (!dd || !*dd) return;
+    NSString *dir = @(dd); static _Atomic unsigned seq;
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *base = [dir stringByAppendingFormat:@"/fc-%d-%u", getpid(), atomic_fetch_add(&seq, 1)];
+    [ll writeToFile:[base stringByAppendingString:@".ll"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSMutableString *meta = [NSMutableString stringWithFormat:@"stage %@\nerror %s\n", stage, e ? e : ""];
+    for (size_t i = 0; i < n; i++) {
+        [meta appendFormat:@"fc %u size %u bytes", idx[i], sizes[i]];
+        for (uint32_t b = 0; b < sizes[i] && payloads[i]; b++) [meta appendFormat:@" %02x", payloads[i][b]];
+        [meta appendString:@"\n"];
+    }
+    [meta writeToFile:[base stringByAppendingString:@".txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *idx, const uint32_t *sizes,
                                 const uint8_t *const *payloads, size_t n, NSString **err)
 {
@@ -1236,26 +1340,15 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
     if (!xlate_fc) { if (err) *err = @"this translator has no nvmtl_translate_fc — rebuild nvmtl_translate"; return nil; }
     if (!ll || !stage.length) { if (err) *err = @"no AIR kept for this function"; return nil; }
     uint8_t *out = NULL; size_t out_len = 0; char e[512] = {0};
+    // NVMTL_FC_DUMP_ALL=<dir>: keep every module before it is translated, including one whose translation never returns.
+    nvmtl_fc_dump(getenv("NVMTL_FC_DUMP_ALL"), ll, stage, idx, sizes, payloads, n, NULL);
     if (xlate_fc(ll.UTF8String, stage.UTF8String, idx, sizes, payloads, n, &out, &out_len, e, sizeof e) != 0) {
         if (g_fc_expect_link && nvmtl_needs_visible_link(ll, @(e)))
             nvlog("function constants: this function calls linked visible functions; it is specialized when its pipeline is created");
         else nvlog("function constants: re-translate FAILED: %s", e);
         // NVMTL_FC_FAIL_DUMP=<dir>: keep the refused module (AIR text, stage, constant values, error) so the refusal can be
         // replayed offline against the translator; nothing is written unless the variable is set.
-        const char *dd = getenv("NVMTL_FC_FAIL_DUMP");
-        if (dd && *dd) {
-            NSString *dir = @(dd); static _Atomic unsigned seq;
-            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-            NSString *base = [dir stringByAppendingFormat:@"/fc-%d-%u", getpid(), atomic_fetch_add(&seq, 1)];
-            [ll writeToFile:[base stringByAppendingString:@".ll"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            NSMutableString *meta = [NSMutableString stringWithFormat:@"stage %@\nerror %s\n", stage, e];
-            for (size_t i = 0; i < n; i++) {
-                [meta appendFormat:@"fc %u size %u bytes", idx[i], sizes[i]];
-                for (uint32_t b = 0; b < sizes[i] && payloads[i]; b++) [meta appendFormat:@" %02x", payloads[i][b]];
-                [meta appendString:@"\n"];
-            }
-            [meta writeToFile:[base stringByAppendingString:@".txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
+        nvmtl_fc_dump(getenv("NVMTL_FC_FAIL_DUMP"), ll, stage, idx, sizes, payloads, n, e);
         if (err) *err = [NSString stringWithUTF8String:e[0] ? e : "specialization failed"];
         return nil;
     }
@@ -1280,30 +1373,37 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     const BOOL fcCacheOn = !getenv("NVMTL_FCCACHE_OFF");
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:memoKey] : nil;
-    if (hit) { gFcHit++; if (path) utimes(path.fileSystemRepresentation, NULL); return hit; }   // keep the trimmer's age order
+    if (hit) { gFcHit++; gFcMemoHit++; nvmtl_cache_touch(path); nvmtl_fc_note_lookup(); return hit; }   // keep the trimmer's age order (<wtl> off the caller)
     if (fcCacheOn && path) hit = [NSData dataWithContentsOfFile:path];
     // </wtl>
     uint32_t magic = 0;
     if (hit.length >= 20 && hit.length % 4 == 0) {
         memcpy(&magic, hit.bytes, 4);
         if (magic == 0x07230203) {
-            gFcHit++; utimes(path.fileSystemRepresentation, NULL);
+            gFcHit++; nvmtl_cache_touch(path);   // <wtl>
             [nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];   // <wtl>
             nvlog("fc cache: HIT %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
                   (unsigned long)hit.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
                   gFcHit, gFcMiss, gFcStored);
+            nvmtl_fc_note_lookup();   // <wtl>
             return hit;
         }
     }
     gFcMiss++;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
     if (result) {
-        if (path && [result writeToFile:path atomically:YES]) gFcStored++;
+        // <wtl>
+        if (path) {
+            NSData *stored = [result copy]; NSString *file = [path copy];
+            nvmtl_cache_io(^{ if ([stored writeToFile:file atomically:YES]) gFcStored++; });
+        }
+        // </wtl>
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:memoKey cost:result.length];   // <wtl>
         nvlog("fc cache: miss %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
               (unsigned long)result.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
               gFcHit, gFcMiss, gFcStored);
     }
+    nvmtl_fc_note_lookup();   // <wtl>
     return result;
 }
 
@@ -1357,11 +1457,11 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
     const BOOL useCache = memoKey && !getenv("NVMTL_REFLCACHE_OFF") && !getenv("NVMTL_SPVCACHE_OFF");
     if (useCache) {
         NSData *mem = [nvmtl_memo() objectForKey:memoKey];
-        if (mem) { ++gRfHit; if (path) utimes(path.fileSystemRepresentation, NULL); return mem; }
+        if (mem) { ++gRfHit; nvmtl_cache_touch(path); return mem; }   // <wtl>
         NSData *hit = path ? [NSData dataWithContentsOfFile:path] : nil;
         id obj = hit.length ? [NSJSONSerialization JSONObjectWithData:hit options:0 error:NULL] : nil;
         if ([obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) {
-            unsigned long hn = ++gRfHit; utimes(path.fileSystemRepresentation, NULL);
+            unsigned long hn = ++gRfHit; nvmtl_cache_touch(path);   // <wtl>
             [nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];
             // </wtl>
             if (!(hn & (hn - 1))) nvlog("refl cache: HIT %s %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", function ? function->_fname.UTF8String : "?",
@@ -1375,7 +1475,12 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
     NSData *d = [NSData dataWithBytes:j length:jn];
     if (xlate_free) xlate_free(j, jn);
     id obj = d.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
-    if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count] && [d writeToFile:path atomically:YES]) gRfStored++;
+    // <wtl>
+    if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) {
+        NSData *stored = [d copy]; NSString *file = [path copy];
+        nvmtl_cache_io(^{ if ([stored writeToFile:file atomically:YES]) gRfStored++; });
+    }
+    // </wtl>
     if (useCache && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) [nvmtl_memo() setObject:d forKey:memoKey cost:d.length];   // <wtl>
     if (!(mn & (mn - 1))) nvlog("refl cache: miss %s %zu B %.2f ms [%lu hit, %lu miss, %lu stored]", function ? function->_fname.UTF8String : "?",
                                 jn, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, (unsigned long)gRfHit, mn, (unsigned long)gRfStored);
@@ -1406,7 +1511,7 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     if (hit.length >= 20 && hit.length % 4 == 0) {
         memcpy(&magic, hit.bytes, 4);
         if (magic == 0x07230203) {
-            unsigned long hn = ++gLkHit; utimes(path.fileSystemRepresentation, NULL);
+            unsigned long hn = ++gLkHit; nvmtl_cache_touch(path);   // <wtl>
             if (!(hn & (hn - 1))) nvlog("link cache: HIT %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", (unsigned long)hit.length,
                                         (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, hn, (unsigned long)gLkMiss, (unsigned long)gLkStored);
             return hit;
@@ -1414,7 +1519,12 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     }
     unsigned long mn = ++gLkMiss;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
-    if (result && path && [result writeToFile:path atomically:YES]) gLkStored++;
+    // <wtl>
+    if (result && path) {
+        NSData *stored = [result copy]; NSString *file = [path copy];
+        nvmtl_cache_io(^{ if ([stored writeToFile:file atomically:YES]) gLkStored++; });
+    }
+    // </wtl>
     if (!(mn & (mn - 1))) nvlog("link cache: miss %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", (unsigned long)result.length,
                                 (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, (unsigned long)gLkHit, mn, (unsigned long)gLkStored);
     return result;
@@ -1838,11 +1948,12 @@ NSData *nvmtl_translate_variant(NVMTLFunction *fn, NSDictionary *states, NSDicti
     // <wtl>
     NSString *memoKey=path ?: nvmtl_spvcache_memo_key_air(airDigest,json,@"variant1");   // no cache folder: the memo still serves this process
     NSData *mem=[nvmtl_memo() objectForKey:memoKey];
-    if(mem){if(path)utimes(path.fileSystemRepresentation,NULL);return mem;}
+    if(mem){nvmtl_cache_touch(path);return mem;}
     NSData *hit=path?[NSData dataWithContentsOfFile:path]:nil;uint32_t magic=0;
     if(hit.length>=20 && hit.length%4==0){memcpy(&magic,hit.bytes,4);if(magic==0x07230203){[nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];nvlog("variant cache: hit %s",fn->_fname.UTF8String);return hit;}}
     NSData *result=nvmtl_translate_variant_uncached(fn,states,tgLen,err);
-    if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:memoKey cost:result.length];BOOL stored=path&&[result writeToFile:path atomically:YES];nvlog("variant cache: miss %s stored=%d",fn->_fname.UTF8String,stored);}
+    if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:memoKey cost:result.length];NSData *keep=[result copy];NSString *file=[path copy],*entry=[fn->_fname copy];
+        nvmtl_cache_io(^{BOOL stored=file&&[keep writeToFile:file atomically:YES];nvlog("variant cache: miss %s stored=%d",entry.UTF8String,stored);});}
     // </wtl>
     return result;
 }
@@ -1863,7 +1974,7 @@ NSData *nvmtl_translate_samplers(NVMTLFunction *fn, NSDictionary *states, uint32
     NSString *memoKey=path ?: ((airDigest && tail)?nvmtl_spvcache_memo_key_air(airDigest,tail,@"sampler1"):nil);
     if(memoKey){
         NSData *mem=[nvmtl_memo() objectForKey:memoKey];
-        if(mem){if(path)utimes(path.fileSystemRepresentation,NULL);return mem;}
+        if(mem){nvmtl_cache_touch(path);return mem;}
         NSData *hit=path?[NSData dataWithContentsOfFile:path]:nil;
         if(nvmtl_is_spirv(hit)){[nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];return hit;}
     }
@@ -1872,7 +1983,7 @@ NSData *nvmtl_translate_samplers(NVMTLFunction *fn, NSDictionary *states, uint32
     if(xlate_sampler(fn->_air.UTF8String,fn->_stage.UTF8String,s.UTF8String,&out,&len,e,sizeof e)) {if(err)*err=@(e);return nil;}
     // <wtl>
     NSData *data=[NSData dataWithBytes:out length:len];xlate_free(out,len);
-    if(memoKey && nvmtl_is_spirv(data)){[nvmtl_memo() setObject:data forKey:memoKey cost:data.length];if(path)[data writeToFile:path atomically:YES];}
+    if(memoKey && nvmtl_is_spirv(data)){[nvmtl_memo() setObject:data forKey:memoKey cost:data.length];if(path){NSData *keep=[data copy];NSString *file=[path copy];nvmtl_cache_io(^{[keep writeToFile:file atomically:YES];});}}
     // </wtl>
     return data;
 }

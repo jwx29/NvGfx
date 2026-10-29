@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>XeGfxAGDC</string>
   <key>CFBundleExecutable</key><string>XeGfxAGDC</string>
   <key>CFBundlePackageType</key><string>KEXT</string>
-  <key>CFBundleVersion</key><string>0.1</string>
-  <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleVersion</key><string>0.1.1</string>
+  <key>CFBundleShortVersionString</key><string>0.1.1</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>IOKitPersonalities</key><dict>
     <key>XeGfxAGDCLoader</key><dict>
