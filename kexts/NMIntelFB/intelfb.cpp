@@ -665,9 +665,15 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
         r->height = fHeight;
         r->pitch = fRowBytes;
 
-        IFBLOG("scanout ABI: real physical address 0x%llx, %ux%u pitch %u, %llu bytes",
-               (unsigned long long)r->phys, r->width, r->height, r->pitch,
-               (unsigned long long)r->actualSize);
+        // This is called on every presentation, often at 60 Hz or higher.
+        // Logging on every scanout query floods the kernel log and can stall
+        // WindowServer. Keep one verified aperture breadcrumb per kext load.
+        static volatile SInt32 gScanoutABILogged = 0;
+        if (OSCompareAndSwap(0, 1, &gScanoutABILogged)) {
+            IFBLOG("scanout ABI: real physical address 0x%llx, %ux%u pitch %u, %llu bytes",
+                   (unsigned long long)r->phys, r->width, r->height, r->pitch,
+                   (unsigned long long)r->actualSize);
+        }
         return kIOReturnSuccess;
     }
     return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
