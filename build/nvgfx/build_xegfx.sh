@@ -7,5 +7,13 @@ export XEGFX_OVERLAY="$R/gpu/xkpi"
 python3 "$X/harness/score.py" --obj > "$X/out/score.log" 2>&1 || { tail -20 "$X/out/score.log"; exit 1; }
 # a source that did not compile would be linked as panicking stubs (N-223 died in one), so stop here instead
 read -r ok all < <(sed -nE 's/^total +([0-9]+)\/ *([0-9]+).*/\1 \2/p' "$X/out/score.log")
-[ -n "${ok:-}" ] && [ "$ok" = "$all" ] || { echo "STOP: ${ok:-?}/${all:-?} sources compiled"; grep -A3 "first errors" "$X/out/score.log"; exit 1; }
+[ -n "${ok:-}" ] && [ "$ok" = "$all" ] || {
+  echo "STOP: ${ok:-?}/${all:-?} sources compiled"
+  grep -A20 "failed sources:" "$X/out/score.log" | head -75 || true
+  if [ -s "$X/out/compile-failures.log" ]; then
+    echo "Compiler diagnostics (full report: $X/out/compile-failures.log):"
+    sed -n '1,100p' "$X/out/compile-failures.log"
+  fi
+  exit 1
+}
 bash "$X/tools/link.sh"
