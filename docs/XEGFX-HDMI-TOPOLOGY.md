@@ -54,14 +54,66 @@ tables and are not consumed by the custom `NMIntelFB` driver.
 Relevant upstream code:
 https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_gmbus.c
 
-The running Nobara Linux kernel does not expose `i915_vbt` under
-`/sys/kernel/debug/dri/*`, though `i915_display_info` works.
-This does not mean the firmware lacks a VBT. Optional alternatives:
-`i915_opregion` (if exported) or `intel_bios_dumper` (if compatible
-with firmware). The known pin/path information suffices to move forward
-on a dedicated, **read-only** HDMI EDID/DDC probe stage. It does not
-suffice to enable pipe B and switch on HDMI without display-engine
-power/PLL/PHY programming.
+### Board firmware VBT and ACPI OpRegion (2026-10-29)
+
+The debugfs files are in fact present on Nobara Linux under
+`/sys/kernel/debug/dri/0000:00:02.0/`; earlier globbing missed them.
+The user extracted both and decoded the VBT with
+`intel_vbt_decode --file=hdmi-vbt.bin --devid=0x7d55`.
+
+**VBT**: `$VBT METEORLAKE`, header size 48 bytes, declared VBT length
+7249 bytes (Linux debugfs export 7680 bytes including padding),
+BDB version 256 and child-entry size 40 bytes. BDB block 2 is the
+firmware General Definitions table. HDMI is child **EFP1**:
+
+| Decoded VBT field | Value | Meaning for XeGfx |
+| --- | --- | --- |
+| Device handle | `0x0004` / EFP1 | Firmware external-output entry |
+| Device type | `0x60D2` (decoder: DVI-D) | Same value as Linux `DEVICE_TYPE_HDMI`; TMDS-capable |
+| DVO port | `DP-B (0x07)` | Intel **DDI B/PHY B**, confirmed by Linux i915 |
+| DDC pin | `0x02` | Confirms DPB's actual **GMBUS pin 2** |
+| AUX channel | `none (0x00)` | This output is not an AUX-driven DP link |
+| Hotplug signaling | advertised | Capability; live HPD detection still needs implementation |
+| Onboard LSPCON | no | No firmware-declared LSPCON bridge on EFP1 |
+| HDMI max data rate | platform max (`0x00`) | No explicit per-output pixel-clock cap in this field |
+| HDMI Max FRL rate | FRL not supported | Use conventional TMDS, not HDMI 2.1 FRL |
+| HDMI level shifter | `0x00` | Use Intel/board programming, do not guess a WEG BusID |
+
+Note: the decoder labels `0x60D2` as DVI-D for legacy reasons;
+Linux's `intel_vbt_defs.h` also defines `DEVICE_TYPE_HDMI 0x60D2`.
+Do **not** reinterpret the entry as a DisplayPort/AUX connector
+because its DVO port is named DP-B. In the running kernel, it is
+`HDMI-A-1` driven by DDI B and communicating over `i915 gmbus dpb`.
+
+The firmware describes internal **LFP1** as an eDP/DP-A output:
+device handle `0x0008`, DVO port `DP-A (0x0a)`, AUX-A `0x40`.
+Other external child entries are DisplayPort/USB-C oriented and do
+not replace the confirmed EFP1 HDMI route.
+
+The `intel_vbt_decode` warnings about the panel type/EDID and
+block minimum sizes do not change the EFP1 routing fields.
+The separate 8192-byte `i915_opregion` dump is Intel OpRegion
+version 3. Its conventional embedded VBT area (`0x400..0x1bff`)
+is empty; the debugfs VBT export is therefore the relevant source.
+The OpRegion contains a valid panel EDID near `0x1c04`, identifying
+the laptop panel as **LEN140WUXGA**; that is **not** the HDMI EDID.
+
+Raw firmware dumps were **not** committed to the repository.
+Keep the original binaries local and avoid assuming a VBT will be
+located inside every macOS OpRegion mapping.
+
+### Consequences for HDMI support
+
+No HDMI BusID remap is indicated by the firmware: EFP1 is already
+DDI B with DDC pin 2, matching Linux. WhateverGreen's connector
+`busid` override patches Apple's framebuffer structures, but
+`NMIntelFB` is its own framebuffer and does not consume those keys.
+
+The next meaningful development stage is safe **EDID readback on
+GMBUS pin 2** (with appropriate display power-domain/HPD handling),
+then a DDI B HDMI TMDS PHY/PLL/link and independent scanout
+initialisation. Do not enable pipe B by toggling register bit 31
+without those steps; preserve firmware-controlled eDP pipe A.
 
 ### Key blockers in the XeGfx branch
 
@@ -102,9 +154,9 @@ on the accelerated desktop: those bypass the eDP preservation guards.
 
 1. Isolate i915 **read-only display discovery** from the normal
    modeset/ownership path; avoid i915 power/PLL/pipe writes during discovery.
-2. Parse Intel VBT/BDB and query the grounded HDMI DDI, HPD, and EDID
-   with safe power-domain handling; use Linux connector evidence as a
-   reference.
+2. Use the confirmed VBT EFP1/DP-B/DDC pin 2 information to
+   validate safe HDMI HPD and read EDID over GMBUS with appropriate
+   power-domain handling; do not reprogram pipe A.
 3. Make exclusive ownership of the *new* display pipe and transcoder
    while preserving firmware eDP A, including CDCLK/shared DPLL
    allocation, power wells, DDI PHY, audio/infoframes and hotplug.
