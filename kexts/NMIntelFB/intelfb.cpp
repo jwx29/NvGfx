@@ -22,6 +22,7 @@
 #include "hdmi_gmbus.h"
 #include "hdmi_edid_timing.h"
 #include "hdmi_modeset_preflight.h"
+#include "hdmi_mode_plan.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -344,7 +345,9 @@ IOReturn NMIntelFB::probeHDMIEDID()
     removeProperty("NMIntelFBHDMIEDID");
     removeProperty("NMIntelFBHDMIPreferredTiming");
     removeProperty("NMIntelFBHDMIPreflightRegisters");
+    removeProperty("NMIntelFBHDMIModePlan");
     setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
+    setProperty("NMIntelFBHDMIModePlanStatus", "not-requested");
     setProperty("NMIntelFBHDMIEDIDStatus", "reading");
     uint8_t edid[256] = {};
     size_t length = 0;
@@ -412,6 +415,11 @@ IOReturn NMIntelFB::preflightHDMIModeset()
 #else
     if (!fDDCLock) return kIOReturnNotReady;
     IOLockLock(fDDCLock);
+    // This snapshot and timing plan are disposable. Never allow a previous
+    // request to masquerade as a current validation after unplug/suspend.
+    removeProperty("NMIntelFBHDMIPreflightRegisters");
+    removeProperty("NMIntelFBHDMIModePlan");
+    setProperty("NMIntelFBHDMIModePlanStatus", "not-validated");
     const bool target = !fStopping && fRegs && fMMIO &&
         fMMIO->getLength() >= 0x711a0u && fPCI &&
         fPCI->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
@@ -432,10 +440,8 @@ IOReturn NMIntelFB::preflightHDMIModeset()
     const bool timingValid = fHDMIDDCState == 1 && edid &&
         nm_hdmi::parsePreferredTiming(
             (const uint8_t *)edid->getBytesNoCopy(), edid->getLength(), mode);
-    if (!timingValid || mode.pixelClockHz != 148500000u ||
-        mode.hActive != 1920u || mode.vActive != 1080u ||
-        mode.hTotal != 2200u || mode.vTotal != 1125u) {
-        removeProperty("NMIntelFBHDMIPreflightRegisters");
+    nm_hdmi::ModePlan modePlan = {};
+    if (!timingValid || !nm_hdmi::buildModePlan(mode, modePlan)) {
         setProperty("NMIntelFBHDMIPreflightStatus", "missing-validated-1080p60-edid");
         IOLockUnlock(fDDCLock);
         return kIOReturnNotReady;
@@ -463,10 +469,24 @@ IOReturn NMIntelFB::preflightHDMIModeset()
         published = setProperty("NMIntelFBHDMIPreflightRegisters", d);
         d->release();
     }
-    IFBLOG("HDMI read-only modeset preflight: %s, eDP A frames/40ms=%u, target 1080p60, snapshot=%d (no modeset)",
-           status, frames, published ? 1 : 0);
+    // Publishing a *timing-only* mode plan is permitted only while the
+    // internal display is demonstrably alive and DDI B/pipe B are unused.
+    // These numbers are NOT replayed into MMIO or the C10 PHY.
+    bool planPublished = false;
+    if (reason == nm_hdmi::PreflightReason::ok && advancing) {
+        if (OSData *d = OSData::withBytes(&modePlan, sizeof(modePlan))) {
+            planPublished = setProperty("NMIntelFBHDMIModePlan", d);
+            d->release();
+        }
+    }
+    setProperty("NMIntelFBHDMIModePlanStatus",
+                planPublished ? "timing-only-not-applied" : "blocked");
+    IFBLOG("HDMI read-only preflight: %s, eDP A frames/40ms=%u, timing-only plan=%d (NO HDMI modeset)",
+           status, frames, planPublished ? 1 : 0);
     IOLockUnlock(fDDCLock);
-    return published ? kIOReturnSuccess : kIOReturnNoMemory;
+    return published && (planPublished ||
+            reason != nm_hdmi::PreflightReason::ok || !advancing)
+        ? kIOReturnSuccess : kIOReturnNoMemory;
 #endif
 }
 
@@ -803,6 +823,7 @@ bool NMIntelFB::start(IOService *provider)
     setProperty("NMIntelFBHDMIDDCGeneration", 0ull, 32);
     setProperty("NMIntelFBHDMIDDCProbeCount", 0ull, 32);
     setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
+    setProperty("NMIntelFBHDMIModePlanStatus", "not-requested");
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);

@@ -75,6 +75,41 @@ int main(void) {
         printf("No register snapshot. Run a successful DDC EDID probe first.\n");
     }
     if(v)CFRelease(v);
+    displayProperty(fb,CFSTR("NMIntelFBHDMIModePlanStatus"),
+                    "HDMI mode plan");
+    CFTypeRef plan=IORegistryEntryCreateCFProperty(
+        fb,CFSTR("NMIntelFBHDMIModePlan"),kCFAllocatorDefault,0);
+    if(plan && CFGetTypeID(plan)==CFDataGetTypeID()) {
+        const CFDataRef d=(CFDataRef)plan;
+        // 10 header words + 7 register offsets + 7 register values.
+        if(CFDataGetLength(d)==96) {
+            const uint8_t *raw=CFDataGetBytePtr(d);
+            uint32_t p[24]={0};
+            memcpy(p,raw,sizeof(p));
+            if(p[0]==0x484d5031u && p[1]==7u && p[2]==1u &&
+               p[3]==1u && p[4]==1u && p[5]==4u) {
+                printf("Linux-referenced HDMI target: pipe %u, DDI %u, C10 DPLL%u, %u lanes, %u kHz refclk, %u Hz pixel clock\n",
+                       p[2],p[3],p[4],p[5],p[6],p[7]);
+                printf("Unimplemented required mode phases bitmask: 0x%08x\n",p[8]);
+                printf("Expected refresh: %u mHz\n",p[9]);
+                const char *names[]={"HTOTAL_B","HBLANK_B","HSYNC_B",
+                                     "VTOTAL_B","VBLANK_B","VSYNC_B","PIPEBSRC"};
+                for(unsigned i=0;i<7;i++)
+                    printf("TIMING ONLY (NOT WRITTEN) 0x%06x=0x%08x %s\n",
+                           p[10+i],p[17+i],names[i]);
+            } else {
+                fprintf(stderr,"Unexpected HDMI mode plan ABI/header\n");
+                kr=1;
+            }
+        } else {
+            fprintf(stderr,"Unexpected HDMI plan byte length: %ld\n",
+                    (long)CFDataGetLength(d));
+            kr=1;
+        }
+    } else {
+        puts("No validated HDMI timing plan was published.");
+    }
+    if(plan) CFRelease(plan);
     IOObjectRelease(fb);
     puts("No HDMI clock, PHY, transcoder or pipe was programmed.");
     return kr==KERN_SUCCESS?0:1;

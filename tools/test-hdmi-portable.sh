@@ -6,7 +6,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIR="$(mktemp -d "${TMPDIR:-/tmp}/xegfx-hdmi-tests.XXXXXX")"
 trap 'rm -rf "$DIR"' EXIT
 CXX="${CXX:-c++}"
-for test in test_hdmi_gmbus test_hdmi_edid_timing test_hdmi_modeset_preflight; do
+for test in test_hdmi_gmbus test_hdmi_edid_timing test_hdmi_modeset_preflight test_hdmi_mode_plan; do
   echo "== $test =="
   "$CXX" -std=c++17 -Wall -Wextra -Werror \
     -I "$REPO/kexts/NMIntelFB" \

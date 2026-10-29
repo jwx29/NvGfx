@@ -229,3 +229,34 @@ The macOS kernel kext has **not been built on the developer's target
 machine by this commit**. Passing portable unit tests does not prove
 the Intel power/PHY/display programming will work; that part is still
 unimplemented.
+
+## Linux captures integrated (29 Oct 2026)
+
+The user's earlier working Nobara files are analyzed and recorded in
+[`docs/XEGFX-HDMI-LINUX-REFERENCE-20261029.md`](XEGFX-HDMI-LINUX-REFERENCE-20261029.md).
+The HDMI DDI B route uses its own C10 **DPLL1**, **38400 kHz**
+reference, 4 lanes and **148500 kHz** clock, with `PW_2`, `PW_B`
+and DDI B IO/lanes in use. Linux eDP retains C10 DPLL0.
+
+New `hdmi_mode_plan.h` constructs a **timing-only, not-applied**
+pipe B mode plan from the validated 1080p60 EDID. After a successful
+`hdmi-modeset-preflight` it publishes
+`NMIntelFBHDMIModePlan` (ABI HMP1, 96 bytes) and
+`NMIntelFBHDMIModePlanStatus=timing-only-not-applied`.
+The utility prints seven target timing register encodings, but none
+are written to MMIO. The 10-bit Linux XR30 scanout format is not
+reused indiscriminately on macOS: transmitted HDMI bpp=24 is distinct
+from the scanout pixel format.
+
+Test:
+
+```sh
+bash tools/test-hdmi-portable.sh
+# On macOS after rebuilding NMIntelFB, reboot and run:
+sudo ./hdmi-edid-probe "$HOME/Desktop/hdmi-edid-macos.bin"
+sudo ./hdmi-modeset-preflight
+```
+
+This patch is NOT a working HDMI video driver. Power-well ownership,
+C10 sideband/PLL setup, GGTT/DBUF, the independent framebuffer and
+MTL+ HDMI port/transcoder ordering remain substantial missing pieces.
