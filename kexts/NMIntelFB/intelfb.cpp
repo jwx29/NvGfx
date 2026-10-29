@@ -21,6 +21,7 @@
 #include "nvrm_vram_abi.h"
 #include "hdmi_gmbus.h"
 #include "hdmi_edid_timing.h"
+#include "hdmi_modeset_preflight.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -196,6 +197,7 @@ private:
     uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
     bool adoptFirmwareMode();
     IOReturn probeHDMIEDID();
+    IOReturn preflightHDMIModeset();
     // nmintelfbcache=1 write-combined, 2 cache-inhibited, else IOKit's default for device memory
     void mapSurface() {
         unsigned c = 0; PE_parse_boot_argn("nmintelfbcache", &c, sizeof c);
@@ -341,6 +343,8 @@ IOReturn NMIntelFB::probeHDMIEDID()
     // WindowServer until a native DDI B scanout actually exists.
     removeProperty("NMIntelFBHDMIEDID");
     removeProperty("NMIntelFBHDMIPreferredTiming");
+    removeProperty("NMIntelFBHDMIPreflightRegisters");
+    setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
     setProperty("NMIntelFBHDMIEDIDStatus", "reading");
     uint8_t edid[256] = {};
     size_t length = 0;
@@ -400,10 +404,84 @@ IOReturn NMIntelFB::probeHDMIEDID()
 #endif
 }
 
+// Hardware preflight: direct MMIO reads only, never power or modeset.
+IOReturn NMIntelFB::preflightHDMIModeset()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return kIOReturnUnsupported;
+#else
+    if (!fDDCLock) return kIOReturnNotReady;
+    IOLockLock(fDDCLock);
+    const bool target = !fStopping && fRegs && fMMIO &&
+        fMMIO->getLength() >= 0x711a0u && fPCI &&
+        fPCI->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
+        fPCI->configRead16(kIOPCIConfigDeviceID) == 0x7d55 &&
+        fPCI->configRead16(0x2c) == 0x17aa &&
+        fPCI->configRead16(0x2e) == 0x3813 &&
+        fPipe == 0 && fWidth == 1920 && fHeight == 1200;
+    if (!target) {
+        setProperty("NMIntelFBHDMIPreflightStatus", "unsupported-identity-or-panel");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    // Require a prior successful DDI B GMBUS pin 2 EDID read. No monitor
+    // settings are guessed; the first modeset target is 1080p60 only.
+    OSData *edid = OSDynamicCast(OSData, getProperty("NMIntelFBHDMIEDID"));
+    nm_hdmi::Timing mode = {};
+    const bool timingValid = fHDMIDDCState == 1 && edid &&
+        nm_hdmi::parsePreferredTiming(
+            (const uint8_t *)edid->getBytesNoCopy(), edid->getLength(), mode);
+    if (!timingValid || mode.pixelClockHz != 148500000u ||
+        mode.hActive != 1920u || mode.vActive != 1080u ||
+        mode.hTotal != 2200u || mode.vTotal != 1125u) {
+        removeProperty("NMIntelFBHDMIPreflightRegisters");
+        setProperty("NMIntelFBHDMIPreflightStatus", "missing-validated-1080p60-edid");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    NMHDMIMMIO io = { fRegs };
+    nm_hdmi::PreflightSnapshot snapshot = {};
+    nm_hdmi::capture(io, snapshot);
+    const nm_hdmi::PreflightReason reason =
+        nm_hdmi::validateIdleDisplay(snapshot);
+    const uint32_t before = rd(FRMCOUNT(0));
+    IOSleep(40); // verify eDP pipe A still scans out
+    const uint32_t after = rd(FRMCOUNT(0));
+    const uint32_t frames = after-before;
+    const bool advancing = frames > 0u && frames < 16u;
+
+    setProperty("NMIntelFBHDMIPreflightPanelFrames", (uint64_t)frames, 32);
+    const char *status = reason == nm_hdmi::PreflightReason::ok ?
+        (advancing ? "ready-for-modeset-implementation" : "edp-frame-counter-stalled") :
+        nm_hdmi::reasonText(reason);
+    setProperty("NMIntelFBHDMIPreflightStatus", status);
+    setProperty("NMIntelFBHDMIPreflightTargetClockHz", (uint64_t)mode.pixelClockHz, 32);
+    bool published = false;
+    if (OSData *d = OSData::withBytes(&snapshot, sizeof(snapshot))) {
+        published = setProperty("NMIntelFBHDMIPreflightRegisters", d);
+        d->release();
+    }
+    IFBLOG("HDMI read-only modeset preflight: %s, eDP A frames/40ms=%u, target 1080p60, snapshot=%d (no modeset)",
+           status, frames, published ? 1 : 0);
+    IOLockUnlock(fDDCLock);
+    return published ? kIOReturnSuccess : kIOReturnNoMemory;
+#endif
+}
+
 /* Reporting-only: root passes ANV's queried shared heap, never a scanout map. */
 IOReturn NMIntelFB::setProperties(OSObject *properties)
 {
     auto outer = OSDynamicCast(OSDictionary, properties);
+    if (outer && outer->getObject("XeGfxHDMIModesetPreflight")) {
+        if (outer->getObject("XeGfxHDMIModesetPreflight") != kOSBooleanTrue)
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+                kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return preflightHDMIModeset();
+    }
     // Explicit root-only request; not performed at boot. The GMBUS transaction
     // touches DDC control registers but NEVER a display pipe, PLL or PHY.
     if (outer && outer->getObject("XeGfxHDMIEDIDProbe")) {
@@ -724,6 +802,7 @@ bool NMIntelFB::start(IOService *provider)
     setProperty("NMIntelFBHDMIDDCState", "unknown");
     setProperty("NMIntelFBHDMIDDCGeneration", 0ull, 32);
     setProperty("NMIntelFBHDMIDDCProbeCount", 0ull, 32);
+    setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);

@@ -119,3 +119,100 @@ c++ -std=c++17 -Wall -Wextra -Werror -I kexts/NMIntelFB \\
 /tmp/test_hdmi_edid_timing
 /tmp/test_hdmi_edid_timing /path/to/hdmi-monitor-edid.bin
 ```
+
+## HDMI stage 3: verified hardware modeset preflight (read-only)
+
+The macOS HDMI DDC/EDID reader was tested on hardware and detected
+connected -> unresponsive -> connected. To prepare **real** DDI B TMDS
+video bring-up, this stage adds a privileged **read-only** modeset
+preflight, without enabling DDI B, allocating a second GGTT scanout,
+or registering a fake monitor with WindowServer.
+
+On the exact Lenovo Intel 8086:7d55 / 17aa:3813 system, the preflight
+requires that the previous GMBUS read returned a checksum-valid
+**1920x1080@60 Hz, 148500000 Hz** preferred timing. It verifies:
+- firmware eDP pipe A is still the selected 1920x1200 panel;
+- the eDP A plane and transcoder are still enabled and FRMCOUNT advances;
+- pipe/transcoder/plane B and DDI B port enable bits are **not** already
+  active or owned by another display path;
+- all sampled power-well, clock, transcoder and plane register snapshots
+  are accessible, without consulting sideband PHY registers or reading
+  the side-effectful GMBUS2 semaphore.
+
+It publishes:
+- `NMIntelFBHDMIPreflightStatus`: explicitly **not**
+  a claim that HDMI modesetting is fully implemented;
+- `NMIntelFBHDMIPreflightPanelFrames` (40ms internal-panel frame delta);
+- `NMIntelFBHDMIPreflightTargetClockHz`;
+- `NMIntelFBHDMIPreflightRegisters`: a binary dump with
+  `uint32 abi=0x48445031, uint32 count=22`, followed by
+  22 offsets and 22 values, all little-endian 32-bit words.
+
+### Running the preflight under macOS
+
+After installing the new NMIntelFB and rebooting, with HDMI connected:
+
+```sh
+cd ~/src/NvGfx-merge-test
+xcrun clang -std=c11 -Wall -Wextra -Werror \
+  -framework IOKit -framework CoreFoundation \
+  tools/hdmi-modeset-preflight.c -o hdmi-modeset-preflight
+
+# First update validated GMBUS/EDID data; writes only the GMBUS controller:
+sudo ./hdmi-edid-probe "$HOME/Desktop/hdmi-edid-macos.bin"
+
+# Then capture power/clock/port/pipe registers without hardware writes:
+sudo ./hdmi-modeset-preflight | tee "$HOME/Desktop/hdmi-macos-preflight.txt"
+```
+
+The preflight never turns on HDMI, even if the status is
+`ready-for-modeset-implementation`. That status means only that
+a validated monitor mode, moving eDP A and unoccupied pipe B were seen.
+
+### Compare Linux's working HDMI mode
+
+Boot Linux with the HDMI monitor actually scanning out **1080p60**
+(not just plugged in). If `intel_reg` is available, run:
+
+```sh
+bash tools/hdmi-linux-register-reference.sh --i-understand-mmio-risk \
+  | tee ~/hdmi-linux-modeset-registers.txt
+```
+
+This samples the **same** 22 register offsets on the *same* Intel PCI
+GPU using `intel_reg --pci-slot=0000:00:02.0 read ...`. It does not
+write registers, but any low-level MMIO reads can still hang hardware.
+The DDI_B port and pipe enables, clock selection, power-well state and
+transcoder timing should differ between working Linux HDMI and macOS
+firmware-only eDP. Some values also vary with the selected Linux mode.
+**Do not paste Linux register values directly into macOS display MMIO.**
+Firmware display states, power-well ownership and DPLL/CDCLK allocation
+are different, so a naive register replay risks a panic or black screen.
+
+Relevant Linux register definitions:
+https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/display/intel_display_regs.h.html.
+MTL+ ordering: Intel's August/October 2026 proposed i915 changes
+enable `DDI_CTL_DE` before `TRANS_CONF` for HDMI TMDS.
+Linux must also program C10/C20 PHY link, pipe configuration, shared
+PLL, power wells and GGTT scanout independently.
+
+### Next code change required for visible HDMI output
+
+The preflight data is sufficient to stop guessing the port/pipe register
+states. To actually light the monitor, a new coordinated display-engine
+controller must:
+
+1. Obtain display power/PHY/PLL ownership without resetting eDP A,
+   and verify DDI B PHY and display power wells are ready.
+2. Allocate GGTT pinned 1920x1080 linear XRGB scanout distinct from
+   firmware eDP memory, respecting MTL stolen-memory workarounds.
+3. Configure HDMI sink, DDI B clock/PHY/TMDS, transcoder B and pipe B
+   in the **MTL+** order, with timeouts and rollback of *owned* state.
+4. Publish a second real framebuffer with independent VBL, EDID,
+   power/connection callbacks and `IOFBDependentIndex=5` /
+   `XeGfxNativeHDMIFramebuffer=true`, and hook XeGfxAccel head 5
+   to its separate mapped scanout.
+5. Implement unplug, sleep/wake and WindowServer recovery; never make
+   experimental hardware modesets automatic at boot.
+
+None of these display writes is enabled by the stage-3 preflight.
