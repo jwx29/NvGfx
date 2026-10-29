@@ -18,11 +18,13 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSData.h>
 #include <mach/kmod.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
 #include <string.h>
 #include "xg_i915.h"
+#include "hdmi_plane_b_image.h"
 #include "xg_fd.h"
 #include "xg_vmap.h"
 
@@ -135,6 +137,7 @@ xg_env_has(const char *kv)
 static IOLock *gStageLock;
 static uint64_t gSurfPte;
 static bool gPipeLit;	/* pipe A was scanning out at probe time (Hybrid); in Discrete mode the NVIDIA GPU has the panel */
+static uint32_t gBootSurf; /* plane A GGTT base, obtained by stage 4 */
 static char gLog[256 * 1024];	/* last 256 KiB of the shim's console output, for sysctl debug.xegfx_log */
 static size_t gLogLen;
 static IOSimpleLock *gLogLock;
@@ -197,6 +200,51 @@ XeGfxResident::setProperties(OSObject *properties)
 		fb.bytes=1920ull*1080ull*4ull;
 	}
 	int err=xg_i915_hdmi_surface_manage(&fb);
+	/* The plane image is only valid while this exact GGTT lease is pinned.
+	 * No CPU kernel pointer (fb.kva) may appear in any IORegistry property.
+	 * Always invalidate a previous plan, including after release/errors.
+	 */
+	removeProperty("XeGfxHDMIScanoutPlaneImage");
+	removeProperty("XeGfxHDMIScanoutEDPGGTTOffset");
+	removeProperty("XeGfxHDMIScanoutEDPBytes");
+	setProperty("XeGfxHDMIScanoutPlanStatus", "no-current-lease");
+	if (!err && fb.bytes) {
+		/* Stage 4 recorded and reserved the internal firmware panel's
+		 * GGTT range. Build an independent pipe-B image from the real
+		 * pinned i915 surface; this must not write display registers.
+		 */
+		nm_hdmi::PlaneBImage image = {};
+		const nm_hdmi::PlaneBImageResult valid =
+		    nm_hdmi::buildPlaneBImage(fb, gPipeLit ? gBootSurf : 0,
+		                             gPipeLit ? xg_boot_fb_size : 0, image);
+		if (gPipeLit && gBootSurf && xg_boot_fb_size) {
+			setProperty("XeGfxHDMIScanoutEDPGGTTOffset", (uint64_t)gBootSurf, 64);
+			setProperty("XeGfxHDMIScanoutEDPBytes", (uint64_t)xg_boot_fb_size, 64);
+		}
+		if (valid == nm_hdmi::PlaneBImageResult::ok) {
+			OSData *data = OSData::withBytes(&image, sizeof(image));
+			if (data) {
+				const bool published = setProperty("XeGfxHDMIScanoutPlaneImage", data);
+				data->release();
+				setProperty("XeGfxHDMIScanoutPlanStatus",
+				            published ? "ready-not-applied" : "publish-failed");
+			} else {
+				setProperty("XeGfxHDMIScanoutPlanStatus", "out-of-memory");
+			}
+		} else {
+			const char *why = "invalid-surface";
+			switch (valid) {
+			case nm_hdmi::PlaneBImageResult::unknownEDPRange:
+				why = "edp-ggtt-unknown"; break;
+			case nm_hdmi::PlaneBImageResult::overlapsEDP:
+				why = "edp-ggtt-overlap"; break;
+			case nm_hdmi::PlaneBImageResult::invalidGGTT:
+				why = "hdmi-ggtt-invalid"; break;
+			default: break;
+			}
+			setProperty("XeGfxHDMIScanoutPlanStatus", why);
+		}
+	}
 	setProperty("XeGfxHDMIScanoutLastErrno", (uint64_t)(-err), 32);
 	setProperty("XeGfxHDMIScanoutStatus", err == 0 ?
 	            (fb.bytes ? "allocated-ggtt-not-displayed" : "released") :
@@ -375,8 +423,6 @@ out:
 	OSSafeReleaseNULL(smb);
 	return rc;
 }
-
-static uint32_t gBootSurf;	/* PLANE_SURF_1_A after i915 ran: the boot surface's GGTT offset */
 
 /* after i915 has run: the panel must still scan out the boot surface through the same GGTT entry, and pipe A must
  * still count frames; otherwise the desktop is black even though WindowServer looks fine */

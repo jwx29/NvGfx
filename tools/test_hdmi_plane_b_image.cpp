@@ -29,6 +29,14 @@ int main() {
         assert(image.values[i]==values[i]);
     }
     assert(image.offsets[image.count-1]==0x7119cu); // surface latches
+    // Captured Meteor Lake values: firmware eDP 1920x1200 near the
+    // high GGTT limit, separate HDMI allocation near the low end.
+    fb.ggtt_offset=0x00ae0000ull;
+    assert(buildPlaneBImage(fb,0xff600000ull,9216000ull,image)
+           ==PlaneBImageResult::ok);
+    assert(image.values[5]==0x00ae0000u);
+    assert(image.values[4]==0x84000000u);
+    fb.ggtt_offset=0x02000000ull;
     fb.op=XG_HDMI_SURFACE_QUERY;
     assert(buildPlaneBImage(fb,0x100000u,0x900000u,image)
            ==PlaneBImageResult::ok);

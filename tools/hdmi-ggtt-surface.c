@@ -8,6 +8,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 static void show(io_service_t s, CFStringRef k, const char *label) {
@@ -56,6 +57,38 @@ int main(int argc, char **argv) {
     show(resident,CFSTR("XeGfxHDMIScanoutGGTTOffset"),"GPU GGTT offset");
     show(resident,CFSTR("XeGfxHDMIScanoutBytes"),"Bytes");
     show(resident,CFSTR("XeGfxHDMIScanoutPitch"),"Pitch");
+    show(resident,CFSTR("XeGfxHDMIScanoutPlanStatus"),"Plane B plan");
+    show(resident,CFSTR("XeGfxHDMIScanoutEDPGGTTOffset"),"eDP GGTT base");
+    show(resident,CFSTR("XeGfxHDMIScanoutEDPBytes"),"eDP scanout bytes");
+
+    // Render the kernel-generated register image, but never write any MMIO.
+    CFTypeRef plan=IORegistryEntryCreateCFProperty(
+        resident,CFSTR("XeGfxHDMIScanoutPlaneImage"),kCFAllocatorDefault,0);
+    if (plan && CFGetTypeID(plan)==CFDataGetTypeID()) {
+        const CFDataRef data=(CFDataRef)plan;
+        // Four header words, six offsets, six values: 16 uint32_t words.
+        if (CFDataGetLength(data)==(CFIndex)(16u*sizeof(uint32_t))) {
+            uint32_t words[16]={0};
+            memcpy(words,CFDataGetBytePtr(data),sizeof(words));
+            if (words[0]==0x48504231u && words[1]==6u &&
+                words[2]==5u && words[3]==0u) {
+                const char *names[]={
+                    "PLANE_STRIDE_1_B","PLANE_POS_1_B","PLANE_SIZE_1_B",
+                    "PLANE_OFFSET_1_B","PLANE_CTL_1_B","PLANE_SURF_1_B"
+                };
+                puts("HDMI plane B MMIO image (NOT WRITTEN):");
+                for (unsigned i=0;i<6;++i)
+                    printf("  0x%06x = 0x%08x %s%s\n",words[4+i],
+                           words[10+i],names[i],
+                           i==5 ? " (arm last; NOT WRITTEN)" : "");
+            } else {
+                fputs("Invalid HDMI plane image header\n",stderr);
+            }
+        } else {
+            fputs("Invalid HDMI plane image size\n",stderr);
+        }
+    }
+    if (plan) CFRelease(plan);
     IOObjectRelease(resident);
     return kr==KERN_SUCCESS?0:1;
 }

@@ -13,7 +13,7 @@ xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -mkernel -ffreestanding -nost
   "$ROOT/shim/src/stubs/xg_stubs.c" -o "$O/xg_stubs.o"
 for cpp in "$ROOT"/shim/src/xnu/*.cpp; do
   xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -mkernel -nostdinc -isysroot "$SDK" -I"$K" \
-    -I"$ROOT/shim/include" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -std=c++17 -fno-rtti -fno-exceptions \
+    -I"$ROOT/shim/include" -I"$ROOT/../../kexts/NMIntelFB" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -std=c++17 -fno-rtti -fno-exceptions \
     -O2 -Wall -Wno-inconsistent-missing-override -Wno-deprecated-declarations -c "$cpp" -o "$O/$(basename "$cpp").o"
 done
 # firmware linked into the binary, so no daemon round trip is needed (empty table without linux-firmware)
