@@ -113,3 +113,31 @@ Sources:
   transcoder;
 - `docs/XEGFX-HDMI-LINUX-REFERENCE-20261029.md` for uploaded
   working Linux HDMI state.
+
+## Next source milestone: i915 scanout lease + C10 image program (unproven on hardware)
+
+On the current branch, `gpu/xkpi/src/i915/xg_i915_exec.c`
+contains a real opt-in GEM system-memory allocation, pinned in the i915
+GGTT, independent of the EFI pipe-A framebuffer. The XNU-facing
+`xgHdmiSurface` platform-function bridge and the privileged
+`XeGfxResident` diagnostic are implemented. See
+[`XEGFX-HDMI-GGTT-SCANOUT.md`](XEGFX-HDMI-GGTT-SCANOUT.md).
+Neither bridge nor allocator has been built or tested on the user's
+macOS LinuxKPI source yet.
+
+`kexts/NMIntelFB/hdmi_c10_pll_image.h` additionally implements the
+Intel C10 **vendor-register programming order** for the
+Linux-verified 1080p60 DPLL1 image. It snapshots the current C10 vendor
+state (temporarily setting `MSGBUS_ACCESS`, as the Linux driver
+requires), can restore it on partial program failures, and has a pure
+mock test. **It is not called by the actual driver.** A real hardware
+backend must first implement/exclusively hold DC_OFF, PSR disable,
+PHY B ownership, PLL power request/ACK and lock, then program C10 PHY
+and port B. The captured DPLL1 vendor data cannot be replayed safely
+outside that sequence, nor can display become active without GGTT
+scanout, DBUF/DDB and a second framebuffer.
+
+Portable test runner:
+`bash tools/test-hdmi-portable.sh`.
+
+This remains a development milestone, **not functional HDMI output**.
