@@ -23,6 +23,8 @@
 #include "hdmi_edid_timing.h"
 #include "hdmi_modeset_preflight.h"
 #include "hdmi_mode_plan.h"
+#include "hdmi_native_sequence.h"
+#include "hdmi_mtl_power.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -199,6 +201,7 @@ private:
     bool adoptFirmwareMode();
     IOReturn probeHDMIEDID();
     IOReturn preflightHDMIModeset();
+    IOReturn dryRunHDMINative();
     // nmintelfbcache=1 write-combined, 2 cache-inhibited, else IOKit's default for device memory
     void mapSurface() {
         unsigned c = 0; PE_parse_boot_argn("nmintelfbcache", &c, sizeof c);
@@ -346,6 +349,8 @@ IOReturn NMIntelFB::probeHDMIEDID()
     removeProperty("NMIntelFBHDMIPreferredTiming");
     removeProperty("NMIntelFBHDMIPreflightRegisters");
     removeProperty("NMIntelFBHDMIModePlan");
+    setProperty("NMIntelFBHDMINativeStatus", "not-requested");
+    removeProperty("NMIntelFBHDMINativeMissingStage");
     setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
     setProperty("NMIntelFBHDMIModePlanStatus", "not-requested");
     setProperty("NMIntelFBHDMIEDIDStatus", "reading");
@@ -448,6 +453,9 @@ IOReturn NMIntelFB::preflightHDMIModeset()
     }
 
     NMHDMIMMIO io = { fRegs };
+    const nm_hdmi::MtlPowerSnapshot power = nm_hdmi::inspectMtlBPower(io);
+    setProperty("NMIntelFBHDMIPowerState", nm_hdmi::mtlPowerName(power.status));
+    setProperty("NMIntelFBHDMIPowerDriver", (uint64_t)power.driver, 32);
     nm_hdmi::PreflightSnapshot snapshot = {};
     nm_hdmi::capture(io, snapshot);
     const nm_hdmi::PreflightReason reason =
@@ -460,7 +468,9 @@ IOReturn NMIntelFB::preflightHDMIModeset()
 
     setProperty("NMIntelFBHDMIPreflightPanelFrames", (uint64_t)frames, 32);
     const char *status = reason == nm_hdmi::PreflightReason::ok ?
-        (advancing ? "ready-for-modeset-implementation" : "edp-frame-counter-stalled") :
+        (!advancing ? "edp-frame-counter-stalled" :
+         power.status != nm_hdmi::MtlPowerStatus::on ? "power-wells-not-ready" :
+         "ready-for-modeset-implementation") :
         nm_hdmi::reasonText(reason);
     setProperty("NMIntelFBHDMIPreflightStatus", status);
     setProperty("NMIntelFBHDMIPreflightTargetClockHz", (uint64_t)mode.pixelClockHz, 32);
@@ -473,7 +483,8 @@ IOReturn NMIntelFB::preflightHDMIModeset()
     // internal display is demonstrably alive and DDI B/pipe B are unused.
     // These numbers are NOT replayed into MMIO or the C10 PHY.
     bool planPublished = false;
-    if (reason == nm_hdmi::PreflightReason::ok && advancing) {
+    if (reason == nm_hdmi::PreflightReason::ok && advancing &&
+        power.status == nm_hdmi::MtlPowerStatus::on) {
         if (OSData *d = OSData::withBytes(&modePlan, sizeof(modePlan))) {
             planPublished = setProperty("NMIntelFBHDMIModePlan", d);
             d->release();
@@ -490,10 +501,73 @@ IOReturn NMIntelFB::preflightHDMIModeset()
 #endif
 }
 
+// Non-destructive top-level native HDMI gate. This is not a hardware
+// implementation: the required C10 PHY/power/GGTT backend is absent.
+// Explicitly report the first missing stage rather than trying partial
+// register writes and corrupting the live firmware eDP scanout.
+IOReturn NMIntelFB::dryRunHDMINative()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return kIOReturnUnsupported;
+#else
+    if (!fDDCLock) return kIOReturnNotReady;
+    IOLockLock(fDDCLock);
+    OSData *data=OSDynamicCast(OSData, getProperty("NMIntelFBHDMIModePlan"));
+    nm_hdmi::ModePlan plan={};
+    if (fStopping || fPipe != 0 || fWidth != 1920 || fHeight != 1200 ||
+        fHDMIDDCState != 1 || !data || data->getLength() != sizeof(plan)) {
+        setProperty("NMIntelFBHDMINativeStatus", "missing-current-edid-and-preflight");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+    bcopy(data->getBytesNoCopy(), &plan, sizeof(plan));
+    // Validate that eDP A still scans and B remains unowned now, not just
+    // at the earlier diagnostic snapshot time.
+    const uint32_t before=rd(FRMCOUNT(0));
+    IOSleep(40);
+    const uint32_t after=rd(FRMCOUNT(0));
+    NMHDMIMMIO powerIO={fRegs};
+    if (after-before == 0 || after-before >= 16 ||
+        nm_hdmi::inspectMtlBPower(powerIO).status != nm_hdmi::MtlPowerStatus::on ||
+        (rd(TRANSCONF(1)) & kEnable) ||
+        (rd(PLANE_CTL(1)) & kEnable) ||
+        (rd(0x61400u) & kEnable) ||
+        (rd(0x64100u) & kEnable)) {
+        setProperty("NMIntelFBHDMINativeStatus", "edp-a-stalled-or-b-occupied");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    // The fully guarded transaction engine is available for a future
+    // native backend; never report success while one is missing.
+    nm_hdmi::UnimplementedNativeBackend backend;
+    const nm_hdmi::NativeReport result=nm_hdmi::bringUp(backend,plan);
+    setProperty("NMIntelFBHDMINativeStatus",
+                nm_hdmi::nativeResultName(result.result));
+    setProperty("NMIntelFBHDMINativeMissingStage",
+                nm_hdmi::stageName(result.failedStage));
+    setProperty("NMIntelFBHDMINativeStagesApplied",
+                (uint64_t)result.appliedCount,32);
+    IFBLOG("HDMI native gate: %s at %s; 0 hardware writes",
+           nm_hdmi::nativeResultName(result.result),
+           nm_hdmi::stageName(result.failedStage));
+    IOLockUnlock(fDDCLock);
+    return kIOReturnUnsupported;
+#endif
+}
+
 /* Reporting-only: root passes ANV's queried shared heap, never a scanout map. */
 IOReturn NMIntelFB::setProperties(OSObject *properties)
 {
     auto outer = OSDynamicCast(OSDictionary, properties);
+    if (outer && outer->getObject("XeGfxHDMINativeDryRun")) {
+        if (outer->getObject("XeGfxHDMINativeDryRun") != kOSBooleanTrue)
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+                kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return dryRunHDMINative();
+    }
     if (outer && outer->getObject("XeGfxHDMIModesetPreflight")) {
         if (outer->getObject("XeGfxHDMIModesetPreflight") != kOSBooleanTrue)
             return kIOReturnBadArgument;
@@ -824,6 +898,7 @@ bool NMIntelFB::start(IOService *provider)
     setProperty("NMIntelFBHDMIDDCProbeCount", 0ull, 32);
     setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
     setProperty("NMIntelFBHDMIModePlanStatus", "not-requested");
+    setProperty("NMIntelFBHDMINativeStatus", "not-requested");
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);

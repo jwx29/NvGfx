@@ -260,3 +260,13 @@ sudo ./hdmi-modeset-preflight
 This patch is NOT a working HDMI video driver. Power-well ownership,
 C10 sideband/PLL setup, GGTT/DBUF, the independent framebuffer and
 MTL+ HDMI port/transcoder ordering remain substantial missing pieces.
+
+## Native sequence and C10 transport staging
+
+A detailed implementation/verification matrix is maintained in
+[`XEGFX-HDMI-NATIVE-IMPLEMENTATION-STATUS.md`](XEGFX-HDMI-NATIVE-IMPLEMENTATION-STATUS.md).
+The MTL PW_2/PW_B registers are decoded, a C10 PHY B message-bus
+transport is implemented but never called while PHY resources are not
+owned, and an 11-stage transactional bring-up/rollback contract is
+unit tested. A privileged dry-run reports missing native hardware
+backends; this is not yet a fully working HDMI display.
