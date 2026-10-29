@@ -89,3 +89,33 @@ Do NOT toggle TRANS_CONF_B bit31 as a shortcut. In particular, recent
 i915 MTL+ HDMI enable ordering configures/enables the port before
 the transcoder; a partial register sequence risks hanging the desktop.
 Source: https://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg385935.html
+
+## EDID-derived timing descriptor (staged, not applied)
+
+A portable, checksum-validated parser in `kexts/NMIntelFB/hdmi_edid_timing.h`
+reads the **first detailed timing descriptor** from EDID 1.3/1.4,
+accepting only digital separate-sync timings with internally consistent
+pixel clock, active size, blanking and sync windows. The one-shot HDMI
+probe publishes `NMIntelFBHDMIPreferredTiming` (10 little-endian
+`uint32_t` values, 40 bytes) only when a validated EDID yields such a
+mode, and removes it before every new DDC read. Layout:
+
+```text
+pixelClockHz,
+hActive, hSyncStart, hSyncEnd, hTotal,
+vActive, vSyncStart, vSyncEnd, vTotal,
+edidSyncFlags
+```
+
+For the validated HP 25x EDID, expect:
+`148500000, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125, 0x1e`.
+This is **not a modeset**; no registers are written by the parser.
+
+Offline parser test (may also pass the known-good EDID):
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -I kexts/NMIntelFB \\
+  tools/test_hdmi_edid_timing.cpp -o /tmp/test_hdmi_edid_timing
+/tmp/test_hdmi_edid_timing
+/tmp/test_hdmi_edid_timing /path/to/hdmi-monitor-edid.bin
+```

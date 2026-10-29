@@ -20,6 +20,7 @@
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
 #include "hdmi_gmbus.h"
+#include "hdmi_edid_timing.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -339,6 +340,7 @@ IOReturn NMIntelFB::probeHDMIEDID()
     // identity after a disconnect. The connector is not advertised to
     // WindowServer until a native DDI B scanout actually exists.
     removeProperty("NMIntelFBHDMIEDID");
+    removeProperty("NMIntelFBHDMIPreferredTiming");
     setProperty("NMIntelFBHDMIEDIDStatus", "reading");
     uint8_t edid[256] = {};
     size_t length = 0;
@@ -354,6 +356,16 @@ IOReturn NMIntelFB::probeHDMIEDID()
             published = setProperty("NMIntelFBHDMIEDID", data);
             data->release();
         }
+        // Parse EDID's preferred 18-byte DTD into a hardware-independent
+        // timing descriptor. This is input for future HDMI B modesetting,
+        // not a request to change or enable any display register.
+        nm_hdmi::Timing mode = {};
+        if (published && nm_hdmi::parsePreferredTiming(edid, length, mode)) {
+            if (OSData *timing = OSData::withBytes(&mode, sizeof(mode))) {
+                setProperty("NMIntelFBHDMIPreferredTiming", timing);
+                timing->release();
+            }
+        }
     }
     const char *status = result == nm_hdmi::Status::ok && !published ?
         "allocation-failed" : nm_hdmi::statusName(result);
@@ -365,7 +377,8 @@ IOReturn NMIntelFB::probeHDMIEDID()
     // are "unknown", never proof the monitor was unplugged.
     const int nextState = published ? 1 :
         result == nm_hdmi::Status::nak ? 0 : -1;
-    if (nextState != fHDMIDDCState) ++fHDMIDDCGeneration;
+    const bool stateChanged = nextState != fHDMIDDCState;
+    if (stateChanged) ++fHDMIDDCGeneration;
     fHDMIDDCState = nextState;
     ++fHDMIDDCProbeCount;
     setProperty("NMIntelFBHDMIDDCState", nextState == 1 ? "connected" :
@@ -374,9 +387,8 @@ IOReturn NMIntelFB::probeHDMIEDID()
     setProperty("NMIntelFBHDMIDDCProbeCount", (uint64_t)fHDMIDDCProbeCount, 32);
     // Never signal kIOFBConnectInterruptType here: this class still owns
     // only eDP pipe A, not an independent HDMI IOFramebuffer.
-    if (fHDMIDDCProbeCount <= 8 || (fHDMIDDCProbeCount % 32) == 0 ||
-        (nextState != -1 && fHDMIDDCGeneration != 0 &&
-         nextState != 1)) {
+    if (stateChanged || fHDMIDDCProbeCount <= 8 ||
+        (fHDMIDDCProbeCount % 32) == 0) {
         IFBLOG("HDMI DDC/GMBUS2 probe on DDI B: %s, state=%s, generation=%u, %lu bytes, GMBUS2=0x%08x (no modeset)",
                status, nextState == 1 ? "connected" :
                        nextState == 0 ? "unresponsive" : "unknown",
