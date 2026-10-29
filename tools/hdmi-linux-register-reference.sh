@@ -9,12 +9,27 @@ if [[ ${1:-} != "" && ${1:-} != "--i-understand-mmio-risk" ]]; then
     exit 2
 fi
 
-GPU=/sys/kernel/debug/dri/0000:00:02.0
-if [[ ! -d $GPU ]]; then
-    echo "GPU debugfs directory not found: $GPU" >&2
-    echo "Mount debugfs or confirm the Intel GPU PCI address before continuing." >&2
+# Debugfs is often root-only. A normal-user "[[ -d ... ]]" returns
+# false on EACCES and incorrectly reports a missing GPU directory.
+# Authenticate once and use sudo for discovery as well as file reads.
+sudo -v
+DEBUG_DRI=/sys/kernel/debug/dri
+GPU=$DEBUG_DRI/0000:00:02.0
+
+if ! sudo test -r "$GPU/i915_display_info"; then
+    # Depending on the kernel, DRM debugfs entries may be named by a
+    # numeric minor (e.g. dri/1) rather than the PCI BDF.
+    GPU=$(sudo find "$DEBUG_DRI" -mindepth 2 -maxdepth 2 \
+        -type f -name i915_display_info -printf '%h\n' -quit 2>/dev/null) || GPU=
+fi
+if [[ -z $GPU ]] || ! sudo test -r "$GPU/i915_display_info"; then
+    echo "Could not find readable i915_display_info under $DEBUG_DRI" >&2
+    echo "Check: sudo ls -la $DEBUG_DRI" >&2
+    echo "If debugfs is not mounted: sudo mount -t debugfs debugfs /sys/kernel/debug" >&2
+    echo "Also confirm this is native Nobara Linux, not WSL or another OS." >&2
     exit 1
 fi
+echo "# Selected Intel DRM debugfs path: $GPU"
 
 echo "# Linux i915 HDMI DDI B reference (with HDMI actively displaying 1080p60)"
 echo "# Date: $(date -u -Is)"
