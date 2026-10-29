@@ -60,7 +60,7 @@ struct xg_i915_hdmi_surface {
     unsigned long long ggtt_offset;
     unsigned long long kva; /* kernel pointer; never publish it */
 };
-int xg_i915_hdmi_surface(struct xg_i915_hdmi_surface *request);
+int xg_i915_hdmi_surface_manage(struct xg_i915_hdmi_surface *request);
 void xg_i915_hdmi_surface_cleanup(void);
 
 /* all return 0 with the report filled, or -ENODEV when no i915 device is bound */

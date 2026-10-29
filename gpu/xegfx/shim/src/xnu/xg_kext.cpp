@@ -196,7 +196,7 @@ XeGfxResident::setProperties(OSObject *properties)
 		fb.pitch=7680;
 		fb.bytes=1920ull*1080ull*4ull;
 	}
-	int err=xg_i915_hdmi_surface(&fb);
+	int err=xg_i915_hdmi_surface_manage(&fb);
 	setProperty("XeGfxHDMIScanoutLastErrno", (uint64_t)(-err), 32);
 	setProperty("XeGfxHDMIScanoutStatus", err == 0 ?
 	            (fb.bytes ? "allocated-ggtt-not-displayed" : "released") :
@@ -217,7 +217,7 @@ XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, v
 	if (name && name->isEqualTo("xgHdmiSurface") && p1) {
 		if (gStage < 4 || gRunning)
 			return kIOReturnNotReady;
-		int rc=xg_i915_hdmi_surface((struct xg_i915_hdmi_surface *)p1);
+		int rc=xg_i915_hdmi_surface_manage((struct xg_i915_hdmi_surface *)p1);
 		if (p2) *(int *)p2=rc;
 		return rc == 0 ? kIOReturnSuccess : kIOReturnError;
 	}

@@ -266,7 +266,7 @@ void xg_i915_hdmi_surface_cleanup(void)
 	mutex_unlock(&xg_hdmi_surface_lock);
 }
 
-int xg_i915_hdmi_surface(struct xg_i915_hdmi_surface *request)
+int xg_i915_hdmi_surface_manage(struct xg_i915_hdmi_surface *request)
 {
 	struct drm_i915_gem_object *obj = NULL;
 	struct i915_vma *vma = NULL;
