@@ -39,6 +39,33 @@ for f in /sys/class/drm/card[0-9]*/device/driver; do
     [ -L "$f" ] || continue
     printf '%s: %s\n' "$f" "$(readlink -f "$f")"
 done
+echo "=== DRM atomic KMS state (connector, encoder, CRTC, plane) ==="
+debug_state=0
+for f in /sys/kernel/debug/dri/*/state; do
+    [ -f "$f" ] || continue
+    debug_state=$((debug_state + 1))
+    if [ -r "$f" ]; then
+        echo "===== $f ====="
+        sed -n '1,1100p' "$f"
+    else
+        echo "$f: permission denied; try sudo bash tools/hdmi-linux-probe.sh"
+    fi
+done
+if [ "$debug_state" -eq 0 ]; then
+    echo "No DRM atomic KMS debug state found; inspect debugfs mount and kernel config"
+fi
+echo "=== Optional modetest connector/encoder/CRTC enumeration ==="
+if command -v modetest >/dev/null 2>&1; then
+    modetest -M i915 -c -e -p 2>&1 | sed -n '1,280p' || :
+else
+    echo "modetest not installed (usually provided by libdrm-tests)"
+fi
+echo "=== Optional drm_info output ==="
+if command -v drm_info >/dev/null 2>&1; then
+    drm_info 2>&1 | sed -n '1,260p' || :
+else
+    echo "drm_info not installed; optional only"
+fi
 echo "=== Optional i915 connector-to-DDI diagnostic ==="
 for f in /sys/kernel/debug/dri/*/i915_display_info; do
     [ -f "$f" ] || continue
