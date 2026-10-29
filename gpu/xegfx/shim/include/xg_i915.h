@@ -38,6 +38,31 @@ struct xg_i915_store {
 	int		err[XG_I915_MAX_ENGINES];
 };
 
+/*
+ * Distinct HDMI B scanout lease in i915-owned system-memory GEM/GGTT.
+ * The release/teardown must happen before unloading XeGfx.
+ * ABI uses plain types so C (LinuxKPI) and C++ (IOKit) share layout.
+ * 'kva' is kernel-only and MUST NEVER be sent to userspace/IORegistry.
+ * This service only allocates/pins/maps memory. It does not enable HDMI.
+ */
+#define XG_HDMI_SURFACE_ABI 0x58485331u  /* XHS1 */
+#define XG_HDMI_SURFACE_ALLOC 1u
+#define XG_HDMI_SURFACE_QUERY 2u
+#define XG_HDMI_SURFACE_RELEASE 3u
+struct xg_i915_hdmi_surface {
+    unsigned int abi;
+    unsigned int op;
+    unsigned int width;
+    unsigned int height;
+    unsigned int pitch;
+    unsigned int reserved;
+    unsigned long long bytes;
+    unsigned long long ggtt_offset;
+    unsigned long long kva; /* kernel pointer; never publish it */
+};
+int xg_i915_hdmi_surface(struct xg_i915_hdmi_surface *request);
+void xg_i915_hdmi_surface_cleanup(void);
+
 /* all return 0 with the report filled, or -ENODEV when no i915 device is bound */
 int xg_i915_state(struct xg_i915_state *st);
 /* I-116 A/B: 1 keeps every GT awake (wakeref), 2 also holds forcewake on all domains; the GT count, or -ENODEV */

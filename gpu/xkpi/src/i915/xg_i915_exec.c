@@ -7,6 +7,8 @@
  */
 #include <linux/pci.h>
 #include <linux/string.h>
+#include <linux/mutex.h>
+#include <linux/err.h>
 
 #include "i915_drv.h"
 #include "i915_request.h"
@@ -19,6 +21,10 @@
 #include "gt/uc/intel_uc.h"
 #include "gt/intel_gtt.h"
 #include "i915_gem_gtt.h"
+#include "i915_gem.h"
+#include "i915_vma.h"
+#include "gem/i915_gem_object.h"
+#include "gem/i915_gem_shmem.h"
 
 #include "xg_i915.h"
 
@@ -219,4 +225,134 @@ xg_i915_reserve_bootfb(unsigned long long offset, unsigned long long size)
 	err = i915_gem_gtt_reserve(&ggtt->vm, NULL, &node, size, offset, I915_COLOR_UNEVICTABLE, PIN_NOEVICT);
 	mutex_unlock(&ggtt->vm.mutex);
 	return (err);
+}
+
+/*
+ * A real HDMI B scanout allocation owned by XeGfx's already-initialized
+ * i915 GEM/GGTT allocator. It is deliberately NOT connected to a plane yet.
+ * Using the allocator (rather than hand-writing GGTT PTEs) ensures it
+ * respects xg_i915_reserve_bootfb() and all other i915 placements.
+ *
+ * Single owner + mutex: no stale kernel pointers may be returned once
+ * RELEASE is requested. A later real HDMI framebuffer backend must keep
+ * this lease alive until it has quiesced the plane, VBL and copy paths.
+ * No access from userspace directly: XeGfxResident enforces root.
+ */
+static DEFINE_MUTEX(xg_hdmi_surface_lock);
+static struct {
+	struct drm_i915_gem_object *obj;
+	struct i915_vma *vma;
+	void *cpu;
+	u64 offset;
+	u64 size;
+} xg_hdmi_surface;
+
+static void xg_hdmi_surface_free_locked(void)
+{
+	if (xg_hdmi_surface.obj) {
+		if (xg_hdmi_surface.cpu)
+			i915_gem_object_unpin_map(xg_hdmi_surface.obj);
+		if (xg_hdmi_surface.vma)
+			i915_vma_unpin(xg_hdmi_surface.vma);
+		i915_gem_object_put(xg_hdmi_surface.obj);
+	}
+	memset(&xg_hdmi_surface, 0, sizeof(xg_hdmi_surface));
+}
+
+void xg_i915_hdmi_surface_cleanup(void)
+{
+	mutex_lock(&xg_hdmi_surface_lock);
+	xg_hdmi_surface_free_locked();
+	mutex_unlock(&xg_hdmi_surface_lock);
+}
+
+int xg_i915_hdmi_surface(struct xg_i915_hdmi_surface *request)
+{
+	struct drm_i915_gem_object *obj = NULL;
+	struct i915_vma *vma = NULL;
+	struct drm_i915_private *i915;
+	struct pci_dev *pdev;
+	u64 bytes = (u64)1920u * 1080u * 4u;
+	void *cpu = NULL;
+	int err = 0;
+
+	if (!request || request->abi != XG_HDMI_SURFACE_ABI)
+		return -EINVAL;
+	if (request->op != XG_HDMI_SURFACE_ALLOC &&
+	    request->op != XG_HDMI_SURFACE_RELEASE &&
+	    request->op != XG_HDMI_SURFACE_QUERY)
+		return -EINVAL;
+	mutex_lock(&xg_hdmi_surface_lock);
+	if (request->op == XG_HDMI_SURFACE_RELEASE) {
+		xg_hdmi_surface_free_locked();
+		goto report;
+	}
+	if (request->op == XG_HDMI_SURFACE_QUERY) {
+		if (!xg_hdmi_surface.obj)
+			err = -ENOENT;
+		goto report;
+	}
+	/* Only the Linux-verified CEA 1080p60 XRGB8888 first mode. */
+	if (request->width != 1920u || request->height != 1080u ||
+	    request->pitch != 7680u || request->bytes != bytes) {
+		err = -EINVAL;
+		goto report;
+	}
+	if (xg_hdmi_surface.obj) {
+		err = -EBUSY;
+		goto report;
+	}
+	if ((i915 = xg_i915_find(&pdev)) == NULL) {
+		err = -ENODEV;
+		goto report;
+	}
+	obj = i915_gem_object_create_shmem(i915, bytes);
+	if (IS_ERR(obj)) {
+		err = PTR_ERR(obj);
+		goto put_pci;
+	}
+	/* Meteor Lake's display planes consume un-snooped memory.
+	 * Keep the framebuffer in system memory and CPU-accessible.
+	 */
+	i915_gem_object_set_cache_coherency(obj, I915_CACHE_NONE);
+	vma = i915_gem_object_ggtt_pin(obj, NULL, 0, 65536u, PIN_GLOBAL);
+	if (IS_ERR(vma)) {
+		err = PTR_ERR(vma);
+		goto put_obj;
+	}
+	cpu = i915_gem_object_pin_map(obj, I915_MAP_WC);
+	if (IS_ERR(cpu)) {
+		err = PTR_ERR(cpu);
+		goto unpin_vma;
+	}
+	memset(cpu, 0, bytes);
+	i915_gem_object_flush_map(obj);
+	if ((u64)i915_ggtt_offset(vma) + bytes > 0x100000000ULL) {
+		err = -ERANGE; /* PLANE_SURF_B has a 32-bit GGTT offset */
+		goto unpin_map;
+	}
+	xg_hdmi_surface.obj = obj;
+	xg_hdmi_surface.vma = vma;
+	xg_hdmi_surface.cpu = cpu;
+	xg_hdmi_surface.offset = i915_ggtt_offset(vma);
+	xg_hdmi_surface.size = bytes;
+	pci_dev_put(pdev);
+	goto report;
+unpin_map:
+	i915_gem_object_unpin_map(obj);
+unpin_vma:
+	i915_vma_unpin(vma);
+put_obj:
+	i915_gem_object_put(obj);
+put_pci:
+	pci_dev_put(pdev);
+report:
+	request->width = xg_hdmi_surface.obj ? 1920u : 0;
+	request->height = xg_hdmi_surface.obj ? 1080u : 0;
+	request->pitch = xg_hdmi_surface.obj ? 7680u : 0;
+	request->bytes = xg_hdmi_surface.size;
+	request->ggtt_offset = xg_hdmi_surface.offset;
+	request->kva = (unsigned long long)(unsigned long)xg_hdmi_surface.cpu;
+	mutex_unlock(&xg_hdmi_surface_lock);
+	return err;
 }

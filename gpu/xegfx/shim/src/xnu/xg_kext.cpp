@@ -10,11 +10,13 @@
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IONVRAM.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <architecture/i386/pio.h>
 #include <kern/thread_call.h>
 #include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSNumber.h>
 #include <mach/kmod.h>
 #include <sys/errno.h>
@@ -80,6 +82,8 @@ class XeGfxResident : public IOService {
 	OSDeclareDefaultStructors(XeGfxResident)
 public:
 	bool start(IOService *provider) override;
+	void stop(IOService *provider) override;
+	IOReturn setProperties(OSObject *properties) override;
 	using IOService::callPlatformFunction;
 	IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
 };
@@ -146,10 +150,77 @@ XeGfxResident::start(IOService *provider)
 	return true;
 }
 
+/*
+ * Explicit single-surface HDMI B GGTT allocation test.
+ * This is REAL i915 GEM+GGTT allocation, but NEVER a display modeset.
+ * The only user-facing fields are the offset and allocation size:
+ * the returned CPU kernel pointer MUST NOT enter IORegistry/userspace.
+ */
+void
+XeGfxResident::stop(IOService *provider)
+{
+	if (gStage >= 4)
+		xg_i915_hdmi_surface_cleanup();
+	if (gResident == this)
+		gResident = nullptr;
+	IOService::stop(provider);
+}
+
+IOReturn
+XeGfxResident::setProperties(OSObject *properties)
+{
+	OSDictionary *request=OSDynamicCast(OSDictionary, properties);
+	if (!request)
+		return IOService::setProperties(properties);
+	OSObject *a=request->getObject("XeGfxHDMIScanoutAllocate");
+	OSObject *q=request->getObject("XeGfxHDMIScanoutQuery");
+	OSObject *d=request->getObject("XeGfxHDMIScanoutRelease");
+	if (!a && !q && !d)
+		return IOService::setProperties(properties);
+	if ((a && a != kOSBooleanTrue) || (q && q != kOSBooleanTrue) ||
+	    (d && d != kOSBooleanTrue) || (!!a + !!q + !!d) != 1)
+		return kIOReturnBadArgument;
+	if (IOUserClient::clientHasPrivilege(current_task(),
+	        kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+		return kIOReturnNotPrivileged;
+	/* i915 and GGTT must be attached; never overlap stage initialisation. */
+	if (gStage < 4 || gRunning)
+		return kIOReturnNotReady;
+	struct xg_i915_hdmi_surface fb = {};
+	fb.abi = XG_HDMI_SURFACE_ABI;
+	fb.op = a ? XG_HDMI_SURFACE_ALLOC :
+	        d ? XG_HDMI_SURFACE_RELEASE : XG_HDMI_SURFACE_QUERY;
+	if (a) {
+		fb.width=1920;
+		fb.height=1080;
+		fb.pitch=7680;
+		fb.bytes=1920ull*1080ull*4ull;
+	}
+	int err=xg_i915_hdmi_surface(&fb);
+	setProperty("XeGfxHDMIScanoutLastErrno", (uint64_t)(-err), 32);
+	setProperty("XeGfxHDMIScanoutStatus", err == 0 ?
+	            (fb.bytes ? "allocated-ggtt-not-displayed" : "released") :
+	            "allocation-or-query-failed");
+	setProperty("XeGfxHDMIScanoutGGTTOffset", fb.ggtt_offset, 64);
+	setProperty("XeGfxHDMIScanoutBytes", fb.bytes, 64);
+	setProperty("XeGfxHDMIScanoutPitch", (uint64_t)fb.pitch, 32);
+	IOLog("XeGfx: HDMI B owned GEM/GGTT %s rc=%d offset 0x%llx bytes %llu (NO modeset)\\n",
+	      a ? "allocate" : d ? "release" : "query", err,
+	      fb.ggtt_offset, fb.bytes);
+	return err == 0 ? kIOReturnSuccess : kIOReturnError;
+}
+
 /* "xgDrmIoctl" (minor, cmd, user arg, int *errno): DRM for WindowServer, through XeGfxAccel's user client */
 IOReturn
 XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+	if (name && name->isEqualTo("xgHdmiSurface") && p1) {
+		if (gStage < 4 || gRunning)
+			return kIOReturnNotReady;
+		int rc=xg_i915_hdmi_surface((struct xg_i915_hdmi_surface *)p1);
+		if (p2) *(int *)p2=rc;
+		return rc == 0 ? kIOReturnSuccess : kIOReturnError;
+	}
 	if (name && name->isEqualTo("xgDrmIoctl") && p4) {
 		*(int *)p4 = xg_fd_remote_ioctl((int)(uintptr_t)p1, (unsigned long)p2, (unsigned long long)(uintptr_t)p3);
 		return kIOReturnSuccess;
