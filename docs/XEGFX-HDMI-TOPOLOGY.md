@@ -102,6 +102,41 @@ Raw firmware dumps were **not** committed to the repository.
 Keep the original binaries local and avoid assuming a VBT will be
 located inside every macOS OpRegion mapping.
 
+### Known-good external HDMI monitor EDID (Linux, 2026-10-29)
+
+A raw **256-byte** EDID from `/sys/class/drm/card1-HDMI-A-1/edid` was
+uploaded and independently checked. Its EDID base and CTA-861 extension
+both have valid 8-bit checksums (sum modulo 256 = 0).
+
+- Monitor name: **HP 25x**; manufacturer **HPN**, product code `0x357F`.
+- EDID revision **1.3**; one CTA-861 revision 3 extension, total 2 blocks.
+- EDID base-block preferred DTD: **1920×1080 @ 60 Hz**,
+  148.50 MHz pixel clock; horizontal 2008–2052 sync / total 2200;
+  vertical 1084–1089 sync / total 1125.
+- CTA extension also describes **1920×1080 @ 50 Hz** (148.50 MHz),
+  **120 Hz** (285.50 MHz, total 2080×1144) and
+  **144 Hz** (346.50 MHz, total 2080×1157).
+- For 120 and 144 Hz: hsync 1968–2000; vsync 1083–1088.
+  All rates above are nominal; the exact high-rate DTDs calculate
+  approximately 119.98 and 143.98 Hz, respectively.
+- CTA extension has HDMI and HDMI Forum vendor-specific blocks
+  (OUIs `0x000C03` and `0xC45DD8`); HDMI monitor EDID is distinct
+  from the Lenovo internal-panel EDID in the OpRegion.
+- The **144 Hz HDMI timings exactly match** the active pipe B
+  timings reported by Linux `i915_display_info`.
+
+**EDID regression test for future XeGfx DDI B / GMBUS pin 2 reader:**
+expect an EDID header `00 ff ff ff ff ff ff 00`, manufacturer HPN,
+product `0x357F`, reported extension count 1, 256 accessible bytes,
+and zero checksum remainder for both 128-byte blocks. Check the
+preferred 1080p60 DTD before attempting a conservative **1080p60**
+modeset; *do not* derive a hardware connector BusID from the
+Linux adapter index (`i2c-3`).
+
+This monitor can expose a unique serial number in raw EDID. Only
+non-sensitive fields and timings are recorded here; the binary itself
+was **not** committed.
+
 ### Consequences for HDMI support
 
 No HDMI BusID remap is indicated by the firmware: EFP1 is already
