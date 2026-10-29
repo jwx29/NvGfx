@@ -533,7 +533,7 @@ bool NMIntelFB::start(IOService *provider)
         IFBLOG("Linux-confirmed HDMI reference: DDI B/PHY B, pipe B; raw firmware TRANSCONF_B=0x%08x PLANE_CTL_B=0x%08x (read only, no modeset)",
                rd(TRANSCONF(1)), rd(PLANE_CTL(1)));
     }
-    if (!adoptFirmwareMode() { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Scan out at the boot console's address (what IONDRV uses), never BAR2 + PLANE_SURF: on display 14 CPU access to
     // stolen memory through the BAR can hang the machine (Linux i915 Wa_22018444074).
     {
