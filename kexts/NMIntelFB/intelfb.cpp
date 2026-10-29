@@ -19,6 +19,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "hdmi_gmbus.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -131,6 +132,7 @@ constexpr uint32_t tileOf(uint32_t ctl) { return (ctl >> 10) & 0x7; }
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
+    IOLock *fDDCLock = nullptr; // protects opt-in GMBUS probe against stop()
     IOMemoryMap *fMMIO = nullptr;
     IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out surface (NVIDIA frames land here)
     // WindowServer paces an accelerated display on its VBL interrupt: the NVIDIA display pipe completes each frame on it.
@@ -188,6 +190,7 @@ private:
 
     uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
     bool adoptFirmwareMode();
+    IOReturn probeHDMIEDID();
     // nmintelfbcache=1 write-combined, 2 cache-inhibited, else IOKit's default for device memory
     void mapSurface() {
         unsigned c = 0; PE_parse_boot_argn("nmintelfbcache", &c, sizeof c);
@@ -291,10 +294,85 @@ public:
 
 OSDefineMetaClassAndStructors(NMIntelFB, IOFramebuffer)
 
+// Wrapper for bounded GMBUS register traffic; no other display
+// registers are written, and the PCI BAR mapping is validated before use.
+struct NMHDMIMMIO {
+    volatile uint8_t *regs;
+    uint32_t read32(uint32_t offset) const {
+        return *(volatile uint32_t *)(regs + offset);
+    }
+    void write32(uint32_t offset, uint32_t value) const {
+        *(volatile uint32_t *)(regs + offset) = value;
+        OSMemoryBarrier();
+    }
+    void delayUs(unsigned us) const { IODelay(us); }
+};
+
+IOReturn NMIntelFB::probeHDMIEDID()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return kIOReturnUnsupported;
+#else
+    if (!fDDCLock) return kIOReturnNotReady;
+    IOLockLock(fDDCLock);
+    // Only the Linux/VBT-confirmed Intel 7d55 Lenovo 3813 configuration.
+    // Refuse if boot firmware is scanning out from a different pipe or the
+    // mapped BAR cannot cover the PCH GMBUS register bank.
+    const bool valid = !fStopping && fRegs && fMMIO &&
+        fMMIO->getLength() >= nm_hdmi::kGMBUS3 + sizeof(uint32_t) &&
+        fPCI && fPCI->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
+        fPCI->configRead16(kIOPCIConfigDeviceID) == 0x7d55 &&
+        fPCI->configRead16(0x2c) == 0x17aa &&
+        fPCI->configRead16(0x2e) == 0x3813 &&
+        fPipe == 0 && fWidth == 1920 && fHeight == 1200;
+    if (!valid) {
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    // Do not expose stale EDID if a later probe fails or the cable is removed.
+    removeProperty("NMIntelFBHDMIEDID");
+    setProperty("NMIntelFBHDMIEDIDStatus", "reading");
+    uint8_t edid[256] = {};
+    size_t length = 0;
+    uint32_t gmbus2 = 0;
+    NMHDMIMMIO io = { fRegs };
+    const nm_hdmi::Status result =
+        nm_hdmi::readEDID(io, edid, length, gmbus2);
+    setProperty("NMIntelFBHDMIEDIDGMBUS2", gmbus2, 32);
+    setProperty("NMIntelFBHDMIEDIDLength", (uint64_t)length, 32);
+    bool published = false;
+    if (result == nm_hdmi::Status::ok) {
+        if (OSData *data = OSData::withBytes(edid, (unsigned)length)) {
+            published = setProperty("NMIntelFBHDMIEDID", data);
+            data->release();
+        }
+    }
+    const char *status = result == nm_hdmi::Status::ok && !published ?
+        "allocation-failed" : nm_hdmi::statusName(result);
+    setProperty("NMIntelFBHDMIEDIDStatus", status);
+    IFBLOG("HDMI DDC/GMBUS2 one-shot probe on DDI B: %s, %lu validated bytes, GMBUS2=0x%08x (no modeset)",
+           status, (unsigned long)(published ? length : 0), gmbus2);
+    IOLockUnlock(fDDCLock);
+    bzero(edid, sizeof(edid)); // limit lifetime of monitor's serial/EDID
+    return published ? kIOReturnSuccess : kIOReturnError;
+#endif
+}
+
 /* Reporting-only: root passes ANV's queried shared heap, never a scanout map. */
 IOReturn NMIntelFB::setProperties(OSObject *properties)
 {
     auto outer = OSDynamicCast(OSDictionary, properties);
+    // Explicit root-only request; not performed at boot. The GMBUS transaction
+    // touches DDC control registers but NEVER a display pipe, PLL or PHY.
+    if (outer && outer->getObject("XeGfxHDMIEDIDProbe")) {
+        if (outer->getObject("XeGfxHDMIEDIDProbe") != kOSBooleanTrue)
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+                kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return probeHDMIEDID();
+    }
     OSObject *payload = outer ? outer->getObject("XeGfxGPUIdentity") : nullptr;
     if (!payload) return IOFramebuffer::setProperties(properties);
 
@@ -598,6 +676,10 @@ bool NMIntelFB::start(IOService *provider)
            "invalid/incomplete firmware timing");
 }
 
+    // Optional GMBUS probe lock: no DDC activity until an admin tool invokes
+    // setProperties. Do not fail boot if the diagnostic lock is unavailable.
+    fDDCLock = IOLockAlloc();
+    setProperty("NMIntelFBHDMIEDIDStatus", fDDCLock ? "not-requested" : "unavailable");
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);
@@ -614,7 +696,9 @@ void NMIntelFB::stop(IOService *provider)
 #endif
     // thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out (as NVRMFB)
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
+    if (fDDCLock) IOLockLock(fDDCLock);
     OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
+    if (fDDCLock) { IOLockUnlock(fDDCLock); IOLockFree(fDDCLock); fDDCLock = nullptr; }
     IOFramebuffer::stop(provider);
 }
 
