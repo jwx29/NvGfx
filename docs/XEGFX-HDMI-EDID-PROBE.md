@@ -77,6 +77,31 @@ Intel reference: GMBUS2.INUSE read-to-acquire/one-to-clear,
 section 2.2.6. Linux source:
 <https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/display/intel_gmbus.c.html>.
 
+## Hardware verification — 29 October 2026
+
+The user successfully ran the corrected probe under macOS Sequoia on the
+Lenovo Intel 8086:7d55 / 17aa:3813 laptop with an HP 25x on HDMI. The
+resulting `hdmi-edid-macos.bin` was compared byte-for-byte against the
+previously exported Linux `hdmi-monitor-edid.bin`:
+
+- Both files contain **256 bytes** and are **exactly identical (0 differing bytes)**.
+- Base EDID and CTA extension checksums are both valid (sum mod 256 = 0).
+- Both identify manufacturer **HPN**, product **0x357f** and a
+  1080p60 preferred mode with CTA 1080p144 timing.
+- This validates the macOS DDI B / GMBUS pin 2 hardware DDC path and the
+  corrected GMBUS semaphore acquisition/release implementation.
+- The earlier failure (`busy`, `GMBUS2=0x8000`) was caused by a
+  double-read of the read-to-acquire `GMBUS2.INUSE` semaphore and
+  was corrected before the successful EDID capture.
+
+**What remains unverified:** live HPD interrupt/plug detection, DDI B
+PHY/PLL and HDMI TMDS output configuration, pipe B scanout ownership,
+a separate macOS `IOFramebuffer` head, and display sleep/wake. Do not
+conflate successful DDC readback with HDMI video output. Preserve eDP
+pipe A throughout future bring-up.
+
+The monitor's raw EDID and serial number are **not** committed.
+
 ## Failure codes
 
 - `busy`: GMBUS0 nonzero or controller INUSE/ACTIVE; refuse to seize another user's bus.
