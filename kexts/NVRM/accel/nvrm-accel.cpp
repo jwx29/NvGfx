@@ -1513,13 +1513,20 @@ NVACCEL_CNT(nvaccel_iop_ok_h1,        gCntIopOkHead[1],   "frames copied to head
 NVACCEL_CNT(nvaccel_iop_ok_h2,        gCntIopOkHead[2],   "frames copied to head 2's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h3,        gCntIopOkHead[3],   "frames copied to head 3's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h4,        gCntIopOkHead[4],   "frames copied to head 4 (an Intel built-in panel, NMIntelFB)");
+#ifdef NMX_XEGFX
+NVACCEL_CNT(nvaccel_iop_ok_h5,        gCntIopOkHead[5],   "XeGfx only: frames copied to an explicitly marked native HDMI head 5");
+#endif
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_published, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadsPublished, 0,
             "bit i = head i's framebuffer has published to the accelerator");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvHeadsRegistered, 0,
             "bit i = head i's framebuffer was handed to the display machine (found_framebuffer)");
 SYSCTL_UINT(_debug, OID_AUTO, nvaccel_heads_piped, CTLFLAG_RD | CTLFLAG_LOCKED, &gNvHeadsPiped, 0,
             "bit i = head i has a display pipe that drives ITS OWN framebuffer (pipe+0x98 read back)");
-static_assert(kNvMaxFB == 5, "kNvMaxFB changed: add debug.nvaccel_iop_ok_h<i> for every new head");
+#ifdef NMX_XEGFX
+static_assert(kNvMaxFB == 6, "XeGfx requires heads 0..5 including staged HDMI head 5");
+#else
+static_assert(kNvMaxFB == 5, "Non-XeGfx requires its original heads 0..4");
+#endif
 NVACCEL_CNT(nvaccel_iop_fail,         gCntIopFail,        "K3: transactions refused (see the capped iop: log lines)");
 NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with no plane (gamma/options only)");
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
