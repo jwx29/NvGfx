@@ -242,9 +242,16 @@ def compile_one(args):
         fl = [x for x in fl if x not in ("-Wno-everything", "-ferror-limit=1")] + ["-ferror-limit=40", "-Wall", "-Wno-sign-conversion", "-Wno-shorten-64-to-32", "-Wno-macro-redefined", "-Wno-unused-variable", "-Wno-unused-function", "-Werror=implicit-function-declaration"]
     r = subprocess.run(["xcrun", "clang"] + fl + out + [path], capture_output=True, text=True)
     err = next((l for l in r.stderr.splitlines() if " error: " in l), "")
+    if r.returncode != 0 and not err:
+        if r.returncode < 0:
+            err = f"clang terminated by signal {-r.returncode}"
+        else:
+            err = next((l for l in reversed(r.stderr.splitlines()) if l.strip()),
+                       f"clang exited {r.returncode} without diagnostics")
     if mod == "shim" and r.stderr.strip():
         print(r.stderr)
-    return mod, os.path.relpath(path, KMOD), r.returncode == 0, err
+    return (mod, os.path.relpath(path, KMOD), r.returncode == 0,
+            err, r.returncode, (r.stderr or r.stdout) if r.returncode else "")
 
 
 def ensure_links():
@@ -261,9 +268,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mods", default="shim,kern,lkpi,drm,dmabuf,ttm,i915")
     ap.add_argument("--obj", action="store_true", help="build objects in out/obj and list undefined symbols")
+    ap.add_argument("--jobs", type=int,
+                    default=int(os.environ.get("XEGFX_JOBS", min(4, os.cpu_count() or 1))),
+                    help="maximum concurrent compiler processes (default: up to 4; XEGFX_JOBS overrides)")
     ap.add_argument("--one", help="compile one shim source (shim flags, all errors shown) into out/one/; for parallel work")
     ap.add_argument("--json", default=os.path.join(ROOT, "out/score.json"))
     a = ap.parse_args()
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
     if a.one:
         src = os.path.abspath(a.one)
         o = os.path.join(ROOT, "out/one", os.path.basename(src) + ".o")
@@ -284,18 +296,37 @@ def main():
     if a.obj:
         OBJ = os.path.join(ROOT, "out/obj")
     jobs = [(m, p) for m in a.mods.split(",") for p in sources(m)]
-    with cf.ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+    print(f"compiling {len(jobs)} sources with {a.jobs} concurrent clang jobs", flush=True)
+    with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
         res = list(ex.map(compile_one, jobs))
+    # A compiler can be killed by memory pressure without printing "error:".
+    # Retry failed sources after the parallel batch finishes; do not mask
+    # persistent compiler errors, which are written to compile-failures.log.
+    for i, item in enumerate(res):
+        if not item[2]:
+            print(f"retrying failed source serially: {item[1]}", flush=True)
+            res[i] = compile_one(jobs[i])
+    failures = [item for item in res if not item[2]]
+    failure_log = os.path.join(ROOT, "out", "compile-failures.log")
+    with open(failure_log, "w") as outlog:
+        for mod, path, _, err, rc, diagnostic in failures:
+            outlog.write(f"FAILED {mod}: {path} (clang exit {rc})\n{diagnostic[-16000:]}\n\n")
+    if failures:
+        print(f"failed sources: {len(failures)}; full diagnostics: {failure_log}")
+        for mod, path, _, err, rc, diagnostic in failures:
+            print(f"  FAILED {mod}: {path} (clang exit {rc}): {err}")
+            if diagnostic:
+                print(diagnostic[-3000:], flush=True)
     if OBJ:
         bad = licence_gate(jobs)
         print(f"licence gate: {len(bad)} GPL-only files compiled or included (out/licence.txt)")
         if bad and OVERLAY:
             print("\n".join("  " + b for b in bad[:40]))
             return 2
-    ok = collections.Counter(m for m, _, good, _ in res if good)
-    tot = collections.Counter(m for m, _, _, _ in res)
+    ok = collections.Counter(m for m, _, good, _, _, _ in res if good)
+    tot = collections.Counter(m for m, _, _, _, _, _ in res)
     missing, kinds = collections.Counter(), collections.Counter()
-    for _, _, good, e in res:
+    for _, _, good, e, _, _ in res:
         if good:
             continue
         m = re.search(r"'([^']+)' file not found", e)
@@ -314,7 +345,9 @@ def main():
         print(f"  {n:4d}  {k}")
     if OBJ:
         undefined_report()
-    json.dump([dict(mod=m, file=f, ok=g, err=e) for m, f, g, e in res], open(a.json, "w"), indent=1)
+    with open(a.json, "w") as report:
+        json.dump([dict(mod=m, file=f, ok=g, err=e, exit_code=rc)
+                   for m, f, g, e, rc, _ in res], report, indent=1)
 
 
 def undefined_report():

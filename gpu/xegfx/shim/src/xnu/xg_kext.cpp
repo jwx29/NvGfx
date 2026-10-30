@@ -10,17 +10,21 @@
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IONVRAM.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <architecture/i386/pio.h>
 #include <kern/thread_call.h>
 #include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSData.h>
 #include <mach/kmod.h>
 #include <sys/errno.h>
 #include <sys/sysctl.h>
 #include <string.h>
 #include "xg_i915.h"
+#include "hdmi_plane_b_image.h"
 #include "xg_fd.h"
 #include "xg_vmap.h"
 
@@ -80,6 +84,8 @@ class XeGfxResident : public IOService {
 	OSDeclareDefaultStructors(XeGfxResident)
 public:
 	bool start(IOService *provider) override;
+	void stop(IOService *provider) override;
+	IOReturn setProperties(OSObject *properties) override;
 	using IOService::callPlatformFunction;
 	IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
 };
@@ -131,6 +137,7 @@ xg_env_has(const char *kv)
 static IOLock *gStageLock;
 static uint64_t gSurfPte;
 static bool gPipeLit;	/* pipe A was scanning out at probe time (Hybrid); in Discrete mode the NVIDIA GPU has the panel */
+static uint32_t gBootSurf; /* plane A GGTT base, obtained by stage 4 */
 static char gLog[256 * 1024];	/* last 256 KiB of the shim's console output, for sysctl debug.xegfx_log */
 static size_t gLogLen;
 static IOSimpleLock *gLogLock;
@@ -146,10 +153,122 @@ XeGfxResident::start(IOService *provider)
 	return true;
 }
 
+/*
+ * Explicit single-surface HDMI B GGTT allocation test.
+ * This is REAL i915 GEM+GGTT allocation, but NEVER a display modeset.
+ * The only user-facing fields are the offset and allocation size:
+ * the returned CPU kernel pointer MUST NOT enter IORegistry/userspace.
+ */
+void
+XeGfxResident::stop(IOService *provider)
+{
+	if (gStage >= 4)
+		xg_i915_hdmi_surface_cleanup();
+	if (gResident == this)
+		gResident = nullptr;
+	IOService::stop(provider);
+}
+
+IOReturn
+XeGfxResident::setProperties(OSObject *properties)
+{
+	OSDictionary *request=OSDynamicCast(OSDictionary, properties);
+	if (!request)
+		return IOService::setProperties(properties);
+	OSObject *a=request->getObject("XeGfxHDMIScanoutAllocate");
+	OSObject *q=request->getObject("XeGfxHDMIScanoutQuery");
+	OSObject *d=request->getObject("XeGfxHDMIScanoutRelease");
+	if (!a && !q && !d)
+		return IOService::setProperties(properties);
+	if ((a && a != kOSBooleanTrue) || (q && q != kOSBooleanTrue) ||
+	    (d && d != kOSBooleanTrue) || (!!a + !!q + !!d) != 1)
+		return kIOReturnBadArgument;
+	if (IOUserClient::clientHasPrivilege(current_task(),
+	        kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+		return kIOReturnNotPrivileged;
+	/* i915 and GGTT must be attached; never overlap stage initialisation. */
+	if (gStage < 4 || gRunning)
+		return kIOReturnNotReady;
+	struct xg_i915_hdmi_surface fb = {};
+	fb.abi = XG_HDMI_SURFACE_ABI;
+	fb.op = a ? XG_HDMI_SURFACE_ALLOC :
+	        d ? XG_HDMI_SURFACE_RELEASE : XG_HDMI_SURFACE_QUERY;
+	if (a) {
+		fb.width=1920;
+		fb.height=1080;
+		fb.pitch=7680;
+		fb.bytes=1920ull*1080ull*4ull;
+	}
+	int err=xg_i915_hdmi_surface_manage(&fb);
+	/* The plane image is only valid while this exact GGTT lease is pinned.
+	 * No CPU kernel pointer (fb.kva) may appear in any IORegistry property.
+	 * Always invalidate a previous plan, including after release/errors.
+	 */
+	removeProperty("XeGfxHDMIScanoutPlaneImage");
+	removeProperty("XeGfxHDMIScanoutEDPGGTTOffset");
+	removeProperty("XeGfxHDMIScanoutEDPBytes");
+	setProperty("XeGfxHDMIScanoutPlanStatus", "no-current-lease");
+	if (!err && fb.bytes) {
+		/* Stage 4 recorded and reserved the internal firmware panel's
+		 * GGTT range. Build an independent pipe-B image from the real
+		 * pinned i915 surface; this must not write display registers.
+		 */
+		nm_hdmi::PlaneBImage image = {};
+		const nm_hdmi::PlaneBImageResult valid =
+		    nm_hdmi::buildPlaneBImage(fb, gPipeLit ? gBootSurf : 0,
+		                             gPipeLit ? xg_boot_fb_size : 0, image);
+		if (gPipeLit && gBootSurf && xg_boot_fb_size) {
+			setProperty("XeGfxHDMIScanoutEDPGGTTOffset", (uint64_t)gBootSurf, 64);
+			setProperty("XeGfxHDMIScanoutEDPBytes", (uint64_t)xg_boot_fb_size, 64);
+		}
+		if (valid == nm_hdmi::PlaneBImageResult::ok) {
+			OSData *data = OSData::withBytes(&image, sizeof(image));
+			if (data) {
+				const bool published = setProperty("XeGfxHDMIScanoutPlaneImage", data);
+				data->release();
+				setProperty("XeGfxHDMIScanoutPlanStatus",
+				            published ? "ready-not-applied" : "publish-failed");
+			} else {
+				setProperty("XeGfxHDMIScanoutPlanStatus", "out-of-memory");
+			}
+		} else {
+			const char *why = "invalid-surface";
+			switch (valid) {
+			case nm_hdmi::PlaneBImageResult::unknownEDPRange:
+				why = "edp-ggtt-unknown"; break;
+			case nm_hdmi::PlaneBImageResult::overlapsEDP:
+				why = "edp-ggtt-overlap"; break;
+			case nm_hdmi::PlaneBImageResult::invalidGGTT:
+				why = "hdmi-ggtt-invalid"; break;
+			default: break;
+			}
+			setProperty("XeGfxHDMIScanoutPlanStatus", why);
+		}
+	}
+	setProperty("XeGfxHDMIScanoutLastErrno", (uint64_t)(-err), 32);
+	setProperty("XeGfxHDMIScanoutStatus", err == 0 ?
+	            (fb.bytes ? "allocated-ggtt-not-displayed" : "released") :
+	            "allocation-or-query-failed");
+	setProperty("XeGfxHDMIScanoutGGTTOffset", fb.ggtt_offset, 64);
+	setProperty("XeGfxHDMIScanoutBytes", fb.bytes, 64);
+	setProperty("XeGfxHDMIScanoutPitch", (uint64_t)fb.pitch, 32);
+	IOLog("XeGfx: HDMI B owned GEM/GGTT %s rc=%d offset 0x%llx bytes %llu (NO modeset)\\n",
+	      a ? "allocate" : d ? "release" : "query", err,
+	      fb.ggtt_offset, fb.bytes);
+	return err == 0 ? kIOReturnSuccess : kIOReturnError;
+}
+
 /* "xgDrmIoctl" (minor, cmd, user arg, int *errno): DRM for WindowServer, through XeGfxAccel's user client */
 IOReturn
 XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
 {
+	if (name && name->isEqualTo("xgHdmiSurface") && p1) {
+		if (gStage < 4 || gRunning)
+			return kIOReturnNotReady;
+		int rc=xg_i915_hdmi_surface_manage((struct xg_i915_hdmi_surface *)p1);
+		if (p2) *(int *)p2=rc;
+		return rc == 0 ? kIOReturnSuccess : kIOReturnError;
+	}
 	if (name && name->isEqualTo("xgDrmIoctl") && p4) {
 		*(int *)p4 = xg_fd_remote_ioctl((int)(uintptr_t)p1, (unsigned long)p2, (unsigned long long)(uintptr_t)p3);
 		return kIOReturnSuccess;
@@ -304,8 +423,6 @@ out:
 	OSSafeReleaseNULL(smb);
 	return rc;
 }
-
-static uint32_t gBootSurf;	/* PLANE_SURF_1_A after i915 ran: the boot surface's GGTT offset */
 
 /* after i915 has run: the panel must still scan out the boot surface through the same GGTT entry, and pipe A must
  * still count frames; otherwise the desktop is black even though WindowServer looks fine */

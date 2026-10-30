@@ -19,6 +19,12 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "hdmi_gmbus.h"
+#include "hdmi_edid_timing.h"
+#include "hdmi_modeset_preflight.h"
+#include "hdmi_mode_plan.h"
+#include "hdmi_native_sequence.h"
+#include "hdmi_mtl_power.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -131,6 +137,11 @@ constexpr uint32_t tileOf(uint32_t ctl) { return (ctl >> 10) & 0x7; }
 class NMIntelFB : public IOFramebuffer {
     OSDeclareDefaultStructors(NMIntelFB)
     IOPCIDevice *fPCI = nullptr;
+    IOLock *fDDCLock = nullptr; // protects opt-in GMBUS probe against stop()
+    // This is diagnostic connector state, NOT an IOFramebuffer connection.
+    // -1=unknown, 0=DDC NAK (unresponsive), 1=valid EDID read.
+    int fHDMIDDCState = -1;
+    uint32_t fHDMIDDCGeneration = 0, fHDMIDDCProbeCount = 0;
     IOMemoryMap *fMMIO = nullptr;
     IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out surface (NVIDIA frames land here)
     // WindowServer paces an accelerated display on its VBL interrupt: the NVIDIA display pipe completes each frame on it.
@@ -188,6 +199,9 @@ private:
 
     uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
     bool adoptFirmwareMode();
+    IOReturn probeHDMIEDID();
+    IOReturn preflightHDMIModeset();
+    IOReturn dryRunHDMINative();
     // nmintelfbcache=1 write-combined, 2 cache-inhibited, else IOKit's default for device memory
     void mapSurface() {
         unsigned c = 0; PE_parse_boot_argn("nmintelfbcache", &c, sizeof c);
@@ -291,10 +305,298 @@ public:
 
 OSDefineMetaClassAndStructors(NMIntelFB, IOFramebuffer)
 
+// Wrapper for bounded GMBUS register traffic; no other display
+// registers are written, and the PCI BAR mapping is validated before use.
+struct NMHDMIMMIO {
+    volatile uint8_t *regs;
+    uint32_t read32(uint32_t offset) const {
+        return *(volatile uint32_t *)(regs + offset);
+    }
+    void write32(uint32_t offset, uint32_t value) const {
+        *(volatile uint32_t *)(regs + offset) = value;
+        // Clang builtin: full compiler/CPU fence; available without IOKit symbols.
+        __sync_synchronize();
+    }
+    void delayUs(unsigned us) const { IODelay(us); }
+};
+
+IOReturn NMIntelFB::probeHDMIEDID()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return kIOReturnUnsupported;
+#else
+    if (!fDDCLock) return kIOReturnNotReady;
+    IOLockLock(fDDCLock);
+    // Only the Linux/VBT-confirmed Intel 7d55 Lenovo 3813 configuration.
+    // Refuse if boot firmware is scanning out from a different pipe or the
+    // mapped BAR cannot cover the PCH GMBUS register bank.
+    const bool valid = !fStopping && fRegs && fMMIO &&
+        fMMIO->getLength() >= nm_hdmi::kGMBUS3 + sizeof(uint32_t) &&
+        fPCI && fPCI->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
+        fPCI->configRead16(kIOPCIConfigDeviceID) == 0x7d55 &&
+        fPCI->configRead16(0x2c) == 0x17aa &&
+        fPCI->configRead16(0x2e) == 0x3813 &&
+        fPipe == 0 && fWidth == 1920 && fHeight == 1200;
+    if (!valid) {
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    // Revalidate the HDMI EDID every time; do not serve stale display
+    // identity after a disconnect. The connector is not advertised to
+    // WindowServer until a native DDI B scanout actually exists.
+    removeProperty("NMIntelFBHDMIEDID");
+    removeProperty("NMIntelFBHDMIPreferredTiming");
+    removeProperty("NMIntelFBHDMIPreflightRegisters");
+    removeProperty("NMIntelFBHDMIModePlan");
+    setProperty("NMIntelFBHDMINativeStatus", "not-requested");
+    removeProperty("NMIntelFBHDMINativeMissingStage");
+    setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
+    setProperty("NMIntelFBHDMIModePlanStatus", "not-requested");
+    setProperty("NMIntelFBHDMIEDIDStatus", "reading");
+    uint8_t edid[256] = {};
+    size_t length = 0;
+    uint32_t gmbus2 = 0;
+    NMHDMIMMIO io = { fRegs };
+    const nm_hdmi::Status result =
+        nm_hdmi::readEDID(io, edid, length, gmbus2);
+    setProperty("NMIntelFBHDMIEDIDGMBUS2", gmbus2, 32);
+    setProperty("NMIntelFBHDMIEDIDLength", (uint64_t)length, 32);
+    bool published = false;
+    if (result == nm_hdmi::Status::ok) {
+        if (OSData *data = OSData::withBytes(edid, (unsigned)length)) {
+            published = setProperty("NMIntelFBHDMIEDID", data);
+            data->release();
+        }
+        // Parse EDID's preferred 18-byte DTD into a hardware-independent
+        // timing descriptor. This is input for future HDMI B modesetting,
+        // not a request to change or enable any display register.
+        nm_hdmi::Timing mode = {};
+        if (published && nm_hdmi::parsePreferredTiming(edid, length, mode)) {
+            if (OSData *timing = OSData::withBytes(&mode, sizeof(mode))) {
+                setProperty("NMIntelFBHDMIPreferredTiming", timing);
+                timing->release();
+            }
+        }
+    }
+    const char *status = result == nm_hdmi::Status::ok && !published ?
+        "allocation-failed" : nm_hdmi::statusName(result);
+    setProperty("NMIntelFBHDMIEDIDStatus", status);
+
+    // EDID is direct evidence of a responding HDMI sink. NAK means DDC
+    // did not acknowledge: report "unresponsive" instead of claiming an
+    // HPD-level physical disconnection. Busy, timeouts and invalid bytes
+    // are "unknown", never proof the monitor was unplugged.
+    const int nextState = published ? 1 :
+        result == nm_hdmi::Status::nak ? 0 : -1;
+    const bool stateChanged = nextState != fHDMIDDCState;
+    if (stateChanged) ++fHDMIDDCGeneration;
+    fHDMIDDCState = nextState;
+    ++fHDMIDDCProbeCount;
+    setProperty("NMIntelFBHDMIDDCState", nextState == 1 ? "connected" :
+                nextState == 0 ? "unresponsive" : "unknown");
+    setProperty("NMIntelFBHDMIDDCGeneration", (uint64_t)fHDMIDDCGeneration, 32);
+    setProperty("NMIntelFBHDMIDDCProbeCount", (uint64_t)fHDMIDDCProbeCount, 32);
+    // Never signal kIOFBConnectInterruptType here: this class still owns
+    // only eDP pipe A, not an independent HDMI IOFramebuffer.
+    if (stateChanged || fHDMIDDCProbeCount <= 8 ||
+        (fHDMIDDCProbeCount % 32) == 0) {
+        IFBLOG("HDMI DDC/GMBUS2 probe on DDI B: %s, state=%s, generation=%u, %lu bytes, GMBUS2=0x%08x (no modeset)",
+               status, nextState == 1 ? "connected" :
+                       nextState == 0 ? "unresponsive" : "unknown",
+               fHDMIDDCGeneration, (unsigned long)(published ? length : 0), gmbus2);
+    }
+    IOLockUnlock(fDDCLock);
+    bzero(edid, sizeof(edid)); // limit lifetime of monitor's serial/EDID
+    return published ? kIOReturnSuccess : kIOReturnError;
+#endif
+}
+
+// Hardware preflight: direct MMIO reads only, never power or modeset.
+IOReturn NMIntelFB::preflightHDMIModeset()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return kIOReturnUnsupported;
+#else
+    if (!fDDCLock) return kIOReturnNotReady;
+    IOLockLock(fDDCLock);
+    // This snapshot and timing plan are disposable. Never allow a previous
+    // request to masquerade as a current validation after unplug/suspend.
+    removeProperty("NMIntelFBHDMIPreflightRegisters");
+    removeProperty("NMIntelFBHDMIModePlan");
+    setProperty("NMIntelFBHDMIModePlanStatus", "not-validated");
+    const bool target = !fStopping && fRegs && fMMIO &&
+        fMMIO->getLength() >= 0x711a0u && fPCI &&
+        fPCI->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
+        fPCI->configRead16(kIOPCIConfigDeviceID) == 0x7d55 &&
+        fPCI->configRead16(0x2c) == 0x17aa &&
+        fPCI->configRead16(0x2e) == 0x3813 &&
+        fPipe == 0 && fWidth == 1920 && fHeight == 1200;
+    if (!target) {
+        setProperty("NMIntelFBHDMIPreflightStatus", "unsupported-identity-or-panel");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    // Require a prior successful DDI B GMBUS pin 2 EDID read. No monitor
+    // settings are guessed; the first modeset target is 1080p60 only.
+    OSData *edid = OSDynamicCast(OSData, getProperty("NMIntelFBHDMIEDID"));
+    nm_hdmi::Timing mode = {};
+    const bool timingValid = fHDMIDDCState == 1 && edid &&
+        nm_hdmi::parsePreferredTiming(
+            (const uint8_t *)edid->getBytesNoCopy(), edid->getLength(), mode);
+    nm_hdmi::ModePlan modePlan = {};
+    if (!timingValid || !nm_hdmi::buildModePlan(mode, modePlan)) {
+        setProperty("NMIntelFBHDMIPreflightStatus", "missing-validated-1080p60-edid");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    NMHDMIMMIO io = { fRegs };
+    const nm_hdmi::MtlPowerSnapshot power = nm_hdmi::inspectMtlBPower(io);
+    setProperty("NMIntelFBHDMIPowerState", nm_hdmi::mtlPowerName(power.status));
+    setProperty("NMIntelFBHDMIPowerDriver", (uint64_t)power.driver, 32);
+    nm_hdmi::PreflightSnapshot snapshot = {};
+    nm_hdmi::capture(io, snapshot);
+    const nm_hdmi::PreflightReason reason =
+        nm_hdmi::validateIdleDisplay(snapshot);
+    const uint32_t before = rd(FRMCOUNT(0));
+    IOSleep(40); // verify eDP pipe A still scans out
+    const uint32_t after = rd(FRMCOUNT(0));
+    const uint32_t frames = after-before;
+    const bool advancing = frames > 0u && frames < 16u;
+
+    setProperty("NMIntelFBHDMIPreflightPanelFrames", (uint64_t)frames, 32);
+    const char *status = reason == nm_hdmi::PreflightReason::ok ?
+        (!advancing ? "edp-frame-counter-stalled" :
+         power.status != nm_hdmi::MtlPowerStatus::on ? "power-wells-not-ready" :
+         "ready-for-modeset-implementation") :
+        nm_hdmi::reasonText(reason);
+    setProperty("NMIntelFBHDMIPreflightStatus", status);
+    setProperty("NMIntelFBHDMIPreflightTargetClockHz", (uint64_t)mode.pixelClockHz, 32);
+    bool published = false;
+    if (OSData *d = OSData::withBytes(&snapshot, sizeof(snapshot))) {
+        published = setProperty("NMIntelFBHDMIPreflightRegisters", d);
+        d->release();
+    }
+    // Publishing a *timing-only* mode plan is permitted only while the
+    // internal display is demonstrably alive and DDI B/pipe B are unused.
+    // These numbers are NOT replayed into MMIO or the C10 PHY.
+    bool planPublished = false;
+    if (reason == nm_hdmi::PreflightReason::ok && advancing &&
+        power.status == nm_hdmi::MtlPowerStatus::on) {
+        if (OSData *d = OSData::withBytes(&modePlan, sizeof(modePlan))) {
+            planPublished = setProperty("NMIntelFBHDMIModePlan", d);
+            d->release();
+        }
+    }
+    setProperty("NMIntelFBHDMIModePlanStatus",
+                planPublished ? "timing-only-not-applied" : "blocked");
+    IFBLOG("HDMI read-only preflight: %s, eDP A frames/40ms=%u, timing-only plan=%d (NO HDMI modeset)",
+           status, frames, planPublished ? 1 : 0);
+    IOLockUnlock(fDDCLock);
+    return published && (planPublished ||
+            reason != nm_hdmi::PreflightReason::ok || !advancing)
+        ? kIOReturnSuccess : kIOReturnNoMemory;
+#endif
+}
+
+// Non-destructive top-level native HDMI gate. This is not a hardware
+// implementation: the required C10 PHY/power/GGTT backend is absent.
+// Explicitly report the first missing stage rather than trying partial
+// register writes and corrupting the live firmware eDP scanout.
+IOReturn NMIntelFB::dryRunHDMINative()
+{
+#ifdef NMINTELFB_VIRTUAL
+    return kIOReturnUnsupported;
+#else
+    if (!fDDCLock) return kIOReturnNotReady;
+    IOLockLock(fDDCLock);
+    OSData *data=OSDynamicCast(OSData, getProperty("NMIntelFBHDMIModePlan"));
+    nm_hdmi::ModePlan plan={};
+    if (fStopping || fPipe != 0 || fWidth != 1920 || fHeight != 1200 ||
+        fHDMIDDCState != 1 || !data || data->getLength() != sizeof(plan)) {
+        setProperty("NMIntelFBHDMINativeStatus", "missing-current-edid-and-preflight");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+    bcopy(data->getBytesNoCopy(), &plan, sizeof(plan));
+    // Validate that eDP A still scans and B remains unowned now, not just
+    // at the earlier diagnostic snapshot time.
+    const uint32_t before=rd(FRMCOUNT(0));
+    IOSleep(40);
+    const uint32_t after=rd(FRMCOUNT(0));
+    NMHDMIMMIO powerIO={fRegs};
+    const nm_hdmi::MtlPowerSnapshot wells = nm_hdmi::inspectMtlBPower(powerIO);
+    // MTL DC_STATE_EN (Linux i915 intel_display_regs.h): this is a
+    // read-only report, NOT a DC_OFF wakeref. A future write backend must
+    // coordinate display DMC/PSR and acquire DC_OFF separately.
+    const uint32_t dcState = rd(0x45504u);
+    setProperty("NMIntelFBHDMIPowerWellStatus", nm_hdmi::mtlPowerName(wells.status));
+    setProperty("NMIntelFBHDMIDCStateEnable", dcState, 32);
+    setProperty("NMIntelFBHDMIDCPolicyStatus",
+                dcState == 0xffffffffu ? "dc-state-inaccessible" :
+                (dcState & ((1u<<30) | 0xbu)) ? "dc-states-enabled-no-dc-off-ownership" :
+                "dc-states-disabled-wakeref-still-required");
+    if (after-before == 0 || after-before >= 16 ||
+        wells.status != nm_hdmi::MtlPowerStatus::on ||
+        (rd(TRANSCONF(1)) & kEnable) ||
+        (rd(PLANE_CTL(1)) & kEnable) ||
+        (rd(0x61400u) & kEnable) ||
+        (rd(0x64100u) & kEnable)) {
+        setProperty("NMIntelFBHDMINativeStatus", "edp-a-stalled-or-b-occupied");
+        IOLockUnlock(fDDCLock);
+        return kIOReturnNotReady;
+    }
+
+    // The fully guarded transaction engine is available for a future
+    // native backend; never report success while one is missing.
+    nm_hdmi::UnimplementedNativeBackend backend;
+    const nm_hdmi::NativeReport result=nm_hdmi::bringUp(backend,plan);
+    setProperty("NMIntelFBHDMINativeStatus",
+                nm_hdmi::nativeResultName(result.result));
+    setProperty("NMIntelFBHDMINativeMissingStage",
+                nm_hdmi::stageName(result.failedStage));
+    setProperty("NMIntelFBHDMINativeStagesApplied",
+                (uint64_t)result.appliedCount,32);
+    IFBLOG("HDMI native gate: %s at %s; 0 hardware writes",
+           nm_hdmi::nativeResultName(result.result),
+           nm_hdmi::stageName(result.failedStage));
+    IOLockUnlock(fDDCLock);
+    return kIOReturnUnsupported;
+#endif
+}
+
 /* Reporting-only: root passes ANV's queried shared heap, never a scanout map. */
 IOReturn NMIntelFB::setProperties(OSObject *properties)
 {
     auto outer = OSDynamicCast(OSDictionary, properties);
+    if (outer && outer->getObject("XeGfxHDMINativeDryRun")) {
+        if (outer->getObject("XeGfxHDMINativeDryRun") != kOSBooleanTrue)
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+                kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return dryRunHDMINative();
+    }
+    if (outer && outer->getObject("XeGfxHDMIModesetPreflight")) {
+        if (outer->getObject("XeGfxHDMIModesetPreflight") != kOSBooleanTrue)
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+                kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return preflightHDMIModeset();
+    }
+    // Explicit root-only request; not performed at boot. The GMBUS transaction
+    // touches DDC control registers but NEVER a display pipe, PLL or PHY.
+    if (outer && outer->getObject("XeGfxHDMIEDIDProbe")) {
+        if (outer->getObject("XeGfxHDMIEDIDProbe") != kOSBooleanTrue)
+            return kIOReturnBadArgument;
+        if (IOUserClient::clientHasPrivilege(current_task(),
+                kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return probeHDMIEDID();
+    }
     OSObject *payload = outer ? outer->getObject("XeGfxGPUIdentity") : nullptr;
     if (!payload) return IOFramebuffer::setProperties(properties);
 
@@ -395,20 +697,64 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
 
 bool NMIntelFB::adoptFirmwareMode()
 {
-    // the panel is on whichever pipe the firmware used; take the first pipe whose transcoder and plane 1 are both on
+    // Firmware can light both eDP and HDMI before macOS starts. Do not blindly
+    // adopt the first enabled pipe: it may not be the GOP/boot-console surface.
+    // Only select a pipe whose validated linear plane matches the firmware
+    // console's geometry. This is firmware HDMI-primary support, not hotplug
+    // or HDMI link/mode training; it is safe to leave all display registers alone.
+    PE_Video console; bzero(&console, sizeof console);
+    const bool haveConsole = getPlatform() &&
+        getPlatform()->getConsoleInfo(&console) == kIOReturnSuccess &&
+        console.v_baseAddr && console.v_depth == 32;
+    const uint32_t diagnosticDDI = rd(0xC4030u); // SHOTPLUG_CTL_DDI, read-only
+    const uint32_t diagnosticTC = rd(0xC4034u);  // SHOTPLUG_CTL_TC, read-only
+    setProperty("NMIntelFBHPDDDI", diagnosticDDI, 32);
+    setProperty("NMIntelFBHPDTC", diagnosticTC, 32);
+    IFBLOG("read-only HPD snapshot: SHOTPLUG_CTL_DDI=0x%08x TC=0x%08x (status bits are not proof of HDMI routing)",
+           diagnosticDDI, diagnosticTC);
+    if (!haveConsole) {
+        IFBLOG("no validated 32-bit firmware console; refusing to guess the active HDMI/eDP pipe");
+        return false;
+    }
+    int candidates = 0, chosen = -1;
     for (int p = 0; p < 4; p++) {
-        uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
+        const uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
         if (!(conf & kEnable) || !(ctl & kEnable)) continue;
-        if (fmtOf(ctl) != 8) { IFBLOG("pipe %c: plane format %u is not XRGB8888 - leaving the firmware screen", 'A' + p, fmtOf(ctl)); return false; }
-        if (tileOf(ctl) != 0) { IFBLOG("pipe %c: plane is tiled (%u) - leaving the firmware screen", 'A' + p, tileOf(ctl)); return false; }
+        const uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FFu;
+        const uint32_t width = (size & 0xFFFFu) + 1u, height = (size >> 16) + 1u, pitch = stride * 64u;
+        const bool linear = fmtOf(ctl) == 8 && tileOf(ctl) == 0;
+        const bool match = linear && width >= 320u && height >= 200u && pitch >= width * 4u &&
+            width == console.v_width && height == console.v_height && pitch == console.v_rowBytes;
+        IFBLOG("firmware pipe %c: enabled plane %ux%u pitch %u format %u tile %u console-match %d",
+               'A' + p, width, height, pitch, fmtOf(ctl), tileOf(ctl), match ? 1 : 0);
+        if (match) { chosen = p; ++candidates; }
+    }
+    // No match must fail closed. If several pipes use identical geometry,
+    // preserve the earlier first-pipe policy for compatibility but report the
+    // ambiguity: only a true GGTT/console identity check can distinguish them.
+    if (!candidates) {
+        IFBLOG("no lit linear plane matches the boot console; HDMI needs firmware GOP takeover or native modesetting");
+        return false;
+    }
+    if (candidates > 1) {
+        IFBLOG("%d lit planes match console geometry; ambiguous eDP/HDMI selection, using first matching pipe", candidates);
+        for (int p = 0; p < 4; ++p) {
+            const uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
+            if (!(conf & kEnable) || !(ctl & kEnable) || fmtOf(ctl) != 8 || tileOf(ctl) != 0) continue;
+            const uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FFu;
+            const uint32_t width = (size & 0xFFFFu) + 1u, height = (size >> 16) + 1u;
+            if (width == console.v_width && height == console.v_height &&
+                stride * 64u == console.v_rowBytes) { chosen = p; break; }
+        }
+    }
+    setProperty("NMIntelFBFirmwarePipeMatches", candidates, 32);
+    for (int p = chosen; p <= chosen; ++p) {
         if (nmifbStep(3, "plane regs")) return false;
         uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FF;
         fWidth = (size & 0xFFFF) + 1; fHeight = ((size >> 16) & 0xFFFF) + 1;
-        fRowBytes = stride * 64;                     // linear planes count the stride in 64-byte units
-        fSurf = rd(PLANE_SURF(p)) & ~0xFFFu;         // GGTT offset of the surface, 4 KiB aligned
-        if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) {
-            IFBLOG("pipe %c: plane %ux%u stride %u is not a usable surface", 'A' + p, fWidth, fHeight, fRowBytes); return false;
-        }
+        fRowBytes = stride * 64;
+        fSurf = rd(PLANE_SURF(p)) & ~0xFFFu;
+        if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) return false;
         if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen)   // only informative: BAR2 is not used for scanout
             IFBLOG("pipe %c: surface at GGTT 0x%x lies past the %llu MiB BAR2 window", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20));
         // the transcoder that feeds pipe p is p on these display versions (eDP on transcoder A in every recording)
@@ -474,6 +820,21 @@ bool NMIntelFB::start(IOService *provider)
     if (!fMMIO || !ap) { IFBLOG("BAR0 or BAR2 is not mapped - leaving the firmware screen"); OSSafeReleaseNULL(fMMIO); return false; }
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
+    // Verified on Linux i915 for Lenovo 17aa:3813 / Intel 8086:7d55:
+    // eDP-1 = DDI A / PHY A / pipe A, HDMI-A-1 = DDI B / PHY B / pipe B.
+    // A read-only snapshot, NOT HDMI link training or a second framebuffer.
+    // Do not infer hotplug/EDID from these raw registers while power wells
+    // may be off. Never touch DDI/pipe B display state from this path.
+    if (fPCI->configRead16(kIOPCIConfigDeviceID) == 0x7d55u &&
+        fPCI->configRead16(0x2cu) == 0x17aau &&
+        fPCI->configRead16(0x2eu) == 0x3813u) {
+        setProperty("NMIntelFBHDMIReferenceDDI", 1ull, 32);
+        setProperty("NMIntelFBHDMIReferencePipe", 1ull, 32);
+        setProperty("NMIntelFBHDMITransconfB", rd(TRANSCONF(1)), 32);
+        setProperty("NMIntelFBHDMIPlaneCtlB", rd(PLANE_CTL(1)), 32);
+        IFBLOG("Linux-confirmed HDMI reference: DDI B/PHY B, pipe B; raw firmware TRANSCONF_B=0x%08x PLANE_CTL_B=0x%08x (read only, no modeset)",
+               rd(TRANSCONF(1)), rd(PLANE_CTL(1)));
+    }
     if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
     // Scan out at the boot console's address (what IONDRV uses), never BAR2 + PLANE_SURF: on display 14 CPU access to
     // stolen memory through the BAR can hang the machine (Linux i915 Wa_22018444074).
@@ -539,6 +900,16 @@ bool NMIntelFB::start(IOService *provider)
            "invalid/incomplete firmware timing");
 }
 
+    // Optional GMBUS probe lock: no DDC activity until an admin tool invokes
+    // setProperties. Do not fail boot if the diagnostic lock is unavailable.
+    fDDCLock = IOLockAlloc();
+    setProperty("NMIntelFBHDMIEDIDStatus", fDDCLock ? "not-requested" : "unavailable");
+    setProperty("NMIntelFBHDMIDDCState", "unknown");
+    setProperty("NMIntelFBHDMIDDCGeneration", 0ull, 32);
+    setProperty("NMIntelFBHDMIDDCProbeCount", 0ull, 32);
+    setProperty("NMIntelFBHDMIPreflightStatus", "not-requested");
+    setProperty("NMIntelFBHDMIModePlanStatus", "not-requested");
+    setProperty("NMIntelFBHDMINativeStatus", "not-requested");
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
     armVbl();
     registerPowerDriver(this, kPowerStates, 2);
@@ -555,7 +926,9 @@ void NMIntelFB::stop(IOService *provider)
 #endif
     // thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out (as NVRMFB)
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
+    if (fDDCLock) IOLockLock(fDDCLock);
     OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
+    if (fDDCLock) { IOLockUnlock(fDDCLock); IOLockFree(fDDCLock); fDDCLock = nullptr; }
     IOFramebuffer::stop(provider);
 }
 
@@ -625,9 +998,15 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
         r->height = fHeight;
         r->pitch = fRowBytes;
 
-        IFBLOG("scanout ABI: real physical address 0x%llx, %ux%u pitch %u, %llu bytes",
-               (unsigned long long)r->phys, r->width, r->height, r->pitch,
-               (unsigned long long)r->actualSize);
+        // This is called on every presentation, often at 60 Hz or higher.
+        // Logging on every scanout query floods the kernel log and can stall
+        // WindowServer. Keep one verified aperture breadcrumb per kext load.
+        static volatile SInt32 gScanoutABILogged = 0;
+        if (OSCompareAndSwap(0, 1, &gScanoutABILogged)) {
+            IFBLOG("scanout ABI: real physical address 0x%llx, %ux%u pitch %u, %llu bytes",
+                   (unsigned long long)r->phys, r->width, r->height, r->pitch,
+                   (unsigned long long)r->actualSize);
+        }
         return kIOReturnSuccess;
     }
     return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
