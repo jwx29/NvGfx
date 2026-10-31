@@ -1,6 +1,21 @@
 # Changelog
 
-Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the test laptop (Legion 5 15IAX10, Arrow Lake iGPU `8086:7D67`); "built" means it compiled and has not been run. Prereleases with a binary: v0.0.27, v0.0.35, v0.0.36, v0.0.38, v0.0.45 and v0.0.46.
+Versions are the kext's `CFBundleVersion`. "Booted" means the version ran on the test laptop (Legion 5 15IAX10, Arrow Lake iGPU `8086:7D67`); "built" means it compiled and has not been run. Prereleases with a binary: v0.0.27, v0.0.35, v0.0.36, v0.0.38, v0.0.45, v0.0.46 and v0.0.47.
+
+## 0.0.47 (booted: N-355)
+
+- The stage 2 probe and the later stages find an Intel GPU whose PCI class is 0380 (display, other) as well as 0300. A MUX in discrete mode leaves the iGPU as 0380, so the probe found nothing on those machines (I-125, reported by two testers).
+- Stage 4 no longer panics on GPUs older than Meteor Lake. i915 looks up the PCH's ISA bridge there, LinuxKPI names a kobject after that driverless device, whose name is NULL, and `xg_vsnprintf` read the NULL format string. It now prints "(fmt null)" as FreeBSD's kvprintf does (I-124, Alder Lake-P tester report in #3). Meteor Lake and Arrow Lake skip that lookup, which is why our machines never hit it.
+
+## Unreleased (plugin, booted: N-319, N-320)
+
+- Horizontal bands across the desktop while typing or scrolling are gone (I-119). An app's render pass or IOSurface write
+  on ANV could still be running when WindowServer composited the surface, so a half-drawn frame reached the screen.
+  On Intel, every process except WindowServer now waits at commit for command buffers that render or write an IOSurface.
+  Writing 64 to `/Library/GPUBundles/nvmtl/xe-live` turns this off live for A/B tests. N-320: no bands with it on,
+  bands within seconds with it off. mtlbench under load stays at 4.6 to 5.0 ms per frame.
+- WindowServer waiting for its own command buffers (N-318) and a GPU barrier at the start of each command buffer
+  (N-317) did not help; the barrier is still in, `NVMTL_XE_CB_BARRIER=0` turns it off.
 
 ## 0.0.46 (booted: N-300 to N-302)
 

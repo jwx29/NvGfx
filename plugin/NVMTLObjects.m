@@ -1,14 +1,17 @@
+#include <sys/sysctl.h>
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+#include <sys/stat.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 void nvlog(const char *fmt, ...);
+void nvlog_raw(const char *fmt, ...);
 
 #import "NVMTLObjects.h"
 #include "nvmtl_ws_stage.h"
@@ -19,6 +22,8 @@ static void nvtrace_emit(const char *fmt, ...) __attribute__((format(printf, 1, 
 // Guard the call site: converting NSString arguments on every draw is expensive
 // even when the trace writer immediately returns without emitting anything.
 #define nvtrace(...) do { if (nvmtl_trace_on()) nvtrace_emit(__VA_ARGS__); } while (0)
+static unsigned nvmtl_xe_live_mask_r(int raw);
+static NVMTLTexture *nvmtl_self_snap(NVMTLTexture *root, BOOL make);
 static unsigned long long nvmtl_global_trace_id(id o) {
     static char key; static unsigned long long next = 1;
     @synchronized (o) {
@@ -117,7 +122,7 @@ __attribute__((constructor)) static void nvmtl_conf_knobs(void)
         while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
         end = val + strlen(val);
         while (end > val && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
-        if (strncmp(key, "NVMTL_", 6) && strncmp(key, "NVK_", 4) && strncmp(key, "NVRM_", 5)) continue;
+        if (strncmp(key, "NVMTL_", 6) && strncmp(key, "NVK_", 4) && strncmp(key, "NVRM_", 5) && strcmp(key, "INTEL_DEBUG")) continue;  // INTEL_DEBUG: ANV A/Bs (noccs, nofc)
         if (getenv(key)) continue;
         if (setenv(key, val, 0) == 0) { took++;
             int k = snprintf(recbuf + recn, sizeof recbuf - recn, "%s%s=%s", recn ? ";" : "", key, val);
@@ -3319,9 +3324,21 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
     NVMTLTexture *nt = (NVMTLTexture *)t;
     if (!nt) { nvlog("setFragmentTexture: nil at index %lu", (unsigned long)i); return; }
+    { static unsigned left; static int armed; const unsigned m = nvmtl_xe_live_mask_r(1);
+      if (!(m & 128)) armed = 0; else if (!armed) { armed = 1; left = 400; }
+      if ((m & 128) && left && _target && getprogname() && !strcmp(getprogname(), "WindowServer")) { left--;
+          NVMTLTexture *r = nt->_parent ?: nt;
+          nvlog_raw("xe-pass ftex %lu: tgt %ux%u <- %ux%u fmt %lu (parent fmt %lu, vk %u) surf %u view %d mips %u", (unsigned long)i, [(_target->_parent ?: _target) nvi]->w,
+                [(_target->_parent ?: _target) nvi]->h, [r nvi]->w, [r nvi]->h, (unsigned long)nt->_fmt, (unsigned long)r->_fmt, [nt nvi]->fmt, r->_surf ? (unsigned)IOSurfaceGetID(r->_surf) : 0u, nt->_parent != nil, nt->_mips); } }
     nvmtl_retain_resource(_cb, nt);
     nvmtl_surface_cpu_dump(nt->_parent ? nt->_parent : nt);
     nvmtl_surface_in_for_cb(_cb, nt);
+    // the pass samples its own target: read the copy taken before the pass (nvmtl_self_snap), else put a barrier before
+    // its draws (nvmtl_self_tex_barrier); xe-live bit 256 turns both off
+    if (_target && (nt->_parent ?: nt) == (_target->_parent ?: _target) && !(nvmtl_xe_live_mask_r(1) & 256)) {
+        if (_snap && !nt->_parent) nt = _snap;
+        else { _cb->_c.self_tex = 1; nvmtl_self_snap(_target->_parent ?: _target, YES); }
+    }
     { NVMTLTexture *rt = nt->_parent ? nt->_parent : nt; nvtrace("FTEX[%lu] %ux%u surf %u view %d", (unsigned long)i, [nt nvi]->w, [nt nvi]->h,
         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }
     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_tbView, nt->_tbStorage);
@@ -3338,9 +3355,30 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     }
     }
 }
+- (void)nvmtlXePassDraw:(NSUInteger)n {
+    // xe-live bit 128: the pipeline and blend of each WindowServer draw, to follow the software cursor's save and restore
+    static unsigned left; static int armed; const unsigned m = nvmtl_xe_live_mask_r(1);
+    if (!(m & 128)) { armed = 0; return; } if (!armed) { armed = 1; left = 400; }
+    if (!left || !_target || !getprogname() || strcmp(getprogname(), "WindowServer")) return; left--;
+    NVMTLTexture *t = _target->_parent ?: _target;
+    nvlog_raw("xe-pass draw tgt %ux%u surf %u n %lu fs %s blend %s", [t nvi]->w, [t nvi]->h, t->_surf ? (unsigned)IOSurfaceGetID(t->_surf) : 0u,
+          (unsigned long)n, _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+    // bit 4096 adds the first floats of vertex buffers 0-2 and fragment buffers 0-1 as the CPU sees them at encode time (I-119)
+    if (!(m & 4096) || n > 48) return;
+    for (int set = 0; set < 2; set++) for (int i = 0; i < (set ? 2 : 3); i++) {
+        NVMTLBuffer *b = set ? _fbufAt[i] : _vbufAt[i]; const NSUInteger off = set ? _fbufOff[i] : _vbufOff[i];
+        const unsigned char *c = b ? (const unsigned char *)[b contents] : NULL;
+        if (!c || off >= b->_b.size) continue;
+        const size_t nf = MIN((size_t)24, (b->_b.size - off) / 4); const float *f = (const float *)(c + off);
+        char line[600]; int k = snprintf(line, sizeof line, "xe-pass  %s%d +%lu:", set ? "fb" : "vb", i, (unsigned long)off);
+        for (size_t j = 0; j < nf && k < (int)sizeof line - 16; j++) k += snprintf(line + k, sizeof line - k, " %.4g", f[j]);
+        nvlog_raw("%s", line);
+    }
+}
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
          instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)baseInstance {
     if (!_begun) { nvlog("encoder: draw with no pipeline set"); return; }
+    [self nvmtlXePassDraw:count];
     if (![self nvmtlBindSamplerPipeline]) return;
     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
     if (nvmtl_trace_on()) { char bufs_[600]; nvmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
@@ -3538,6 +3576,10 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n { if (r && n) [self setScissorRect:r[0]]; }
 - (void)setScissorRect:(MTLScissorRect)r {
     nvtrace("SC %lu %lu %lu %lu", (unsigned long)r.x, (unsigned long)r.y, (unsigned long)r.width, (unsigned long)r.height);
+    { static unsigned left; static int armed; const unsigned m = nvmtl_xe_live_mask_r(1);
+      if (!(m & 128)) armed = 0; else if (!armed) { armed = 1; left = 400; }
+      if ((m & 128) && left && getprogname() && !strcmp(getprogname(), "WindowServer")) { left--;
+          nvlog_raw("xe-pass scissor %lu %lu %lu %lu", (unsigned long)r.x, (unsigned long)r.y, (unsigned long)r.width, (unsigned long)r.height); } }
     _sc[0] = (uint32_t)r.x; _sc[1] = (uint32_t)r.y; _sc[2] = (uint32_t)r.width; _sc[3] = (uint32_t)r.height; _hasSC = YES;
     if (!_begun) return;
     nvmtl_vk_cmd_set_scissor(&_cb->_c, (int32_t)r.x, (int32_t)r.y, (uint32_t)r.width, (uint32_t)r.height);
@@ -3596,6 +3638,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
                   indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)off
                 instanceCount:(NSUInteger)instances baseVertex:(NSInteger)baseVertex baseInstance:(NSUInteger)baseInstance {
     if (!_begun) { nvlog("drawIndexedPrimitives with no pipeline set"); return; }
+    [self nvmtlXePassDraw:count];
     NVMTLBuffer *b = (NVMTLBuffer *)ib;
     if (!b) { nvlog("drawIndexedPrimitives with no index buffer"); return; }
     nvmtl_retain_resource(_cb, b);
@@ -4322,6 +4365,8 @@ static void nvmtl_enc78_census(void) {
 }
 void nvmtl_vk_cmd_barrier_c2c(nvk_cmdbuf *c);
 @interface NVMTLCommandBuffer () { @public NVMTLBuffer *_e78Ring; size_t _e78RingOff; } @end
+@interface NVMTLCommandBuffer () { @public unsigned _xeKinds; } @end
+@interface NVMTLCommandBuffer () { @public __unsafe_unretained NVMTLTexture *_xePrevT; } @end
 @interface NVMTLCommandBuffer () { @public BOOL _g79Owed, _g79C2C; NSMutableArray *_g79Sig, *_g79Promised; } @end
 enum { NVMTL_G79_DUPIDX = 32, NVMTL_G79_DUPMAX = 64 };
 @interface NVMTLCommandBuffer () { @public __unsafe_unretained NVMTLBuffer *_g79BRing[NVMTL_G79_DUPIDX]; size_t _g79BOff[NVMTL_G79_DUPIDX];
@@ -5163,9 +5208,50 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
     nvmtl_g79_flush(self);
+    _xeKinds |= 4;
     NVMTLRenderCommandEncoder *e = [NVMTLRenderCommandEncoder new];
     _nEnc++;
     e->_cb = self; e->_target = (NVMTLTexture *)d.colorAttachments[0].texture;
+    // I-119 probe, xe-live bit 2048 with /tmp/nvmtl-dump-request: when a WindowServer pass on a display surface follows
+    // a pass on a small private target (the backdrop blur cache), dump that target as the earlier passes left it.
+    { static unsigned seq; const unsigned m = nvmtl_xe_live_mask_r(1);
+      if (!(m & 2048)) seq = 0;
+      else if (e->_target && getprogname() && !strcmp(getprogname(), "WindowServer")) {
+        NVMTLTexture *p = _xePrevT, *r = e->_target->_parent ?: e->_target;
+        if (p && !p->_surf && r->_surf && [p nvi]->bpp == 4 && [p nvi]->w <= 1024 && [p nvi]->h <= 512 && seq < 60
+            && access("/tmp/nvmtl-dump-request", F_OK) == 0) {
+            nvk_image *pi = [p nvi]; const uint32_t w = pi->w, h = pi->h;
+            const unsigned n = seq++, sid = (unsigned)IOSurfaceGetID(r->_surf);
+            __block nvk_buffer hb = {0};
+            if (!nvmtl_vk_buffer_create((size_t)w * h * 4, 1, &hb) && hb.map
+                && !nvmtl_vk_cmd_copy_image_to_buffer_layer(&_c, pi, 0, 0, w, h, &hb, 0, w * 4, 0)) {
+                [self addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                    char f[96]; snprintf(f, sizeof f, "/tmp/nvmtl-blur-%d-%03u-s%u-%ux%u.bgra", (int)getpid(), n, sid, w, h);
+                    int fd = open(f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd >= 0) { (void)!write(fd, hb.map, (size_t)w * h * 4); close(fd); }
+                    nvmtl_vk_buffer_destroy(&hb); }];
+            } else if (hb.buf) nvmtl_vk_buffer_destroy(&hb);
+        }
+      }
+      if (e->_target) _xePrevT = e->_target->_parent ?: e->_target; }
+    // I-119 cursor square: bit 128 in xe-live logs WindowServer's render passes (400 lines each time it is set).
+    { static unsigned left; static int armed; const unsigned m = nvmtl_xe_live_mask_r(1);
+      if (!(m & 128)) armed = 0; else if (!armed) { armed = 1; left = 400; }
+      if ((m & 128) && left && e->_target && getprogname() && !strcmp(getprogname(), "WindowServer")) { left--;
+          NVMTLTexture *r = e->_target->_parent ?: e->_target;
+          nvlog_raw("xe-pass %ux%u surf %u load %lu store %lu clear %.2f/%.2f/%.2f/%.2f fmt %lu view %d", [r nvi]->w, [r nvi]->h,
+                r->_surf ? (unsigned)IOSurfaceGetID(r->_surf) : 0u, (unsigned long)d.colorAttachments[0].loadAction,
+                (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
+                d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, (unsigned long)e->_target.pixelFormat,
+                e->_target->_parent != nil); } }
+    // A target WindowServer samples inside its own pass: on Apple GPUs that read returns the pass's starting pixels
+    // (tile memory), so give those draws a copy of the target taken before the pass begins.
+    if (e->_target) nvmtl_surface_cpu_dump(e->_target->_parent ?: e->_target);   // the final display surface is never sampled
+    if (e->_target && d.colorAttachments[0].loadAction == MTLLoadActionLoad) {
+        NVMTLTexture *r = e->_target->_parent ?: e->_target, *snap = nvmtl_self_snap(r, NO);
+        if (snap && !(nvmtl_xe_live_mask_r(1) & 256) && !nvmtl_vk_cmd_copy_image(&_c, [r nvi], 0, 0, [snap nvi], 0, 0, [r nvi]->w, [r nvi]->h)) {
+            e->_snap = snap; if (!_resources) _resources = [NVMTLResSet new]; [_resources addObject:snap]; }
+    }
     if (!_resources) _resources = [NVMTLResSet new];
     if (e->_target) [_resources addObject:e->_target];
     if (d.depthAttachment.texture) [_resources addObject:d.depthAttachment.texture];
@@ -5274,8 +5360,75 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
+// I-119 bisect: WindowServer waits for the command buffers whose encoder kinds match the mask in this file (1 blit,
+// 2 compute, 4 render, 8 every one; 16 applies it to other processes, 32 to them only), re-read while it runs, so a
+// wait can be toggled without restarting WindowServer.
+static unsigned nvmtl_xe_live_mask_r(int raw) {
+    static _Atomic unsigned mask; static _Atomic uint64_t checked; static long mt = -1;
+    static int ws = -1; if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now - atomic_load(&checked) > 250000000ull) {
+        atomic_store(&checked, now);
+        struct stat st; unsigned m = 0; int fresh = 1;
+        if (stat("/Library/GPUBundles/nvmtl/xe-live", &st) == 0) {
+            if ((long)st.st_mtime == mt) fresh = 0;
+            else { mt = (long)st.st_mtime; FILE *f = fopen("/Library/GPUBundles/nvmtl/xe-live", "r");
+                   if (f) { if (fscanf(f, "%u", &m) != 1) m = 0; fclose(f); } }
+        } else mt = -1;
+        if (fresh && m != atomic_exchange(&mask, m)) nvlog("xe-live wait mask %u", m);
+    }
+    const unsigned m = atomic_load(&mask);
+    if (raw) return m;
+    if (ws ? (m & 32) : !(m & 48)) return 0;
+    return m;
+}
+static unsigned nvmtl_xe_live_raw(void) { return nvmtl_xe_live_mask_r(1); }
+// The pre-pass copy of each target that was sampled inside its own pass, made the first time that happens.
+static NVMTLTexture *nvmtl_self_snap(NVMTLTexture *root, BOOL make) {
+    static NSMapTable *map; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lk);
+    if (!map) map = [NSMapTable weakToStrongObjectsMapTable];
+    NVMTLTexture *snap = [map objectForKey:root];
+    os_unfair_lock_unlock(&lk);
+    if (snap || !make) return snap;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:root.pixelFormat width:[root nvi]->w height:[root nvi]->h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+    snap = (NVMTLTexture *)[root.device newTextureWithDescriptor:td];
+    if (!snap) return nil;
+    nvlog("self-sampled target %ux%u fmt %lu: later passes read a copy taken before the pass", [root nvi]->w, [root nvi]->h, (unsigned long)root.pixelFormat);
+    os_unfair_lock_lock(&lk); if (![map objectForKey:root]) [map setObject:snap forKey:root]; os_unfair_lock_unlock(&lk);
+    return snap;
+}
+static unsigned nvmtl_xe_live_mask(void) { return nvmtl_xe_live_mask_r(0); }
+// I-119: on ANV an app's render pass or IOSurface write could still be running when WindowServer composited the
+// surface, which showed as horizontal bands; apps on Intel now wait for those at commit (bit 64 in xe-live turns it off).
+static int nvmtl_xe_app_wait(void) {
+    static int on = -1;
+    if (on < 0) on = nvmtl_vk_vendor() == 0x8086 && !(getprogname() && !strcmp(getprogname(), "WindowServer"));
+    return on;
+}
+// I-119 probe (xe-live bit 1024): a panel copy (debug.nvaccel_iop_ok) between a WindowServer render commit and its GPU
+// completion means the kernel may have copied a frame the GPU was still drawing.
+static void nvmtl_xe_race_watch(NVMTLCommandBuffer *cb) {
+    static int ws = -1; if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+    if (!ws || !(cb->_xeKinds & 4) || !(nvmtl_xe_live_raw() & 1024)) return;
+    int64_t c0 = 0; size_t l = sizeof c0;
+    if (sysctlbyname("debug.nvaccel_iop_ok", &c0, &l, NULL, 0)) return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        static _Atomic unsigned long total, raced; int64_t c1 = 0; size_t l1 = sizeof c1;
+        if (sysctlbyname("debug.nvaccel_iop_ok", &c1, &l1, NULL, 0)) return;
+        const unsigned long r = atomic_fetch_add(&raced, c1 != c0) + (c1 != c0), t = atomic_fetch_add(&total, 1) + 1;
+        if (t % 100 == 0) nvlog_raw("xe-race %lu/%lu render CBs saw a panel copy before they finished (mask %u)", r, t, nvmtl_xe_live_raw());
+    }];
+}
 - (void)commit {
+    BOOL surf = _surfDirty.count > 0;
+    if (!surf) for (NVMTLSubmissionPart *p in _parts) if ([p isKindOfClass:[NVMTLSubmissionPart class]] && p->surfaces.count) { surf = YES; break; }
+    nvmtl_xe_race_watch(self);
     [self nvmtlSubmitWithEvents];
+    { const unsigned m = nvmtl_xe_live_mask();
+      if ((m && ((m & 8) || (_xeKinds & m))) || (nvmtl_xe_app_wait() && !(nvmtl_xe_live_raw() & 64) && (surf || (_xeKinds & 4))))
+          [self waitUntilCompleted]; }
     // NVMTL_DEBUG_WAIT_EACH=1: every command buffer is waited for and its completion traced, so a GPU hang is pinned to
     // the command buffer (and the debug groups traced before it) that never finished. A diagnostic: it serialises the app.
     static int each = -1; if (each < 0) { const char *e = getenv("NVMTL_DEBUG_WAIT_EACH"); each = e && e[0] == '1'; }
@@ -5283,6 +5436,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
         [self waitUntilCompleted]; nvtrace("CB done #%lu status %ld", k, (long)self.status); }
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+    _xeKinds |= 2;
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t {
@@ -5295,6 +5449,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoderWithDescriptor:(MTLResourceStatePassDescriptor *)d { return nil; }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
     nvmtl_g79_flush(self);
+    _xeKinds |= 1;
     NVMTLBlitCommandEncoder *e = [NVMTLBlitCommandEncoder new]; e->_cb = self; _nEnc++; return e;
 }
 - (id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoder {
